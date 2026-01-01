@@ -294,7 +294,7 @@ router.post('/api/tag-order', async (req, res) => {
 
         var orderNoteBlock = "";
 
-        if (tag == "racked") {
+        if (tag == "racked_up") {
           orderNoteBlock = [
             '~',
             `ORDER READY TO BE BUILT — ${timestamp}`,
