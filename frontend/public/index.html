@@ -1,0 +1,38 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Login</title>
+  <link rel="stylesheet" href="/css/style.css" />
+</head>
+<body class="login">
+
+<div class="loginContainer">
+  <h1>AIRTAC</h1>
+  <p>Shopify Scanner Login</p>
+
+  <form id="loginForm">
+    <input
+      type="text"
+      id="shop"
+      placeholder="your-store.myshopify.com"
+      value="airtacuk.myshopify.com"
+      required
+    />
+    <button type="submit">Log in</button>
+  </form>
+
+  <script>
+    const form = document.getElementById('loginForm');
+    form.addEventListener('submit', e => {
+      e.preventDefault();
+      const shop = document.getElementById('shop').value.trim();
+      if (!shop) return alert('Enter your Shopify store domain');
+      window.location.href = `/auth?shop=${encodeURIComponent(shop)}`;
+    });
+  </script>
+</div>
+
+</body>
+</html>
