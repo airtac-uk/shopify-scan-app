@@ -205,7 +205,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const html5QrcodeScanner = new Html5Qrcode("reader");
   html5QrcodeScanner.start(
     { facingMode: "environment" },
-    { fps: 30, aspectRatio: 1.0, disableFlip: false },
+    { fps: 15, aspectRatio: 1.0, disableFlip: true },
     qrCodeMessage => {
       console.log('QR detected:', qrCodeMessage);
 

@@ -111,6 +111,8 @@ router.get('/auth/callback', async (req, res) => {
 
     // Set cookie for frontend
     res.cookie('shop', shop, { httpOnly: false, sameSite: 'lax' });
+    res.cookie('userId', data.associated_user.first_name, { httpOnly: false, sameSite: 'lax' });
+
 
     console.log('Session stored successfully, redirecting to scan page');
     res.redirect('/scan.html');
@@ -165,12 +167,17 @@ router.post('/api/tag-order', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Not logged in' });
     }
 
+    const userId = req.cookies.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Username needs to be set' });
+    }
+
     const session = sessionsStore.get(shop);
     if (!session) {
       return res.status(401).json({ success: false, error: 'No session found' });
     }
 
-    const staff = session.associated_user || 'Unknown';
+    const staff = userId;
     const client = shopifyClient(session);
 
     console.log(`Looking up order ${barcode} for shop ${shop}`);
@@ -372,12 +379,17 @@ router.post('/api/awaiting-parts', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Not logged in' });
     }
 
+    const userId = req.cookies.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Username needs to be set' });
+    }
+
     const session = sessionsStore.get(shop);
     if (!session) {
       return res.status(401).json({ success: false, error: 'No session found' });
     }
 
-    const staff = session.associated_user|| 'Unknown';
+    const staff = userId || 'Unknown';
     const client = shopifyClient(session);
 
     // --------------------------------------------------
