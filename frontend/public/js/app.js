@@ -132,7 +132,18 @@ async function submitAwaitingParts() {
 
 document.addEventListener('DOMContentLoaded', () => {
 
-  
+  var tagInput = document.getElementById("tag");
+
+  var lastTagged = localStorage.getItem("lastTag");
+  if (lastTagged != null) {
+    tagInput.value = lastTagged;
+  }
+
+  tagInput.addEventListener('change', () => {
+    localStorage.setItem("lastTag", tagInput.value || '');
+  });
+
+
   const scanResult = document.getElementById('scanResult');
 
   const shopCookie = document.cookie.split('; ').find(c => c.startsWith('shop='));
