@@ -155,6 +155,75 @@ async function sendGoogleChatMessage(webhookUrl, text) {
   }
 }
 
+async function sendGeckoboardEvent(eventData) {
+  const apiKey = process.env.GECKOBOARD_API_KEY;
+  const datasetId = process.env.GECKOBOARD_DATASET_ID;
+  if (!apiKey || !datasetId) return;
+
+  const authHeader = `Basic ${Buffer.from(`${apiKey}:`).toString('base64')}`;
+  await ensureGeckoboardDataset({ authHeader, datasetId });
+
+  const res = await fetch(`https://api.geckoboard.com/datasets/${datasetId}/data`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({ data: [eventData] }),
+  });
+
+  if (!res.ok) {
+    const body = await res.text();
+    throw new Error(`Geckoboard error ${res.status}: ${body}`);
+  }
+}
+
+let geckoboardDatasetChecked = false;
+
+async function ensureGeckoboardDataset({ authHeader, datasetId }) {
+  if (geckoboardDatasetChecked) return;
+
+  const getRes = await fetch(`https://api.geckoboard.com/datasets/${datasetId}`, {
+    method: 'GET',
+    headers: { Authorization: authHeader },
+  });
+
+  if (getRes.ok) {
+    geckoboardDatasetChecked = true;
+    return;
+  }
+
+  if (getRes.status !== 404) {
+    const body = await getRes.text();
+    throw new Error(`Geckoboard dataset check failed ${getRes.status}: ${body}`);
+  }
+
+  const createRes = await fetch(`https://api.geckoboard.com/datasets/${datasetId}`, {
+    method: 'PUT',
+    headers: {
+      'Content-Type': 'application/json',
+      Authorization: authHeader,
+    },
+    body: JSON.stringify({
+      fields: {
+        timestamp: { type: 'datetime' },
+        order_number: { type: 'string' },
+        order_id: { type: 'string' },
+        barcode: { type: 'string' },
+        tag: { type: 'string' },
+        staff: { type: 'string' }
+      },
+    }),
+  });
+
+  if (!createRes.ok) {
+    const body = await createRes.text();
+    throw new Error(`Geckoboard dataset create failed ${createRes.status}: ${body}`);
+  }
+
+  geckoboardDatasetChecked = true;
+}
+
 router.post('/api/tag-order', async (req, res) => {
   try {
     const { barcode, tag } = req.body;
@@ -339,11 +408,23 @@ router.post('/api/tag-order', async (req, res) => {
         }
 
         appendOrderNote(client, order.id, orderNoteBlock)
-      } else {
-        console.log("Skipped as already tagged")
-      }
+    } else {
+      console.log("Skipped as already tagged")
+    }
     }
     
+    try {
+      await sendGeckoboardEvent({
+        timestamp: new Date().toISOString(),
+        order_number: order.name,
+        order_id: order.id,
+        barcode,
+        tag,
+        staff,
+      });
+    } catch (geckoboardErr) {
+      console.error('Geckoboard event send failed:', geckoboardErr);
+    }
 
     return res.json({
       success: true,
