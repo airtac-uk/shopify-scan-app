@@ -253,6 +253,12 @@ router.post('/api/tag-order', async (req, res) => {
 
     const staff = userId;
     const normalizedBarcode = normalizeScanBarcode(barcode);
+    const latestWaitingQcStaff = tag == "qc_fail"
+      ? sessionsStore.getLatestWaitingQcStaffByBarcode(normalizedBarcode)
+      : null;
+    const attributedStaff = tag == "qc_fail"
+      ? (latestWaitingQcStaff || staff)
+      : staff;
     const client = shopifyClient(session);
 
     console.log(`Looking up order ${barcode} for shop ${shop}`);
@@ -350,7 +356,7 @@ router.post('/api/tag-order', async (req, res) => {
       return res.json({ success: false, error: 'Failed to update order' });
     }
 
-    console.log(`Order ${barcode} tagged with "${tag}" by ${staff}`);
+    console.log(`Order ${barcode} tagged with "${tag}" by ${attributedStaff}`);
 
     if (tag == "awaiting_parts") {
       // await sendGoogleChatMessage(
@@ -364,7 +370,7 @@ router.post('/api/tag-order', async (req, res) => {
     } else {
        await sendGoogleChatMessage(
         process.env.GCHAT_ALL_ACTIVITY_WEBHOOK_URL,
-        `🏷️ Order ${order.name} tagged "${tag}" by ${staff}`
+        `🏷️ Order ${order.name} tagged "${tag}" by ${attributedStaff}`
       );
 
       
@@ -401,7 +407,7 @@ router.post('/api/tag-order', async (req, res) => {
             orderNoteBlock = [
             '~',
             `QUALITY CHECKS ESCALATED - AWAITING REBUILD — ${timestamp}`,
-            `Team Member: ${staff}`,
+            `Team Member: ${attributedStaff}`,
             '',
           ].join('\n');
         } else if (tag == "packaged") {
@@ -433,7 +439,7 @@ router.post('/api/tag-order', async (req, res) => {
         order_id: order.id,
         barcode,
         tag,
-        staff,
+        staff: attributedStaff,
       });
     } catch (geckoboardErr) {
       console.error('Geckoboard event send failed:', geckoboardErr);
@@ -461,7 +467,7 @@ router.post('/api/tag-order', async (req, res) => {
       success: true,
       orderNumber: order.name,
       lineItems: lineItemArray,
-      staff,
+      staff: attributedStaff,
       wholesaleAdapterBuiltCount,
     });
 
