@@ -2,6 +2,10 @@ var lastTag = "";
 var lastBarcode = "";
 var loadingTrack = false;
 
+var hidBuffer = "";
+var hidLastKeyAt = 0;
+var hidBufferTimeoutId = null;
+
 function loading() {
 
   loadingTrack = true;
@@ -130,6 +134,100 @@ async function submitAwaitingParts() {
   closeAwaitingParts();
 }
 
+function openQcFailDialog(orderId, lineItems) {
+  const scanResult = document.getElementById('scanResult');
+  const skuSelect = document.getElementById('qcFailSku');
+  const reasonInput = document.getElementById('qcFailReason');
+  if (!skuSelect || !reasonInput || !scanResult) return;
+
+  skuSelect.innerHTML = '';
+
+  const skuItems = (lineItems || []).filter(item => item && item.sku);
+  const uniqueSkuItems = [];
+  const seenSkus = new Set();
+
+  skuItems.forEach((item) => {
+    if (seenSkus.has(item.sku)) return;
+    seenSkus.add(item.sku);
+    uniqueSkuItems.push(item);
+  });
+
+  uniqueSkuItems.forEach((item) => {
+    const option = document.createElement('option');
+    option.value = item.sku;
+    option.textContent = `${item.sku} — ${item.title || ''}`;
+    skuSelect.appendChild(option);
+  });
+
+  if (uniqueSkuItems.length === 0) {
+    negativeDing();
+    scanResult.textContent = 'Error: No SKU found on this order to mark as QC fail.';
+    return;
+  }
+
+  skuSelect.dataset.orderId = orderId;
+  reasonInput.value = '';
+  document.getElementById('qcFailModal').style.display = 'block';
+}
+
+function closeQcFail() {
+  stopLoading();
+
+  const modal = document.getElementById('qcFailModal');
+  const skuSelect = document.getElementById('qcFailSku');
+  const reasonInput = document.getElementById('qcFailReason');
+
+  if (modal) modal.style.display = 'none';
+  if (skuSelect) skuSelect.dataset.orderId = '';
+  if (reasonInput) reasonInput.value = '';
+}
+
+async function submitQcFail() {
+  const skuSelect = document.getElementById('qcFailSku');
+  const reasonInput = document.getElementById('qcFailReason');
+  const scanResult = document.getElementById('scanResult');
+
+  if (!skuSelect || !reasonInput || !scanResult) return;
+
+  const orderId = skuSelect.dataset.orderId;
+  const sku = skuSelect.value;
+  const reason = reasonInput.value.trim();
+
+  if (!sku) {
+    alert('Please select a SKU.');
+    return;
+  }
+
+  if (!reason) {
+    alert('Please enter a reason for QC fail.');
+    return;
+  }
+
+  try {
+    loading();
+
+    const res = await fetch('/api/qc-fail', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderId, sku, reason }),
+    });
+
+    const data = await res.json();
+    if (!res.ok || !data.success) {
+      throw new Error(data.error || 'Failed to save QC fail');
+    }
+
+    positiveDing();
+    scanResult.textContent = `QC fail saved for ${sku}: ${reason}`;
+    closeQcFail();
+  } catch (err) {
+    negativeDing();
+    scanResult.textContent = `Error: ${err.message}`;
+  } finally {
+    stopLoading();
+  }
+}
+
 document.addEventListener('DOMContentLoaded', () => {
 
   var tagInput = document.getElementById("tag");
@@ -146,6 +244,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const scanResult = document.getElementById('scanResult');
 
+  function isAnyDialogOpen() {
+    const awaitingPartsModal = document.getElementById('awaitingPartsModal');
+    const qcFailModal = document.getElementById('qcFailModal');
+    return awaitingPartsModal?.style.display === 'block' || qcFailModal?.style.display === 'block';
+  }
+
   const shopCookie = document.cookie.split('; ').find(c => c.startsWith('shop='));
   if (!shopCookie) {
     console.log('Shop cookie not found, redirecting to login...');
@@ -160,14 +264,25 @@ document.addEventListener('DOMContentLoaded', () => {
       return;
     }
 
+    if (isAnyDialogOpen()) {
+      return;
+    }
 
-    if ((lastTag == tag && lastBarcode == barcode && tag != 'awaiting_parts' )) {
+    const normalizedBarcode = String(barcode).trim();
+    if (!normalizedBarcode.toUpperCase().startsWith("AT")) {
+      negativeDing();
+      scanResult.textContent = 'Error: Invalid QR code. Code must begin with AT.';
+      return;
+    }
+
+
+    if ((lastTag == tag && lastBarcode == normalizedBarcode && tag != 'awaiting_parts' && tag != 'qc_fail')) {
       // scanResult.textContent = `Avoiding double upload`;
       console.log("Avoiding double upload");
       return;
     }
 
-    console.log('Tagging order:', { barcode, tag });
+    console.log('Tagging order:', { barcode: normalizedBarcode, tag });
     scanResult.textContent = 'Processing...';
     try {
 
@@ -176,13 +291,13 @@ document.addEventListener('DOMContentLoaded', () => {
       const res = await fetch('/api/tag-order', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ barcode, tag })
+        body: JSON.stringify({ barcode: normalizedBarcode, tag })
       });
       const data = await res.json();
       console.log('API response:', data);
 
       lastTag = tag;
-      lastBarcode = barcode;
+      lastBarcode = normalizedBarcode;
       if (data.success) {
         positiveDing();
         scanResult.textContent = `Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`;
@@ -191,10 +306,15 @@ document.addEventListener('DOMContentLoaded', () => {
         scanResult.textContent = `Error: ${data.error}`;
       }
 
-      if (tag == 'awaiting_parts') {
+      if (data.success && tag == 'awaiting_parts') {
         openAwaitingPartsDialog(
-          barcode,          // or order ID if you have it
+          normalizedBarcode, // or order ID if you have it
           data.lineItems    // returned from backend
+        );
+      } else if (data.success && tag == 'qc_fail') {
+        openQcFailDialog(
+          normalizedBarcode,
+          data.lineItems
         );
       } else {
         stopLoading();
@@ -213,19 +333,87 @@ document.addEventListener('DOMContentLoaded', () => {
     }
   }
 
-  const html5QrcodeScanner = new Html5Qrcode("reader");
-  html5QrcodeScanner.start(
-    { facingMode: "environment" },
-    { fps: 15, aspectRatio: 1.0, disableFlip: true },
-    qrCodeMessage => {
-      console.log('QR detected:', qrCodeMessage);
+  function setupHidScanner(onScan) {
+    const body = document.body;
+    const hidEnabled = body?.dataset?.enableHidScan === 'true';
+    if (!hidEnabled) return;
 
-      if (loadingTrack == false) {
-        tagOrder(qrCodeMessage)
-      } else {
-        console.log("Skipping due to loading");
+    const INTER_KEY_TIMEOUT_MS = 80;
+    const BUFFER_RESET_MS = 200;
+    const MIN_SCAN_LENGTH = 3;
+
+    function resetHidBuffer() {
+      hidBuffer = "";
+      hidLastKeyAt = 0;
+      if (hidBufferTimeoutId) {
+        clearTimeout(hidBufferTimeoutId);
+        hidBufferTimeoutId = null;
       }
-    },
-    errorMessage => {}
-  );
+    }
+
+    document.addEventListener('keydown', (event) => {
+      if (loadingTrack) return;
+      if (isAnyDialogOpen()) return;
+
+      const target = event.target;
+      const tagName = target?.tagName?.toLowerCase();
+      if (tagName === 'input' || tagName === 'textarea' || target?.isContentEditable) {
+        return;
+      }
+
+      const now = Date.now();
+      if (hidLastKeyAt && now - hidLastKeyAt > INTER_KEY_TIMEOUT_MS) {
+        resetHidBuffer();
+      }
+      hidLastKeyAt = now;
+
+      if (event.key === 'Enter') {
+        const scannedCode = hidBuffer.trim();
+        resetHidBuffer();
+
+        if (scannedCode.length >= MIN_SCAN_LENGTH) {
+          console.log('HID scan detected:', scannedCode);
+          onScan(scannedCode);
+        }
+        return;
+      }
+
+      if (event.key.length === 1) {
+        hidBuffer += event.key;
+      }
+
+      if (hidBufferTimeoutId) {
+        clearTimeout(hidBufferTimeoutId);
+      }
+      hidBufferTimeoutId = setTimeout(resetHidBuffer, BUFFER_RESET_MS);
+    });
+  }
+
+  setupHidScanner((scannedCode) => {
+    tagOrder(scannedCode);
+  });
+
+  const readerEl = document.getElementById("reader");
+  const cameraEnabled = document.body?.dataset?.enableCameraScan !== 'false';
+  if (readerEl && cameraEnabled) {
+    try {
+      const html5QrcodeScanner = new Html5Qrcode("reader");
+      html5QrcodeScanner.start(
+        { facingMode: "environment" },
+        { fps: 15, aspectRatio: 1.0, disableFlip: true },
+        qrCodeMessage => {
+          console.log('QR detected:', qrCodeMessage);
+
+          if (loadingTrack == false && !isAnyDialogOpen()) {
+            tagOrder(qrCodeMessage)
+          } else {
+            console.log("Skipping due to loading");
+          }
+        },
+        errorMessage => {}
+      );
+    } catch (err) {
+      console.log("No reader found");
+    }
+  }
 });

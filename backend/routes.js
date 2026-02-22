@@ -589,5 +589,139 @@ router.post('/api/awaiting-parts', async (req, res) => {
   }
 });
 
+router.post('/api/qc-fail', async (req, res) => {
+  try {
+    const { orderId, sku, reason } = req.body;
+    const barcode = orderId;
+
+    if (!barcode || !sku || !reason) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing orderId, sku, or reason',
+      });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const userId = req.cookies.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Username needs to be set' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const staff = userId || 'Unknown';
+    const client = shopifyClient(session);
+
+    const findOrderQuery = `
+      query findOrder($query: String!) {
+        orders(first: 1, query: $query) {
+          edges {
+            node {
+              id
+              name
+              note
+            }
+          }
+        }
+      }
+    `;
+
+    const findRes = await client.graphql(findOrderQuery, {
+      variables: {
+        query: `${barcode} status:any`,
+      },
+    });
+
+    const orderEdge = findRes.data?.orders?.edges?.[0];
+    if (!orderEdge) {
+      return res.status(404).json({
+        success: false,
+        error: `Order ${barcode} not found`,
+      });
+    }
+
+    const order = orderEdge.node;
+
+    const timestamp = new Date()
+      .toISOString()
+      .replace('T', ' ')
+      .slice(0, 16);
+
+    const qcFailBlock = [
+      '~',
+      `QC FAIL — ${timestamp}`,
+      `Team Member: ${staff}`,
+      `SKU: ${sku}`,
+      `Reason: ${String(reason).trim()}`,
+      '',
+    ].join('\n');
+
+    const updatedNote = (order.note || '') + qcFailBlock;
+
+    const updateNoteMutation = `
+      mutation updateOrderNote($id: ID!, $note: String) {
+        orderUpdate(input: { id: $id, note: $note }) {
+          userErrors {
+            field
+            message
+          }
+        }
+      }
+    `;
+
+    //  DONT UPDATE ORDER NOTES AS WE DONT WANT CUSTOMER SEEING THIS.
+    // const updateRes = await client.graphql(updateNoteMutation, {
+    //   variables: {
+    //     id: order.id,
+    //     note: updatedNote,
+    //   },
+    // });
+
+    // if (updateRes.data?.orderUpdate?.userErrors?.length) {
+    //   console.error(updateRes.data.orderUpdate.userErrors);
+    //   return res.status(500).json({
+    //     success: false,
+    //     error: 'Failed to update order note',
+    //   });
+    // }
+
+    try {
+      await sendGoogleChatMessage(
+        process.env.GCHAT_QC_FAIL_URL,
+        [
+          `QC fail reported for order ${order.name}`,
+          `Reported by: ${staff}`,
+          `SKU: ${sku}`,
+          `Reason: ${String(reason).trim()}`,
+        ].join('\n')
+      );
+    } catch (chatErr) {
+      console.error('Google Chat notification failed:', chatErr);
+    }
+
+    return res.json({
+      success: true,
+      orderNumber: order.name,
+      sku,
+    });
+  } catch (err) {
+    console.error('Error in /api/qc-fail:', err);
+    if (err.response) {
+      console.error('API Response Dump:', JSON.stringify(err.response, null, 2));
+    }
+    return res.status(500).json({
+      success: false,
+      error: 'Server error',
+    });
+  }
+});
+
 
 module.exports = router;

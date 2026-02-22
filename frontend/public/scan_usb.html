@@ -6,10 +6,7 @@
   <link rel="stylesheet" href="css/style.css">
   <script src="https://unpkg.com/html5-qrcode"></script>
 </head>
-<body >
-    <div style="text-align: center; margin: 12px 0;">
-      <a href="/scan_usb.html" style="font-size: 28px; color: #4fc3f7;">Use USB Scanner Mode</a>
-    </div>
+<body data-enable-hid-scan="true" data-enable-camera-scan="false">
     <select style="text-align-last: center; font-size: 48px; width: 98vw;" name="cars" id="tag">
       <option value="racked_up">Racked</option>
       <option value="awaiting_parts">Awaiting Parts</option>
@@ -19,10 +16,10 @@
       <option value="packaged">Packaged</option>
       <option value="on_hold">On Hold</option>
     </select>
-     <div id="cameraScanner" style="margin-top:20px; margin-bottom: 20px; ">
-      <div id="reader" style="width:100%;"></div>
-    </div>
-   
+   <p style="text-align:center; font-size: 28px; margin-top: 20px;">
+    USB scanner ready. Scan a QR/barcode with your HID reader.
+   </p>
+
     <div style="width: 100%; display: flex; align-items: center;  justify-content: center;">
     <span id="spinner" class="loader" style="display: none;"></span>
     </div>
