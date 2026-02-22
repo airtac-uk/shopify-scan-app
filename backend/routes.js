@@ -179,6 +179,11 @@ async function sendGeckoboardEvent(eventData) {
 }
 
 let geckoboardDatasetChecked = false;
+const wholesaleAdapterBuiltScanCounts = new Map();
+
+function normalizeScanBarcode(barcode) {
+  return String(barcode || '').trim().toUpperCase();
+}
 
 async function ensureGeckoboardDataset({ authHeader, datasetId }) {
   if (geckoboardDatasetChecked) return;
@@ -247,6 +252,7 @@ router.post('/api/tag-order', async (req, res) => {
     }
 
     const staff = userId;
+    const normalizedBarcode = normalizeScanBarcode(barcode);
     const client = shopifyClient(session);
 
     console.log(`Looking up order ${barcode} for shop ${shop}`);
@@ -362,7 +368,7 @@ router.post('/api/tag-order', async (req, res) => {
       );
 
       
-      if (newTag) {
+      if (newTag || tag == "wholesale_adapter_built") {
         const timestamp = new Date()
           .toISOString()
           .replace('T', ' ')
@@ -405,6 +411,13 @@ router.post('/api/tag-order', async (req, res) => {
             `Team Member: ${staff}`,
             '',
           ].join('\n');
+        } else if (tag == "wholesale_adapter_built") {
+            orderNoteBlock = [
+            '~',
+            `WHOLESALE ADAPTER BUILT — ${timestamp}`,
+            `Team Member: ${staff}`,
+            '',
+          ].join('\n');
         }
 
         appendOrderNote(client, order.id, orderNoteBlock)
@@ -426,11 +439,30 @@ router.post('/api/tag-order', async (req, res) => {
       console.error('Geckoboard event send failed:', geckoboardErr);
     }
 
+    if (tag == "waiting_qc") {
+      try {
+        sessionsStore.recordWaitingQcEvent({
+          barcode: normalizedBarcode,
+          staff,
+        });
+      } catch (waitingQcStoreErr) {
+        console.error('Failed to store waiting_qc event:', waitingQcStoreErr);
+      }
+    }
+
+    let wholesaleAdapterBuiltCount = null;
+    if (tag == "wholesale_adapter_built") {
+      const nextCount = (wholesaleAdapterBuiltScanCounts.get(normalizedBarcode) || 0) + 1;
+      wholesaleAdapterBuiltScanCounts.set(normalizedBarcode, nextCount);
+      wholesaleAdapterBuiltCount = nextCount;
+    }
+
     return res.json({
       success: true,
       orderNumber: order.name,
       lineItems: lineItemArray,
       staff,
+      wholesaleAdapterBuiltCount,
     });
 
   } catch (err) {
@@ -617,6 +649,8 @@ router.post('/api/qc-fail', async (req, res) => {
     }
 
     const staff = userId || 'Unknown';
+    const normalizedBarcode = normalizeScanBarcode(barcode);
+    const latestWaitingQcStaff = sessionsStore.getLatestWaitingQcStaffByBarcode(normalizedBarcode);
     const client = shopifyClient(session);
 
     const findOrderQuery = `
@@ -698,6 +732,7 @@ router.post('/api/qc-fail', async (req, res) => {
         [
           `QC fail reported for order ${order.name}`,
           `Reported by: ${staff}`,
+          `Built by: ${latestWaitingQcStaff || 'No waiting_qc record found'}`,
           `SKU: ${sku}`,
           `Reason: ${String(reason).trim()}`,
         ].join('\n')
@@ -710,6 +745,7 @@ router.post('/api/qc-fail', async (req, res) => {
       success: true,
       orderNumber: order.name,
       sku,
+      latestWaitingQcStaff: latestWaitingQcStaff || null,
     });
   } catch (err) {
     console.error('Error in /api/qc-fail:', err);

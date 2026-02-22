@@ -218,7 +218,7 @@ async function submitQcFail() {
     }
 
     positiveDing();
-    scanResult.textContent = `QC fail saved for ${sku}: ${reason}`;
+    scanResult.textContent = `QC fail saved for ${sku}: ${reason}. Last waiting_qc by: ${data.latestWaitingQcStaff || 'No waiting_qc record found'}`;
     closeQcFail();
   } catch (err) {
     negativeDing();
@@ -276,7 +276,13 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 
 
-    if ((lastTag == tag && lastBarcode == normalizedBarcode && tag != 'awaiting_parts' && tag != 'qc_fail')) {
+    if (
+      lastTag == tag &&
+      lastBarcode == normalizedBarcode &&
+      tag != 'awaiting_parts' &&
+      tag != 'qc_fail' &&
+      tag != 'wholesale_adapter_built'
+    ) {
       // scanResult.textContent = `Avoiding double upload`;
       console.log("Avoiding double upload");
       return;
@@ -300,7 +306,11 @@ document.addEventListener('DOMContentLoaded', () => {
       lastBarcode = normalizedBarcode;
       if (data.success) {
         positiveDing();
-        scanResult.textContent = `Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`;
+        if (tag === 'wholesale_adapter_built') {
+          scanResult.textContent = `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`;
+        } else {
+          scanResult.textContent = `Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`;
+        }
       } else {
         negativeDing();
         scanResult.textContent = `Error: ${data.error}`;
@@ -357,6 +367,12 @@ document.addEventListener('DOMContentLoaded', () => {
 
       const target = event.target;
       const tagName = target?.tagName?.toLowerCase();
+
+      if (tagName === 'select' && target?.id === 'tag') {
+        // Prevent HID characters from changing the selected workflow mode.
+        event.preventDefault();
+      }
+
       if (tagName === 'input' || tagName === 'textarea' || target?.isContentEditable) {
         return;
       }

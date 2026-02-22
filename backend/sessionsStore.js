@@ -26,6 +26,24 @@ db.prepare(`
   )
 `).run();
 
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS waiting_qc_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    barcode TEXT NOT NULL,
+    staff TEXT NOT NULL,
+    createdAt TEXT NOT NULL
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_waiting_qc_events_barcode_createdAt
+  ON waiting_qc_events (barcode, createdAt DESC, id DESC)
+`).run();
+
+function normalizeBarcode(barcode) {
+  return String(barcode || '').trim().toUpperCase();
+}
+
 module.exports = {
   /**
    * Save session for a shop
@@ -66,5 +84,31 @@ module.exports = {
       expires: row.expires ? new Date(row.expires) : null,
       associated_user: row.associatedUser ? JSON.parse(row.associatedUser) : null
     };
-  }
+  },
+
+  recordWaitingQcEvent({ barcode, staff, createdAt }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!normalizedBarcode || !staff) return;
+
+    const stmt = db.prepare(`
+      INSERT INTO waiting_qc_events (barcode, staff, createdAt)
+      VALUES (?, ?, ?)
+    `);
+    stmt.run(normalizedBarcode, String(staff), createdAt || new Date().toISOString());
+  },
+
+  getLatestWaitingQcStaffByBarcode(barcode) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!normalizedBarcode) return null;
+
+    const row = db.prepare(`
+      SELECT staff
+      FROM waiting_qc_events
+      WHERE barcode = ?
+      ORDER BY createdAt DESC, id DESC
+      LIMIT 1
+    `).get(normalizedBarcode);
+
+    return row?.staff || null;
+  },
 };
