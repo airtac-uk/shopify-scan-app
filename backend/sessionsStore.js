@@ -40,6 +40,22 @@ db.prepare(`
   ON waiting_qc_events (barcode, createdAt DESC, id DESC)
 `).run();
 
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS wholesale_build_progress (
+    shop TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    itemKey TEXT NOT NULL,
+    scannedQty INTEGER NOT NULL,
+    updatedAt TEXT NOT NULL,
+    PRIMARY KEY (shop, barcode, itemKey)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_wholesale_build_progress_shop_barcode
+  ON wholesale_build_progress (shop, barcode)
+`).run();
+
 function normalizeBarcode(barcode) {
   return String(barcode || '').trim().toUpperCase();
 }
@@ -110,5 +126,57 @@ module.exports = {
     `).get(normalizedBarcode);
 
     return row?.staff || null;
+  },
+
+  getWholesaleBuildProgress({ shop, barcode }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return {};
+
+    const rows = db.prepare(`
+      SELECT itemKey, scannedQty
+      FROM wholesale_build_progress
+      WHERE shop = ? AND barcode = ?
+    `).all(String(shop), normalizedBarcode);
+
+    const progressByItemKey = {};
+    rows.forEach((row) => {
+      if (!row?.itemKey) return;
+      const qty = Math.max(0, Number(row.scannedQty) || 0);
+      progressByItemKey[String(row.itemKey)] = qty;
+    });
+
+    return progressByItemKey;
+  },
+
+  setWholesaleBuildProgress({ shop, barcode, progressByItemKey }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return;
+
+    const entries = Object.entries(progressByItemKey || {})
+      .map(([itemKey, scannedQty]) => ({
+        itemKey: String(itemKey || '').trim(),
+        scannedQty: Math.max(0, Number(scannedQty) || 0),
+      }))
+      .filter((entry) => entry.itemKey && entry.scannedQty > 0);
+
+    const nowIso = new Date().toISOString();
+    const deleteStmt = db.prepare(`
+      DELETE FROM wholesale_build_progress
+      WHERE shop = ? AND barcode = ?
+    `);
+    const insertStmt = db.prepare(`
+      INSERT OR REPLACE INTO wholesale_build_progress
+      (shop, barcode, itemKey, scannedQty, updatedAt)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    const tx = db.transaction(() => {
+      deleteStmt.run(String(shop), normalizedBarcode);
+      entries.forEach((entry) => {
+        insertStmt.run(String(shop), normalizedBarcode, entry.itemKey, entry.scannedQty, nowIso);
+      });
+    });
+
+    tx();
   },
 };

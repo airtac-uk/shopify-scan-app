@@ -5,6 +5,7 @@ const cookieParser = require('cookie-parser');
 const sessionsStore = require('./sessionsStore'); // your SQLite session store
 const { initShopify, shopifyClient } = require('./shopifyClient');
 const fetch = require('node-fetch'); // for OAuth token exchange
+const { fetchPickListSheet, buildPickListForOrder, normalizeSku } = require('./pickListService');
 
 router.use(cookieParser());
 
@@ -182,7 +183,49 @@ let geckoboardDatasetChecked = false;
 const wholesaleAdapterBuiltScanCounts = new Map();
 
 function normalizeScanBarcode(barcode) {
-  return String(barcode || '').trim().toUpperCase();
+  return normalizeSku(barcode);
+}
+
+function includesMissingBundleFieldError(err) {
+  const raw = String(err?.message || '').toLowerCase();
+  if (!raw.includes('lineitemgroup')) return false;
+  return raw.includes('cannot query field') || raw.includes("doesn't exist");
+}
+
+function getPickListOrderQuery({ includeBundleGroup }) {
+  return `
+      query getOrderForPickList($query: String!) {
+        orders(first: 1, query: $query) {
+          edges {
+            node {
+              id
+              name
+              note
+              lineItems(first: 200) {
+                edges {
+                  node {
+                    id
+                    title
+                    sku
+                    quantity
+                    variantTitle
+                    variant {
+                      barcode
+                    }
+                    ${includeBundleGroup ? `
+                    lineItemGroup {
+                      id
+                      title
+                      quantity
+                    }` : ''}
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    `;
 }
 
 async function ensureGeckoboardDataset({ authHeader, datasetId }) {
@@ -282,6 +325,10 @@ router.post('/api/tag-order', async (req, res) => {
                     sku
                     quantity
                     variantTitle
+                    variant {
+                      id
+                      barcode
+                    }
                   }
                 }
               }
@@ -762,6 +809,144 @@ router.post('/api/qc-fail', async (req, res) => {
       success: false,
       error: 'Server error',
     });
+  }
+});
+
+router.post('/api/wholesale-progress', async (req, res) => {
+  try {
+    const { barcode, progressByItemKey } = req.body || {};
+    const normalizedBarcode = normalizeScanBarcode(barcode);
+    if (!normalizedBarcode) {
+      return res.status(400).json({ success: false, error: 'Missing barcode' });
+    }
+
+    if (!progressByItemKey || typeof progressByItemKey !== 'object' || Array.isArray(progressByItemKey)) {
+      return res.status(400).json({ success: false, error: 'Missing progressByItemKey object' });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    sessionsStore.setWholesaleBuildProgress({
+      shop,
+      barcode: normalizedBarcode,
+      progressByItemKey,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /api/wholesale-progress:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/pick-list', async (req, res) => {
+  try {
+    const { barcode } = req.body || {};
+    const normalizedBarcode = normalizeScanBarcode(barcode);
+
+    if (!normalizedBarcode) {
+      return res.status(400).json({ success: false, error: 'Missing barcode' });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const client = shopifyClient(session);
+
+    const queryVariables = {
+      query: `${normalizedBarcode} status:any`,
+    };
+
+    let bundleMetadataSupported = true;
+    let orderResponse;
+
+    try {
+      orderResponse = await client.graphql(getPickListOrderQuery({ includeBundleGroup: true }), {
+        variables: queryVariables,
+      });
+    } catch (err) {
+      if (!includesMissingBundleFieldError(err)) {
+        throw err;
+      }
+
+      bundleMetadataSupported = false;
+      orderResponse = await client.graphql(getPickListOrderQuery({ includeBundleGroup: false }), {
+        variables: queryVariables,
+      });
+    }
+
+    const orderEdge = orderResponse.data?.orders?.edges?.[0];
+    if (!orderEdge) {
+      return res.status(404).json({ success: false, error: `Order ${normalizedBarcode} not found` });
+    }
+
+    const order = orderEdge.node;
+    const orderLineItems = (order.lineItems?.edges || []).map((edge, index) => {
+      const rawQty = Number(edge.node.quantity);
+      const quantity = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 1;
+      const bundleGroup = edge.node.lineItemGroup
+        ? {
+            id: String(edge.node.lineItemGroup.id || '').trim(),
+            title: String(edge.node.lineItemGroup.title || '').trim(),
+            quantity: Number(edge.node.lineItemGroup.quantity) || null,
+          }
+        : null;
+
+      return {
+        id: edge.node.id || `ORDER_LINE_${index + 1}`,
+        title: edge.node.title || '',
+        sku: edge.node.sku || '',
+        quantity,
+        variantTitle: edge.node.variantTitle || '',
+        upc: edge.node.variant?.barcode || '',
+        bundleGroup,
+      };
+    });
+
+    const pickListSheet = await fetchPickListSheet();
+    const pickListResult = buildPickListForOrder({
+      skuMap: pickListSheet.skuMap,
+      lineItems: orderLineItems,
+    });
+    const wholesaleProgressByItemKey = sessionsStore.getWholesaleBuildProgress({
+      shop,
+      barcode: normalizedBarcode,
+    });
+
+    return res.json({
+      success: true,
+      barcode: normalizedBarcode,
+      orderNumber: order.name,
+      orderNote: order.note || '',
+      sheetFetchedAt: pickListSheet.fetchedAt,
+      sheetSkuCount: pickListSheet.sourceRowCount,
+      notesEnabled: pickListSheet.notesEnabled || false,
+      notesLoaded: pickListSheet.notesLoaded || false,
+      notesError: pickListSheet.notesError || null,
+      bundleMetadataSupported,
+      wholesaleProgressByItemKey,
+      orderItems: orderLineItems,
+      lineItems: pickListResult.lineItems,
+      totals: pickListResult.totals,
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
 });
 

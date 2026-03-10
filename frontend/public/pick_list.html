@@ -1,0 +1,106 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shopify Pick List</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body data-enable-hid-scan="true" class="pick-list-page">
+  <main class="pick-list-layout">
+    <header class="pick-list-topbar">
+      <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
+      <h1>Order Viewer</h1>
+      <p>Scan or enter an order barcode to build required picks and desk-item list.</p>
+    </header>
+
+    <section class="pick-list-controls">
+      <label for="pickListBarcode">Order Barcode</label>
+      <div class="pick-list-input-row">
+        <input id="pickListBarcode" type="text" placeholder="AT..." autocomplete="off" autocapitalize="characters" />
+        <button id="pickListFetchBtn" type="button">Build Pick List</button>
+      </div>
+      <div class="pick-list-toggle-row">
+        <label class="pick-list-toggle-label" for="pickerModeToggle">
+          <input id="pickerModeToggle" type="checkbox" />
+          Picker mode (hide desk items)
+        </label>
+      </div>
+      <div class="pick-list-toggle-row">
+        <label class="pick-list-toggle-label" for="verifyModeToggle">
+          <input id="verifyModeToggle" type="checkbox" />
+          Verify Order mode
+        </label>
+      </div>
+      <div class="pick-list-toggle-row">
+        <label class="pick-list-toggle-label" for="wholesaleModeToggle">
+          <input id="wholesaleModeToggle" type="checkbox" />
+          Wholesale mode (shared build progress)
+        </label>
+      </div>
+      <div class="pick-list-status-row">
+        <span id="pickListSpinner" class="loader" style="display:none;"></span>
+        <p id="pickListStatus" data-type="info">Ready to scan.</p>
+      </div>
+      <p id="pickListOrderMeta" class="pick-list-order-meta"></p>
+    </section>
+
+    <section class="pick-list-actions">
+      <h2 class="pick-list-section-title">Order Actions</h2>
+      <div class="pick-list-action-grid">
+        <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false">Racked</button>
+        <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true">Awaiting Parts</button>
+        <button type="button" class="pick-list-action-btn" data-order-action="waiting_qc" data-picker-visible="false" data-verify-visible="false">Waiting QC</button>
+        <button type="button" class="pick-list-action-btn" data-order-action="wholesale_adapter_built" data-picker-visible="false" data-verify-visible="false">Wholesale Adapter</button>
+        <button type="button" class="pick-list-action-btn" data-order-action="qc_passed" data-picker-visible="false" data-verify-visible="false">QC Passed</button>
+        <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="qc_fail" data-picker-visible="false" data-verify-visible="false">QC Fail</button>
+        <button type="button" class="pick-list-action-btn" data-order-action="packaged" data-picker-visible="true" data-verify-visible="true">Packaged</button>
+        <button type="button" class="pick-list-action-btn pick-list-action-btn--hold" data-order-action="on_hold" data-picker-visible="false" data-verify-visible="false">On Hold</button>
+      </div>
+    </section>
+
+    <section>
+      <div id="pickListLineItems" class="pick-list-grid"></div>
+    </section>
+
+    <section id="pickListTimelineSection" class="pick-list-timeline-section" hidden>
+      <div class="pick-list-timeline-card">
+        <h2 class="pick-list-section-title">Order Timeline</h2>
+        <div id="pickListTimelineCard"></div>
+      </div>
+    </section>
+
+  </main>
+
+  <div id="awaitingPartsModal" class="pick-modal" aria-hidden="true">
+    <div class="pick-modal__panel">
+      <h3>Awaiting Parts</h3>
+      <p>Select the parts we are waiting on:</p>
+      <form id="awaitingPartsForm" class="pick-modal-form"></form>
+      <div class="pick-modal-actions">
+        <button id="awaitingPartsCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
+        <button id="awaitingPartsConfirmBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="qcFailModal" class="pick-modal" aria-hidden="true">
+    <div class="pick-modal__panel">
+      <h3>QC Fail</h3>
+      <p>Select failed SKU:</p>
+      <select id="qcFailSku" class="pick-modal-select"></select>
+
+      <p>Reason for fail:</p>
+      <textarea id="qcFailReason" class="pick-modal-textarea"></textarea>
+
+      <div class="pick-modal-actions">
+        <button id="qcFailCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
+        <button id="qcFailConfirmBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <script src="js/pick-list.js"></script>
+</body>
+</html>
