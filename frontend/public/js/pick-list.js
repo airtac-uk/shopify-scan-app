@@ -434,6 +434,31 @@ function normalizeVerifyCode(value) {
   return String(value || '').trim().toUpperCase();
 }
 
+function expandVerifyCodeVariants(value) {
+  const raw = normalizeVerifyCode(value);
+  if (!raw) return [];
+
+  const variants = new Set([raw]);
+  const noSpaces = raw.replace(/\s+/g, '');
+  if (noSpaces) variants.add(noSpaces);
+
+  const alnum = noSpaces.replace(/[^A-Z0-9]/g, '');
+  if (alnum) {
+    variants.add(alnum);
+    const alnumNoLeadingZeros = alnum.replace(/^0+/, '');
+    if (alnumNoLeadingZeros) variants.add(alnumNoLeadingZeros);
+  }
+
+  const digits = raw.replace(/\D/g, '');
+  if (digits) {
+    variants.add(digits);
+    const digitsNoLeadingZeros = digits.replace(/^0+/, '');
+    if (digitsNoLeadingZeros) variants.add(digitsNoLeadingZeros);
+  }
+
+  return Array.from(variants).filter(Boolean);
+}
+
 function getVerifyAudioContext() {
   const AudioCtx = window.AudioContext || window.webkitAudioContext;
   if (!AudioCtx) return null;
@@ -567,8 +592,8 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const row = grouped.get(key);
     row.sortIndex = Math.min(row.sortIndex, index);
     row.requiredQty += qty;
-    if (normalizedSku) row.codes.add(normalizedSku);
-    if (normalizedUpc) row.codes.add(normalizedUpc);
+    expandVerifyCodeVariants(normalizedSku).forEach((code) => row.codes.add(code));
+    expandVerifyCodeVariants(normalizedUpc).forEach((code) => row.codes.add(code));
   });
 
   verifyItems = Array.from(grouped.values()).sort((a, b) => {
@@ -918,13 +943,24 @@ function processVerifyUndo(key) {
 
 function processVerifyScan(scannedCode) {
   if (!isVerificationStyleModeEnabled()) return false;
-  const normalizedCode = normalizeVerifyCode(scannedCode);
+  const codeVariants = expandVerifyCodeVariants(scannedCode);
+  const normalizedCode = codeVariants[0] || '';
   if (!normalizedCode) {
     setStatus('Error: Empty scan received.', 'error');
     return true;
   }
 
-  const candidates = verifyCodeIndex.get(normalizedCode) || [];
+  const rowKeySeen = new Set();
+  const candidates = [];
+  codeVariants.forEach((variant) => {
+    const variantCandidates = verifyCodeIndex.get(variant) || [];
+    variantCandidates.forEach((row) => {
+      if (rowKeySeen.has(row.key)) return;
+      rowKeySeen.add(row.key);
+      candidates.push(row);
+    });
+  });
+
   if (!candidates.length) {
     setStatus(`Error: ${normalizedCode} is not on this order.`, 'error');
     return true;
