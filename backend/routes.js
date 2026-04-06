@@ -3,6 +3,7 @@ const express = require('express');
 const router = express.Router();
 const path = require('path');
 const cookieParser = require('cookie-parser');
+const crypto = require('crypto');
 const sessionsStore = require('./sessionsStore'); // your SQLite session store
 const { initShopify, shopifyClient } = require('./shopifyClient');
 const fetch = require('node-fetch'); // for OAuth token exchange
@@ -117,6 +118,13 @@ router.get('/auth/callback', async (req, res) => {
     // Store session in SQLite
     sessionsStore.set(shop, { shop, accessToken, isOnline: false, associated_user: data.associated_user.first_name });
 
+    try {
+      const client = shopifyClient({ shop, accessToken, isOnline: false });
+      await ensureOrdersCreateWebhookSubscription({ client, shop, req });
+    } catch (webhookErr) {
+      console.error(`Failed to ensure orders/create webhook for ${shop}:`, webhookErr);
+    }
+
     // Set cookie for frontend
     res.cookie('shop', shop, { httpOnly: false, sameSite: 'lax' });
     res.cookie('userId', data.associated_user.first_name, { httpOnly: false, sameSite: 'lax' });
@@ -144,6 +152,13 @@ router.get('/api/auth/status', async (req, res) => {
   if (!session) {
     console.log("Cookie has no session")
     return res.status(401).json({ success: false, error: 'No session found' });
+  }
+
+  try {
+    const client = shopifyClient(session);
+    await ensureOrdersCreateWebhookSubscription({ client, shop, req });
+  } catch (webhookErr) {
+    console.error(`Failed to ensure orders/create webhook for ${shop}:`, webhookErr);
   }
 
 
@@ -188,15 +203,160 @@ async function sendGeckoboardEvent(eventData) {
 
 let geckoboardDatasetChecked = false;
 const wholesaleAdapterBuiltScanCounts = new Map();
+const webhookRegistrationCheckedShops = new Set();
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
 const ORDER_WORKFLOW_STATUS_FIELDS = `
               displayFulfillmentStatus
               cancelledAt
               cancelReason
 `;
+const TRACKER_METAFIELD_NAMESPACE = String(process.env.SHOPIFY_TRACKER_METAFIELD_NAMESPACE || 'airtac').trim();
+const TRACKER_METAFIELD_KEY = String(process.env.SHOPIFY_TRACKER_METAFIELD_KEY || 'tracker_token').trim();
+const ORDER_TRACKER_METAFIELD_FIELD = `
+              trackerTokenMetafield: metafield(namespace: "${TRACKER_METAFIELD_NAMESPACE}", key: "${TRACKER_METAFIELD_KEY}") {
+                value
+              }
+`;
 
 function normalizeScanBarcode(barcode) {
   return normalizeSku(barcode);
+}
+
+function verifyShopifyWebhook(rawBody, hmacHeader) {
+  const bodyBuffer = Buffer.isBuffer(rawBody)
+    ? rawBody
+    : Buffer.from(String(rawBody || ''), 'utf8');
+  const expected = crypto
+    .createHmac('sha256', process.env.SHOPIFY_API_SECRET || '')
+    .update(bodyBuffer)
+    .digest('base64');
+
+  const expectedBuffer = Buffer.from(expected);
+  const headerBuffer = Buffer.from(String(hmacHeader || ''));
+  if (expectedBuffer.length !== headerBuffer.length) {
+    return false;
+  }
+
+  return crypto.timingSafeEqual(expectedBuffer, headerBuffer);
+}
+
+function buildOrdersCreateWebhookUrl(req) {
+  return `${getTrackerBaseUrl(req)}/webhooks/orders-create`;
+}
+
+function buildWebhookTrackerBarcode(orderPayload) {
+  const name = String(orderPayload?.name || '').trim();
+  if (name) return normalizeScanBarcode(name);
+
+  const orderNumber = String(orderPayload?.order_number || '').trim();
+  if (orderNumber) return normalizeScanBarcode(`ORDER-${orderNumber}`);
+
+  const numericId = String(orderPayload?.id || '').trim();
+  if (numericId) return normalizeScanBarcode(`ORDER-${numericId}`);
+
+  return '';
+}
+
+function buildWebhookLineItems(lineItems = []) {
+  return (lineItems || [])
+    .map((lineItem) => {
+      const quantity = Math.max(0, Number(lineItem?.current_quantity ?? lineItem?.quantity) || 0);
+      if (quantity <= 0) return null;
+
+      return {
+        title: String(lineItem?.title || '').trim(),
+        variantTitle: String(lineItem?.variant_title || '').trim(),
+        sku: String(lineItem?.sku || '').trim(),
+        quantity,
+      };
+    })
+    .filter(Boolean);
+}
+
+async function ensureOrdersCreateWebhookSubscription({ client, shop, req }) {
+  if (!client || !shop) return false;
+  if (webhookRegistrationCheckedShops.has(shop)) {
+    return true;
+  }
+
+  const callbackUrl = buildOrdersCreateWebhookUrl(req);
+  const query = `
+    query getWebhookSubscriptions {
+      webhookSubscriptions(first: 50) {
+        edges {
+          node {
+            id
+            topic
+            endpoint {
+              __typename
+              ... on WebhookHttpEndpoint {
+                callbackUrl
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const response = await client.graphql(query);
+  const subscriptions = response.data?.webhookSubscriptions?.edges || [];
+  const matchingSubscription = subscriptions.find((edge) => {
+    const node = edge?.node;
+    const topic = String(node?.topic || '').trim().toUpperCase();
+    const existingCallbackUrl = String(node?.endpoint?.callbackUrl || '').trim();
+    return topic === 'ORDERS_CREATE' && existingCallbackUrl === callbackUrl;
+  });
+
+  if (matchingSubscription) {
+    webhookRegistrationCheckedShops.add(shop);
+    return true;
+  }
+
+  const mutation = `
+    mutation createOrdersCreateWebhook($topic: WebhookSubscriptionTopic!, $webhookSubscription: WebhookSubscriptionInput!) {
+      webhookSubscriptionCreate(topic: $topic, webhookSubscription: $webhookSubscription) {
+        webhookSubscription {
+          id
+          topic
+        }
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  const createResponse = await client.graphql(mutation, {
+    variables: {
+      topic: 'ORDERS_CREATE',
+      webhookSubscription: {
+        uri: callbackUrl,
+        format: 'JSON',
+        includeFields: [
+          'id',
+          'name',
+          'order_number',
+          'created_at',
+          'note',
+          'tags',
+          'cancelled_at',
+          'fulfillment_status',
+          'line_items',
+        ],
+      },
+    },
+  });
+
+  const userErrors = createResponse.data?.webhookSubscriptionCreate?.userErrors || [];
+  if (userErrors.length) {
+    const message = userErrors.map((error) => error.message).join('; ');
+    throw new Error(`Failed to register orders/create webhook: ${message}`);
+  }
+
+  webhookRegistrationCheckedShops.add(shop);
+  return true;
 }
 
 function formatOrderStatusLabel(value) {
@@ -266,6 +426,77 @@ function buildCurrentOrderLineItems(edges = []) {
     .filter(Boolean);
 }
 
+router.post('/webhooks/orders-create', async (req, res) => {
+  const topic = String(req.get('X-Shopify-Topic') || '').trim();
+  const shop = String(req.get('X-Shopify-Shop-Domain') || '').trim();
+  const hmacHeader = String(req.get('X-Shopify-Hmac-Sha256') || '').trim();
+
+  if (!verifyShopifyWebhook(req.rawBody, hmacHeader)) {
+    return res.sendStatus(401);
+  }
+
+  if (topic !== 'orders/create') {
+    return res.sendStatus(200);
+  }
+
+  if (!shop) {
+    return res.sendStatus(200);
+  }
+
+  let orderPayload;
+  try {
+    orderPayload = req.rawBody?.length
+      ? JSON.parse(req.rawBody.toString('utf8'))
+      : (req.body || {});
+  } catch (err) {
+    console.error('Failed to parse orders/create webhook payload:', err);
+    return res.sendStatus(400);
+  }
+
+  const session = sessionsStore.get(shop);
+  if (!session) {
+    console.error(`No session found for orders/create webhook from ${shop}`);
+    return res.sendStatus(200);
+  }
+
+  const orderId = String(orderPayload?.admin_graphql_api_id || '').trim() || (
+    orderPayload?.id ? `gid://shopify/Order/${orderPayload.id}` : ''
+  );
+  const trackerBarcode = buildWebhookTrackerBarcode(orderPayload);
+
+  if (!orderId || !trackerBarcode) {
+    return res.sendStatus(200);
+  }
+
+  try {
+    const client = shopifyClient(session);
+    await persistOrderTrackerSnapshot({
+      req,
+      client,
+      shop,
+      order: {
+        id: orderId,
+        name: String(orderPayload?.name || orderPayload?.order_number || '').trim() || `Order ${orderPayload?.id || ''}`.trim(),
+        createdAt: orderPayload?.created_at || null,
+        note: orderPayload?.note || '',
+        tags: orderPayload?.tags || '',
+        cancelledAt: orderPayload?.cancelled_at || null,
+        displayFulfillmentStatus: orderPayload?.fulfillment_status || '',
+        trackerTokenMetafield: null,
+      },
+      barcode: trackerBarcode,
+      lineItems: buildWebhookLineItems(orderPayload?.line_items || []),
+      explicitTag: '',
+      appendEventIfStageChanged: false,
+    });
+
+    return res.sendStatus(200);
+  } catch (err) {
+    console.error(`Failed to process orders/create webhook for ${shop}:`, err);
+    return res.sendStatus(500);
+  }
+});
+
 function getTrackerBaseUrl(req) {
   const configuredHost = String(process.env.HOST || '').trim();
   if (configuredHost) {
@@ -275,8 +506,106 @@ function getTrackerBaseUrl(req) {
   return `${req.protocol}://${req.get('host')}`;
 }
 
-function persistOrderTrackerSnapshot({
+async function fetchOrderTrackingLinks({ client, orderId }) {
+  if (!client || !orderId) {
+    return [];
+  }
+
+  const query = `
+    query getOrderTrackingLinks($id: ID!) {
+      order(id: $id) {
+        fulfillments(first: 20) {
+          trackingInfo(first: 10) {
+            company
+            number
+            url
+          }
+        }
+      }
+    }
+  `;
+
+  const response = await client.graphql(query, {
+    variables: { id: orderId },
+  });
+
+  const fulfillments = response.data?.order?.fulfillments || [];
+  const seenUrls = new Set();
+
+  return fulfillments.flatMap((fulfillment) => (
+    Array.isArray(fulfillment?.trackingInfo) ? fulfillment.trackingInfo : []
+  )).map((trackingInfo) => ({
+    company: String(trackingInfo?.company || '').trim(),
+    number: String(trackingInfo?.number || '').trim(),
+    url: String(trackingInfo?.url || '').trim(),
+  })).filter((trackingInfo) => {
+    if (!trackingInfo.url) return false;
+    if (seenUrls.has(trackingInfo.url)) return false;
+    seenUrls.add(trackingInfo.url);
+    return true;
+  });
+}
+
+async function syncOrderTrackerMetafield({
+  client,
+  orderId,
+  trackerToken,
+  existingTrackerToken,
+}) {
+  if (!client || !orderId || !trackerToken) {
+    return false;
+  }
+
+  const normalizedTrackerToken = String(trackerToken || '').trim();
+  const normalizedExistingToken = String(existingTrackerToken || '').trim();
+  if (!normalizedTrackerToken || normalizedExistingToken === normalizedTrackerToken) {
+    return false;
+  }
+
+  const mutation = `
+    mutation setOrderTrackerMetafield($metafields: [MetafieldsSetInput!]!) {
+      metafieldsSet(metafields: $metafields) {
+        metafields {
+          namespace
+          key
+          value
+          updatedAt
+        }
+        userErrors {
+          field
+          message
+          code
+        }
+      }
+    }
+  `;
+
+  const response = await client.graphql(mutation, {
+    variables: {
+      metafields: [
+        {
+          ownerId: orderId,
+          namespace: TRACKER_METAFIELD_NAMESPACE,
+          key: TRACKER_METAFIELD_KEY,
+          type: 'single_line_text_field',
+          value: normalizedTrackerToken,
+        },
+      ],
+    },
+  });
+
+  const userErrors = response.data?.metafieldsSet?.userErrors || [];
+  if (userErrors.length) {
+    const message = userErrors.map((error) => error.message).join('; ');
+    throw new Error(`Failed to sync order tracker metafield: ${message}`);
+  }
+
+  return true;
+}
+
+async function persistOrderTrackerSnapshot({
   req,
+  client,
   shop,
   order,
   barcode,
@@ -317,6 +646,17 @@ function persistOrderTrackerSnapshot({
     return { trackerToken: null, trackerUrl: null };
   }
 
+  try {
+    await syncOrderTrackerMetafield({
+      client,
+      orderId: order.id,
+      trackerToken: trackerSnapshot.publicToken,
+      existingTrackerToken: order.trackerTokenMetafield?.value,
+    });
+  } catch (err) {
+    console.error(`Failed to sync tracker metafield for order ${order.id}:`, err);
+  }
+
   const trackerBaseUrl = getTrackerBaseUrl(req);
   return {
     trackerToken: trackerSnapshot.publicToken,
@@ -342,6 +682,7 @@ function getPickListOrderQuery({ includeBundleGroup }) {
               note
               tags
               ${ORDER_WORKFLOW_STATUS_FIELDS}
+              ${ORDER_TRACKER_METAFIELD_FIELD}
               lineItems(first: 200) {
                 edges {
                   node {
@@ -462,6 +803,7 @@ router.post('/api/tag-order', async (req, res) => {
               note
               tags
               ${ORDER_WORKFLOW_STATUS_FIELDS}
+              ${ORDER_TRACKER_METAFIELD_FIELD}
               lineItems(first: 200) {
                 edges {
                   node {
@@ -499,8 +841,9 @@ router.post('/api/tag-order', async (req, res) => {
     const lineItemArray = buildCurrentOrderLineItems(order.lineItems?.edges || []);
     const workflowBlock = getOrderWorkflowBlock(order);
     if (workflowBlock) {
-      const trackerInfo = persistOrderTrackerSnapshot({
+      const trackerInfo = await persistOrderTrackerSnapshot({
         req,
+        client,
         shop,
         order,
         barcode: normalizedBarcode,
@@ -664,8 +1007,9 @@ router.post('/api/tag-order', async (req, res) => {
       }
     }
 
-    const trackerInfo = persistOrderTrackerSnapshot({
+    const trackerInfo = await persistOrderTrackerSnapshot({
       req,
+      client,
       shop,
       order: {
         ...order,
@@ -1084,8 +1428,9 @@ router.post('/api/pick-list', async (req, res) => {
       shop,
       barcode: normalizedBarcode,
     });
-    const trackerInfo = persistOrderTrackerSnapshot({
+    const trackerInfo = await persistOrderTrackerSnapshot({
       req,
+      client,
       shop,
       order,
       barcode: normalizedBarcode,
@@ -1134,11 +1479,28 @@ router.get('/api/order-tracker/:token', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Tracker not found' });
     }
 
+    let trackingLinks = [];
+    const currentStageKey = String(trackerRecord.currentStageKey || '').trim();
+    if (currentStageKey === 'fulfilled' || currentStageKey === 'partially_fulfilled') {
+      const session = sessionsStore.get(trackerRecord.shop);
+      if (session) {
+        try {
+          const client = shopifyClient(session);
+          trackingLinks = await fetchOrderTrackingLinks({
+            client,
+            orderId: trackerRecord.orderId,
+          });
+        } catch (trackingErr) {
+          console.error(`Failed to fetch tracking links for ${trackerRecord.orderId}:`, trackingErr);
+        }
+      }
+    }
+
     res.set('Cache-Control', 'no-store');
 
     return res.json({
       success: true,
-      tracker: buildPublicTrackerPayload(trackerRecord),
+      tracker: buildPublicTrackerPayload(trackerRecord, { trackingLinks }),
     });
   } catch (err) {
     console.error('Error in /api/order-tracker/:token:', err);

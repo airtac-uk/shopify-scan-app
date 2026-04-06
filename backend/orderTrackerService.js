@@ -440,9 +440,18 @@ function buildMilestones(currentStageKey) {
   }));
 }
 
-function buildPublicTrackerPayload(trackerRecord) {
+function buildPublicTrackerPayload(trackerRecord, options = {}) {
   const currentStage = getTrackerStageByKey(trackerRecord?.currentStageKey);
   const items = normalizeTrackerLineItems(trackerRecord?.lineItems);
+  const trackingLinks = Array.isArray(options.trackingLinks)
+    ? options.trackingLinks
+        .map((trackingLink) => ({
+          company: String(trackingLink?.company || '').trim(),
+          number: String(trackingLink?.number || '').trim(),
+          url: String(trackingLink?.url || '').trim(),
+        }))
+        .filter((trackingLink) => trackingLink.url)
+    : [];
   const timeline = Array.isArray(trackerRecord?.events)
     ? trackerRecord.events.map((event) => ({
         stageKey: String(event.stageKey || '').trim(),
@@ -468,6 +477,7 @@ function buildPublicTrackerPayload(trackerRecord) {
     },
     milestones: buildMilestones(currentStage.key),
     items,
+    trackingLinks,
     tips: buildTips(items, currentStage.key),
     quote: selectQuote(currentStage.key, `${trackerRecord?.orderNumber || ''}:${trackerRecord?.updatedAt || ''}`),
     timeline,

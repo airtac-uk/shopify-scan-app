@@ -13,7 +13,11 @@ initShopify();
 
 // Middleware
 app.use(cookieParser());
-app.use(express.json());
+app.use(express.json({
+  verify: (req, res, buf) => {
+    req.rawBody = Buffer.from(buf);
+  },
+}));
 app.use(express.static(path.join(__dirname, '..', 'frontend/public')));
 
 // Use routes

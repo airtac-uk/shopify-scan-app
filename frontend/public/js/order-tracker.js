@@ -5,7 +5,7 @@ const TRACKER_DEFAULT_STEP_COUNT = 5;
 const TRACKER_SEGMENT_GAP = 5;
 const TRACKER_ORB_CENTER = 120;
 const TRACKER_SEGMENT_SHORT_LABELS = {
-  'ORDER PLACED': 'ORDER',
+  'ORDER PLACED': 'ORDERED',
   'IN WORKSHOP': 'WORKSHOP',
   'QUALITY CHECK': 'QC',
   'PACKED': 'PACKED',
@@ -218,12 +218,12 @@ function getSegmentLabelMetrics(displayLabel, segmentAngle) {
   const minFontSize = 5.7;
   const fontSize = Math.max(minFontSize, Math.min(maxFontSize, availableArcLength / Math.max(widthUnits, 1)));
   const letterSpacing = glyphCount >= 12
-    ? 0.04
+    ? 0.07
     : glyphCount >= 9
-      ? 0.07
+      ? 0.1
       : isCompactTrackerViewport()
-        ? 0.1
-        : 0.14;
+        ? 0.13
+        : 0.17;
 
   return {
     fontSize: Number(fontSize.toFixed(2)),
@@ -249,7 +249,8 @@ function getSegmentLabelLayout(displayLabel, geometry, labelMetrics) {
   const radius = getSegmentLabelRadius();
   const characters = Array.from(String(displayLabel || ''));
   const letterSpacingPx = labelMetrics.fontSize * labelMetrics.letterSpacing;
-  const direction = shouldReverseSegmentLabel(geometry.centerAngle) ? -1 : 1;
+  const shouldFlipGlyphs = shouldReverseSegmentLabel(geometry.centerAngle);
+  const direction = shouldFlipGlyphs ? -1 : 1;
   const glyphs = [];
 
   let totalWidth = 0;
@@ -267,11 +268,9 @@ function getSegmentLabelLayout(displayLabel, geometry, labelMetrics) {
     const centerOffsetPx = offsetPx + (glyphWidth / 2);
     const centerAngle = geometry.centerAngle + (direction * ((centerOffsetPx / radius) * (180 / Math.PI)));
     const point = polarToCartesian(radius, centerAngle);
-    let rotation = normalizeAngle(centerAngle);
-
-    if (rotation > 90 && rotation < 270) {
-      rotation -= 180;
-    }
+    const rotation = shouldFlipGlyphs
+      ? centerAngle - 180
+      : centerAngle;
 
     glyphs.push({
       character,
@@ -374,6 +373,7 @@ function setTrackerError(message) {
   const tips = document.getElementById('trackerTips');
   const items = document.getElementById('trackerItems');
   const timeline = document.getElementById('trackerTimeline');
+  const trackingLinks = document.getElementById('trackerTrackingLinks');
   const milestones = document.getElementById('trackerMilestones');
   const card = document.getElementById('trackerStatusCard');
 
@@ -385,10 +385,17 @@ function setTrackerError(message) {
   if (tips) tips.innerHTML = '<li>Please check the link or try again later.</li>';
   if (items) items.innerHTML = '<p class="tracker-empty">No order details available.</p>';
   if (timeline) timeline.innerHTML = '<p class="tracker-empty">No timeline updates available.</p>';
+  if (trackingLinks) {
+    trackingLinks.hidden = true;
+    trackingLinks.innerHTML = '';
+  }
   if (milestones) milestones.innerHTML = '';
   renderTrackerStepSegments(buildPlaceholderMilestones());
   setTrackerProgressSummary(null, null, 'Unavailable');
-  if (card) card.dataset.tone = 'warn';
+  if (card) {
+    card.dataset.tone = 'warn';
+    card.dataset.stageKey = 'error';
+  }
   trackerIntroRunId += 1;
   trackerHasPlayedIntro = false;
   document.title = 'AIRTAC Order Tracker';
@@ -429,6 +436,39 @@ function renderTrackerTips(tips) {
   }
 
   container.innerHTML = tips.map((tip) => `<li>${escapeHtml(tip)}</li>`).join('');
+}
+
+function renderTrackerTrackingLinks(trackingLinks) {
+  const container = document.getElementById('trackerTrackingLinks');
+  if (!container) return;
+
+  const safeLinks = Array.isArray(trackingLinks)
+    ? trackingLinks.filter((trackingLink) => trackingLink?.url)
+    : [];
+
+  if (safeLinks.length === 0) {
+    container.hidden = true;
+    container.innerHTML = '';
+    return;
+  }
+
+  container.hidden = false;
+  container.innerHTML = safeLinks.map((trackingLink, index) => {
+    const parts = [
+      String(trackingLink.company || '').trim(),
+      String(trackingLink.number || '').trim(),
+    ].filter(Boolean);
+    const label = parts.join(' ') || `Track shipment ${index + 1}`;
+
+    return `
+      <a
+        class="tracker-tracking-link"
+        href="${escapeHtml(trackingLink.url)}"
+        target="_blank"
+        rel="noopener noreferrer"
+      >${escapeHtml(label)}</a>
+    `;
+  }).join('');
 }
 
 function renderTrackerTimeline(timeline) {
@@ -532,10 +572,14 @@ function renderTracker(tracker) {
     updated.textContent = updatedText ? `Last updated ${updatedText}` : 'Waiting for live workshop updates.';
   }
 
-  if (card) card.dataset.tone = tracker.currentStage?.tone || 'info';
+  if (card) {
+    card.dataset.tone = tracker.currentStage?.tone || 'info';
+    card.dataset.stageKey = tracker.currentStage?.key || 'unknown';
+  }
   document.title = `${tracker.currentStage?.label || 'Order Tracker'} | ${tracker.orderNumber || 'AIRTAC'}`;
 
   renderTrackerTips(tracker.tips);
+  renderTrackerTrackingLinks(tracker.trackingLinks);
   renderTrackerItems(tracker.items);
   renderTrackerTimeline(tracker.timeline);
 

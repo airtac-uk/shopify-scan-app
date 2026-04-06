@@ -845,6 +845,16 @@ button:hover { background: #0056b3; }
     linear-gradient(180deg, #090b09 0%, #050605 100%);
 }
 
+.customer-tracker-page h1,
+.customer-tracker-page h2,
+.customer-tracker-page h3,
+.customer-tracker-page h4,
+.customer-tracker-page .tracker-kicker,
+.customer-tracker-page .tracker-order-number,
+.customer-tracker-page .tracker-disclosure summary {
+  letter-spacing: 0.025em;
+}
+
 .tracker-shell {
   max-width: 760px;
   margin: 0 auto;
@@ -881,9 +891,10 @@ button:hover { background: #0056b3; }
 .tracker-orb-card {
   --tracker-accent: #a7ff34;
   --tracker-accent-soft: rgba(167, 255, 52, 0.18);
-  --tracker-complete: #5d7f23;
-  --tracker-complete-soft: rgba(93, 127, 35, 0.28);
-  --tracker-frame: rgba(167, 255, 52, 0.18);
+  --tracker-complete: #65705f;
+  --tracker-complete-soft: rgba(101, 112, 95, 0.26);
+  --tracker-track: #2a2f29;
+  --tracker-frame: rgba(138, 150, 132, 0.18);
   padding: 24px 20px;
   border: 1px solid var(--tracker-frame);
   border-radius: 28px;
@@ -901,12 +912,18 @@ button:hover { background: #0056b3; }
 
 .tracker-orb-card[data-tone="good"],
 .tracker-orb-card[data-tone="complete"] {
-  --tracker-frame: rgba(167, 255, 52, 0.24);
+  --tracker-frame: rgba(130, 143, 124, 0.22);
 }
 
 .tracker-orb-card[data-tone="warn"],
 .tracker-orb-card[data-tone="hold"] {
   --tracker-frame: rgba(214, 138, 33, 0.28);
+}
+
+.tracker-orb-card[data-stage-key="awaiting_parts"] {
+  --tracker-accent: #d88a21;
+  --tracker-accent-soft: rgba(216, 138, 33, 0.2);
+  --tracker-frame: rgba(214, 138, 33, 0.3);
 }
 
 .tracker-orb-card[data-tone="cancelled"] {
@@ -937,7 +954,7 @@ button:hover { background: #0056b3; }
   stroke-width: 18;
   stroke-linecap: butt;
   stroke-linejoin: miter;
-  stroke: #242924;
+  stroke: var(--tracker-track);
   opacity: 1;
   transition: stroke 220ms ease, opacity 220ms ease, stroke-width 220ms ease, filter 220ms ease;
 }
@@ -953,7 +970,7 @@ button:hover { background: #0056b3; }
 }
 
 .tracker-orb-segment[data-state="todo"] {
-  stroke: #242924;
+  stroke: var(--tracker-track);
 }
 
 .tracker-orb-segment-label {
@@ -968,7 +985,7 @@ button:hover { background: #0056b3; }
 }
 
 .tracker-orb-segment-group[data-state="done"] .tracker-orb-segment-label {
-  fill: #d0deba;
+  fill: #d6ddd1;
 }
 
 .tracker-orb-segment-group[data-state="current"] .tracker-orb-segment-label {
@@ -1027,6 +1044,36 @@ button:hover { background: #0056b3; }
   font-size: clamp(16px, 2.6vw, 19px);
   line-height: 1.45;
   text-align: center;
+}
+
+.tracker-tracking-links {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: center;
+  gap: 10px;
+  margin: 18px auto 0;
+}
+
+.tracker-tracking-link {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 44px;
+  padding: 12px 16px;
+  border: 1px solid rgba(167, 255, 52, 0.26);
+  border-radius: 999px;
+  background: rgba(167, 255, 52, 0.08);
+  color: #dff0c2;
+  font-weight: 800;
+  text-decoration: none;
+  transition: transform 180ms ease, background 180ms ease, border-color 180ms ease, color 180ms ease;
+}
+
+.tracker-tracking-link:hover {
+  transform: translateY(-1px);
+  background: rgba(167, 255, 52, 0.12);
+  border-color: rgba(167, 255, 52, 0.38);
+  color: #f3f9ea;
 }
 
 .tracker-quote {
