@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AIRTAC Order Tracker</title>
+  <link rel="stylesheet" href="/css/style.css" />
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body class="customer-tracker-page">
+  <main class="tracker-shell">
+    <header class="tracker-hero">
+      <p class="tracker-kicker">AIRTAC Order Tracker</p>
+      <p id="trackerOrderNumber" class="tracker-order-number">Order loading...</p>
+      <p id="trackerUpdated" class="tracker-updated">Checking for updates...</p>
+    </header>
+
+    <section id="trackerStatusCard" class="tracker-orb-card" data-tone="info">
+      <div class="tracker-orb-wrap">
+        <div class="tracker-orb">
+          <svg class="tracker-orb-ring" viewBox="0 0 240 240" aria-hidden="true">
+            <g id="trackerProgressSegments"></g>
+          </svg>
+          <div class="tracker-orb-core">
+            <p class="tracker-orb-kicker">Current status</p>
+            <h1 id="trackerStageLabel">Preparing your tracker</h1>
+            <p id="trackerProgressValue" class="tracker-orb-progress">Step 0 of 5</p>
+          </div>
+        </div>
+      </div>
+
+      <p id="trackerStageText" class="tracker-stage-copy">Fetching the latest workshop update.</p>
+      <blockquote id="trackerQuote" class="tracker-quote">Loading today's nonsense...</blockquote>
+      <div id="trackerMilestones" class="tracker-milestones"></div>
+    </section>
+
+    <section class="tracker-help-strip">
+      <article class="tracker-note-card">
+        <p class="tracker-note-kicker">While you wait</p>
+        <ul id="trackerTips" class="tracker-list"></ul>
+      </article>
+    </section>
+
+    <section class="tracker-details">
+      <details class="tracker-disclosure">
+        <summary>View order items</summary>
+        <div id="trackerItems" class="tracker-items"></div>
+      </details>
+
+      <details class="tracker-disclosure">
+        <summary>View full timeline</summary>
+        <div id="trackerTimeline" class="tracker-timeline"></div>
+      </details>
+    </section>
+  </main>
+
+  <script src="/js/order-tracker.js"></script>
+</body>
+</html>

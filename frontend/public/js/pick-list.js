@@ -12,6 +12,8 @@ let hasRenderedPickList = false;
 let currentOrderBarcode = '';
 let currentOrderNumber = '';
 let currentOrderNote = '';
+let currentWorkflowBlock = null;
+let currentTrackerUrl = '';
 let lastActionTag = '';
 let lastActionBarcode = '';
 let actionButtons = [];
@@ -58,6 +60,104 @@ function setStatus(message, type = 'info') {
   el.dataset.type = type;
 }
 
+function renderTrackerLink() {
+  const container = document.getElementById('pickListTrackerLink');
+  const anchor = document.getElementById('pickListTrackerAnchor');
+  if (!container || !anchor) return;
+
+  if (!currentTrackerUrl) {
+    container.hidden = true;
+    anchor.href = '#';
+    return;
+  }
+
+  anchor.href = currentTrackerUrl;
+  container.hidden = false;
+}
+
+function formatWorkflowStatusLabel(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return '';
+
+  return raw
+    .toLowerCase()
+    .split('_')
+    .filter(Boolean)
+    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
+    .join(' ');
+}
+
+function renderWorkflowAlert() {
+  const alert = document.getElementById('pickListWorkflowAlert');
+  const title = document.getElementById('pickListWorkflowAlertTitle');
+  const badge = document.getElementById('pickListWorkflowAlertBadge');
+  const message = document.getElementById('pickListWorkflowAlertMessage');
+  if (!alert || !title || !badge || !message) return;
+
+  alert.classList.remove(
+    'pick-list-workflow-alert--cancelled',
+    'pick-list-workflow-alert--fulfilled',
+    'pick-list-workflow-alert--partiallyfulfilled',
+    'pick-list-workflow-alert--restocked'
+  );
+
+  if (!isCurrentOrderWorkflowBlocked()) {
+    alert.hidden = true;
+    title.textContent = 'Order blocked';
+    badge.textContent = '';
+    message.textContent = '';
+    return;
+  }
+
+  const workflowStatus = String(currentWorkflowBlock?.status || '').trim();
+  const workflowCode = String(currentWorkflowBlock?.code || '').trim().toLowerCase();
+  const normalizedClassKey = workflowStatus.toLowerCase().replace(/[^a-z0-9]/g, '');
+  const statusLabel = formatWorkflowStatusLabel(workflowStatus || workflowCode);
+
+  if (normalizedClassKey) {
+    alert.classList.add(`pick-list-workflow-alert--${normalizedClassKey}`);
+  }
+
+  title.textContent = statusLabel
+    ? `${statusLabel} Order`
+    : 'Order blocked';
+  badge.textContent = statusLabel || 'Blocked';
+  message.textContent = currentWorkflowBlock?.message || 'This order cannot be picked or built.';
+  alert.hidden = false;
+}
+
+function isCurrentOrderWorkflowBlocked() {
+  return Boolean(currentWorkflowBlock && currentWorkflowBlock.blocked);
+}
+
+function clearLoadedOrderState() {
+  lastRenderedLineItems = [];
+  lastOrderItems = [];
+  lastWholesaleProgressByItemKey = {};
+  hasRenderedPickList = false;
+  currentOrderBarcode = '';
+  currentOrderNumber = '';
+  currentOrderNote = '';
+  currentWorkflowBlock = null;
+  currentTrackerUrl = '';
+  verifyItems = [];
+  verifyCodeIndex = new Map();
+
+  const orderMeta = document.getElementById('pickListOrderMeta');
+  const lineItems = document.getElementById('pickListLineItems');
+  const timelineSection = document.getElementById('pickListTimelineSection');
+  const timelineCard = document.getElementById('pickListTimelineCard');
+
+  if (orderMeta) orderMeta.textContent = '';
+  if (lineItems) lineItems.innerHTML = '';
+  if (timelineSection) timelineSection.hidden = true;
+  if (timelineCard) timelineCard.innerHTML = '';
+
+  renderWorkflowAlert();
+  renderTrackerLink();
+  setActionButtonsEnabled(false);
+}
+
 function isVerificationStyleModeEnabled() {
   return verifyModeEnabled || wholesaleModeEnabled;
 }
@@ -73,13 +173,18 @@ function setActionButtonsEnabled(enabled) {
   actionButtons.forEach((button) => {
     const tag = button.dataset.orderAction || '';
     const packagedLocked = tag === 'packaged' && isPackagedActionLocked();
-    button.disabled = loading || !actionButtonsUnlocked || packagedLocked;
+    button.disabled = loading || !actionButtonsUnlocked || packagedLocked || isCurrentOrderWorkflowBlocked();
   });
 }
 
 function syncVerifyButtonDisabledState() {
   const verifyButtons = document.querySelectorAll('.pick-verify-item-btn');
   verifyButtons.forEach((button) => {
+    if (isCurrentOrderWorkflowBlocked()) {
+      button.disabled = true;
+      return;
+    }
+
     const role = button.dataset.role || 'increment';
     if (role === 'undo') {
       const canUndo = button.dataset.canUndo === '1';
@@ -544,6 +649,33 @@ function playVerifyCompleteSound() {
   });
 }
 
+function playVerifyErrorSound() {
+  const ctx = getVerifyAudioContext();
+  if (!ctx) return;
+
+  playVerifyTone(ctx, {
+    startOffset: 0,
+    frequency: 380,
+    endFrequency: 220,
+    duration: 0.12,
+    gain: 0.034,
+    type: 'sawtooth',
+  });
+  playVerifyTone(ctx, {
+    startOffset: 0.14,
+    frequency: 250,
+    endFrequency: 140,
+    duration: 0.16,
+    gain: 0.03,
+    type: 'sawtooth',
+  });
+}
+
+function showWorkflowBlockedWarning(message = '') {
+  playVerifyErrorSound();
+  setStatus(message || 'This order cannot be picked or built.', 'error');
+}
+
 function buildVerifyState(orderItems, initialProgressByItemKey = null) {
   const grouped = new Map();
   const bundleOrder = new Map();
@@ -893,6 +1025,11 @@ function getVerifyDisplayLabel(row) {
 
 function processVerifyManual(key) {
   if (!isVerificationStyleModeEnabled()) return;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
   const row = verifyItems.find((item) => item.key === key);
   if (!row) {
     setStatus('Error: Verification item not found.', 'error');
@@ -923,6 +1060,11 @@ function processVerifyManual(key) {
 
 function processVerifyUndo(key) {
   if (!isVerificationStyleModeEnabled()) return;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
   const row = verifyItems.find((item) => item.key === key);
   if (!row) {
     setStatus('Error: Verification item not found.', 'error');
@@ -943,6 +1085,11 @@ function processVerifyUndo(key) {
 
 function processVerifyScan(scannedCode) {
   if (!isVerificationStyleModeEnabled()) return false;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return true;
+  }
+
   const codeVariants = expandVerifyCodeVariants(scannedCode);
   const normalizedCode = codeVariants[0] || '';
   if (!normalizedCode) {
@@ -1189,6 +1336,11 @@ async function runOrderAction(tag) {
     return;
   }
 
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
   if (tag === 'packaged' && isPackagedActionLocked()) {
     setStatus('Complete Verify Order before marking this order as Packaged.', 'error');
     return;
@@ -1271,16 +1423,38 @@ async function fetchPickList(barcodeInput) {
 
     const data = await response.json();
     if (!response.ok || !data.success) {
+      if (data.workflowBlocked) {
+        clearLoadedOrderState();
+        playVerifyErrorSound();
+        setStatus(data.error || 'This order cannot be picked or built.', 'error');
+        return;
+      }
+
+      if (response.status === 404) {
+        clearLoadedOrderState();
+      }
+
       throw new Error(data.error || 'Failed to load pick list');
     }
 
     currentOrderBarcode = data.barcode;
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
+    currentTrackerUrl = String(data.trackerUrl || '').trim();
+    currentWorkflowBlock = data.workflowBlocked
+      ? {
+          blocked: true,
+          code: data.workflowBlockCode || '',
+          status: data.workflowStatus || '',
+          message: data.workflowWarning || data.error || 'This order cannot be picked or built.',
+        }
+      : null;
     setActionButtonsEnabled(true);
 
     const orderMeta = document.getElementById('pickListOrderMeta');
     orderMeta.textContent = `${data.orderNumber} (${data.barcode})`;
+    renderWorkflowAlert();
+    renderTrackerLink();
 
     lastRenderedLineItems = Array.isArray(data.lineItems) ? data.lineItems : [];
     lastOrderItems = Array.isArray(data.orderItems) ? data.orderItems : [];
@@ -1298,6 +1472,11 @@ async function fetchPickList(barcodeInput) {
       barcodeInputEl.value = '';
     }
     focusBarcodeInput();
+
+    if (currentWorkflowBlock) {
+      showWorkflowBlockedWarning(currentWorkflowBlock.message);
+      return;
+    }
 
     const noteState = data.notesEnabled
       ? (data.notesLoaded ? ' Notes loaded.' : ' Notes unavailable for this refresh.')
@@ -1422,6 +1601,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const pickerModeToggle = document.getElementById('pickerModeToggle');
   const verifyModeToggle = document.getElementById('verifyModeToggle');
   const wholesaleModeToggle = document.getElementById('wholesaleModeToggle');
+  const trackerCopyButton = document.getElementById('pickListTrackerCopyBtn');
 
   actionButtons = Array.from(document.querySelectorAll('.pick-list-action-btn'));
   setActionButtonsEnabled(false);
@@ -1437,6 +1617,19 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (button) {
     button.addEventListener('click', () => fetchPickList(input?.value || ''));
+  }
+
+  if (trackerCopyButton) {
+    trackerCopyButton.addEventListener('click', async () => {
+      if (!currentTrackerUrl) return;
+
+      try {
+        await navigator.clipboard.writeText(currentTrackerUrl);
+        setStatus('Customer tracker link copied.', 'success');
+      } catch (err) {
+        setStatus('Could not copy the tracker link.', 'error');
+      }
+    });
   }
 
   if (input) {

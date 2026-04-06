@@ -1,11 +1,18 @@
 // routes.js
 const express = require('express');
 const router = express.Router();
+const path = require('path');
 const cookieParser = require('cookie-parser');
 const sessionsStore = require('./sessionsStore'); // your SQLite session store
 const { initShopify, shopifyClient } = require('./shopifyClient');
 const fetch = require('node-fetch'); // for OAuth token exchange
 const { fetchPickListSheet, buildPickListForOrder, normalizeSku } = require('./pickListService');
+const {
+  deriveTrackerStage,
+  extractTrackerEventsFromOrderNote,
+  normalizeTrackerLineItems,
+  buildPublicTrackerPayload,
+} = require('./orderTrackerService');
 
 router.use(cookieParser());
 
@@ -181,9 +188,140 @@ async function sendGeckoboardEvent(eventData) {
 
 let geckoboardDatasetChecked = false;
 const wholesaleAdapterBuiltScanCounts = new Map();
+const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
+const ORDER_WORKFLOW_STATUS_FIELDS = `
+              displayFulfillmentStatus
+              cancelledAt
+              cancelReason
+`;
 
 function normalizeScanBarcode(barcode) {
   return normalizeSku(barcode);
+}
+
+function formatOrderStatusLabel(value) {
+  return String(value || '')
+    .trim()
+    .toLowerCase()
+    .replace(/_/g, ' ');
+}
+
+function getOrderWorkflowBlock(order) {
+  if (!order) return null;
+
+  if (order.cancelledAt) {
+    const cancelReason = formatOrderStatusLabel(order.cancelReason);
+    const reasonText = cancelReason ? ` (${cancelReason})` : '';
+    return {
+      code: 'cancelled',
+      status: 'CANCELLED',
+      message: `Order ${order.name} is cancelled${reasonText}. Do not pick or build this order.`,
+    };
+  }
+
+  const fulfillmentStatus = String(order.displayFulfillmentStatus || '').trim().toUpperCase();
+  if (BLOCKED_FULFILLMENT_STATUSES.has(fulfillmentStatus)) {
+    return {
+      code: fulfillmentStatus.toLowerCase(),
+      status: fulfillmentStatus,
+      message: `Order ${order.name} is ${formatOrderStatusLabel(fulfillmentStatus)}. Do not pick or build this order.`,
+    };
+  }
+
+  return null;
+}
+
+function buildCurrentOrderLineItems(edges = []) {
+  return (edges || [])
+    .map((edge, index) => {
+      const node = edge?.node || {};
+      const rawCurrentQty = Number(node.currentQuantity);
+      const rawLegacyQty = Number(node.quantity);
+      const quantity = Number.isFinite(rawCurrentQty)
+        ? rawCurrentQty
+        : (Number.isFinite(rawLegacyQty) ? rawLegacyQty : 0);
+
+      if (quantity <= 0) {
+        return null;
+      }
+
+      const bundleGroup = node.lineItemGroup
+        ? {
+            id: String(node.lineItemGroup.id || '').trim(),
+            title: String(node.lineItemGroup.title || '').trim(),
+            quantity: Number(node.lineItemGroup.quantity) || null,
+          }
+        : null;
+
+      return {
+        id: node.id || `ORDER_LINE_${index + 1}`,
+        title: node.title || '',
+        sku: node.sku || '',
+        quantity,
+        variantTitle: node.variantTitle || '',
+        upc: node.variant?.barcode || '',
+        bundleGroup,
+      };
+    })
+    .filter(Boolean);
+}
+
+function getTrackerBaseUrl(req) {
+  const configuredHost = String(process.env.HOST || '').trim();
+  if (configuredHost) {
+    return configuredHost.replace(/\/+$/, '');
+  }
+
+  return `${req.protocol}://${req.get('host')}`;
+}
+
+function persistOrderTrackerSnapshot({
+  req,
+  shop,
+  order,
+  barcode,
+  lineItems,
+  explicitTag = '',
+  appendEventIfStageChanged = false,
+}) {
+  if (!shop || !order?.id || !barcode) {
+    return { trackerToken: null, trackerUrl: null };
+  }
+
+  const trackerStage = deriveTrackerStage({
+    explicitTag,
+    tags: order.tags,
+    cancelledAt: order.cancelledAt,
+    displayFulfillmentStatus: order.displayFulfillmentStatus,
+    orderNote: order.note,
+  });
+  const legacyEvents = extractTrackerEventsFromOrderNote(order.note || '');
+
+  const trackerSnapshot = sessionsStore.saveOrderTrackerSnapshot({
+    shop,
+    orderId: order.id,
+    barcode,
+    orderNumber: order.name,
+    orderCreatedAt: order.createdAt || null,
+    currentStage: trackerStage,
+    workflowStatus: order.cancelledAt
+      ? 'CANCELLED'
+      : (order.displayFulfillmentStatus || ''),
+    lineItems: normalizeTrackerLineItems(lineItems),
+    legacyEvents,
+    appendEventIfStageChanged,
+    sourceTag: explicitTag || null,
+  });
+
+  if (!trackerSnapshot?.publicToken) {
+    return { trackerToken: null, trackerUrl: null };
+  }
+
+  const trackerBaseUrl = getTrackerBaseUrl(req);
+  return {
+    trackerToken: trackerSnapshot.publicToken,
+    trackerUrl: `${trackerBaseUrl}/track/${trackerSnapshot.publicToken}`,
+  };
 }
 
 function includesMissingBundleFieldError(err) {
@@ -200,7 +338,10 @@ function getPickListOrderQuery({ includeBundleGroup }) {
             node {
               id
               name
+              createdAt
               note
+              tags
+              ${ORDER_WORKFLOW_STATUS_FIELDS}
               lineItems(first: 200) {
                 edges {
                   node {
@@ -208,6 +349,7 @@ function getPickListOrderQuery({ includeBundleGroup }) {
                     title
                     sku
                     quantity
+                    currentQuantity
                     variantTitle
                     variant {
                       barcode
@@ -316,7 +458,10 @@ router.post('/api/tag-order', async (req, res) => {
             node {
               id
               name
+              createdAt
+              note
               tags
+              ${ORDER_WORKFLOW_STATUS_FIELDS}
               lineItems(first: 200) {
                 edges {
                   node {
@@ -324,6 +469,7 @@ router.post('/api/tag-order', async (req, res) => {
                     title
                     sku
                     quantity
+                    currentQuantity
                     variantTitle
                     variant {
                       id
@@ -350,14 +496,29 @@ router.post('/api/tag-order', async (req, res) => {
     }
 
     const order = orderEdge.node;
-
-    const lineItemArray = order.lineItems.edges.map(edge => ({
-      id: edge.node.id,
-      title: edge.node.title,
-      sku: edge.node.sku,
-      quantity: edge.node.quantity,
-      variantTitle: edge.node.variantTitle,
-    }));
+    const lineItemArray = buildCurrentOrderLineItems(order.lineItems?.edges || []);
+    const workflowBlock = getOrderWorkflowBlock(order);
+    if (workflowBlock) {
+      const trackerInfo = persistOrderTrackerSnapshot({
+        req,
+        shop,
+        order,
+        barcode: normalizedBarcode,
+        lineItems: lineItemArray,
+        explicitTag: '',
+        appendEventIfStageChanged: true,
+      });
+      return res.status(409).json({
+        success: false,
+        error: workflowBlock.message,
+        workflowBlocked: true,
+        workflowBlockCode: workflowBlock.code,
+        workflowStatus: workflowBlock.status,
+        orderNumber: order.name,
+        trackerToken: trackerInfo.trackerToken,
+        trackerUrl: trackerInfo.trackerUrl,
+      });
+    }
 
     // ---------
     // -----------------------------------------
@@ -499,9 +660,22 @@ router.post('/api/tag-order', async (req, res) => {
           staff,
         });
       } catch (waitingQcStoreErr) {
-        console.error('Failed to store waiting_qc event:', waitingQcStoreErr);
+      console.error('Failed to store waiting_qc event:', waitingQcStoreErr);
       }
     }
+
+    const trackerInfo = persistOrderTrackerSnapshot({
+      req,
+      shop,
+      order: {
+        ...order,
+        tags: [tag],
+      },
+      barcode: normalizedBarcode,
+      lineItems: lineItemArray,
+      explicitTag: tag,
+      appendEventIfStageChanged: true,
+    });
 
     let wholesaleAdapterBuiltCount = null;
     if (tag == "wholesale_adapter_built") {
@@ -516,6 +690,8 @@ router.post('/api/tag-order', async (req, res) => {
       lineItems: lineItemArray,
       staff: attributedStaff,
       wholesaleAdapterBuiltCount,
+      trackerToken: trackerInfo.trackerToken,
+      trackerUrl: trackerInfo.trackerUrl,
     });
 
   } catch (err) {
@@ -896,27 +1072,8 @@ router.post('/api/pick-list', async (req, res) => {
     }
 
     const order = orderEdge.node;
-    const orderLineItems = (order.lineItems?.edges || []).map((edge, index) => {
-      const rawQty = Number(edge.node.quantity);
-      const quantity = Number.isFinite(rawQty) && rawQty > 0 ? rawQty : 1;
-      const bundleGroup = edge.node.lineItemGroup
-        ? {
-            id: String(edge.node.lineItemGroup.id || '').trim(),
-            title: String(edge.node.lineItemGroup.title || '').trim(),
-            quantity: Number(edge.node.lineItemGroup.quantity) || null,
-          }
-        : null;
-
-      return {
-        id: edge.node.id || `ORDER_LINE_${index + 1}`,
-        title: edge.node.title || '',
-        sku: edge.node.sku || '',
-        quantity,
-        variantTitle: edge.node.variantTitle || '',
-        upc: edge.node.variant?.barcode || '',
-        bundleGroup,
-      };
-    });
+    const workflowBlock = getOrderWorkflowBlock(order);
+    const orderLineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
 
     const pickListSheet = await fetchPickListSheet();
     const pickListResult = buildPickListForOrder({
@@ -926,6 +1083,15 @@ router.post('/api/pick-list', async (req, res) => {
     const wholesaleProgressByItemKey = sessionsStore.getWholesaleBuildProgress({
       shop,
       barcode: normalizedBarcode,
+    });
+    const trackerInfo = persistOrderTrackerSnapshot({
+      req,
+      shop,
+      order,
+      barcode: normalizedBarcode,
+      lineItems: orderLineItems,
+      explicitTag: '',
+      appendEventIfStageChanged: true,
     });
 
     return res.json({
@@ -939,6 +1105,12 @@ router.post('/api/pick-list', async (req, res) => {
       notesLoaded: pickListSheet.notesLoaded || false,
       notesError: pickListSheet.notesError || null,
       bundleMetadataSupported,
+      workflowBlocked: Boolean(workflowBlock),
+      workflowBlockCode: workflowBlock?.code || null,
+      workflowStatus: workflowBlock?.status || null,
+      workflowWarning: workflowBlock?.message || '',
+      trackerToken: trackerInfo.trackerToken,
+      trackerUrl: trackerInfo.trackerUrl,
       wholesaleProgressByItemKey,
       orderItems: orderLineItems,
       lineItems: pickListResult.lineItems,
@@ -948,6 +1120,34 @@ router.post('/api/pick-list', async (req, res) => {
     console.error('Error in /api/pick-list:', err);
     return res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
+});
+
+router.get('/api/order-tracker/:token', async (req, res) => {
+  try {
+    const token = String(req.params.token || '').trim();
+    if (!token) {
+      return res.status(400).json({ success: false, error: 'Missing tracker token' });
+    }
+
+    const trackerRecord = sessionsStore.getOrderTrackerByToken(token);
+    if (!trackerRecord) {
+      return res.status(404).json({ success: false, error: 'Tracker not found' });
+    }
+
+    res.set('Cache-Control', 'no-store');
+
+    return res.json({
+      success: true,
+      tracker: buildPublicTrackerPayload(trackerRecord),
+    });
+  } catch (err) {
+    console.error('Error in /api/order-tracker/:token:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.get('/track/:token', (req, res) => {
+  res.sendFile(path.join(__dirname, '..', 'frontend/public', 'order_tracker.html'));
 });
 
 

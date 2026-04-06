@@ -302,9 +302,9 @@ document.addEventListener('DOMContentLoaded', () => {
       const data = await res.json();
       console.log('API response:', data);
 
-      lastTag = tag;
-      lastBarcode = normalizedBarcode;
       if (data.success) {
+        lastTag = tag;
+        lastBarcode = normalizedBarcode;
         positiveDing();
         if (tag === 'wholesale_adapter_built') {
           scanResult.textContent = `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`;
@@ -313,7 +313,9 @@ document.addEventListener('DOMContentLoaded', () => {
         }
       } else {
         negativeDing();
-        scanResult.textContent = `Error: ${data.error}`;
+        scanResult.textContent = data.workflowBlocked
+          ? String(data.error || 'This order cannot be picked or built.')
+          : `Error: ${data.error}`;
       }
 
       if (data.success && tag == 'awaiting_parts') {

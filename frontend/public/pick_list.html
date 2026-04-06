@@ -44,6 +44,21 @@
         <p id="pickListStatus" data-type="info">Ready to scan.</p>
       </div>
       <p id="pickListOrderMeta" class="pick-list-order-meta"></p>
+      <div id="pickListTrackerLink" class="pick-list-tracker-link" hidden>
+        <span class="pick-list-tracker-link__label">Tracker test:</span>
+        <a id="pickListTrackerAnchor" href="#" target="_blank" rel="noopener noreferrer">open customer page</a>
+        <button id="pickListTrackerCopyBtn" type="button">copy</button>
+      </div>
+    </section>
+
+    <section id="pickListWorkflowAlert" class="pick-list-workflow-alert" hidden>
+      <p class="pick-list-workflow-alert__eyebrow">Workflow Warning</p>
+      <div class="pick-list-workflow-alert__head">
+        <h2 id="pickListWorkflowAlertTitle">Order blocked</h2>
+        <span id="pickListWorkflowAlertBadge" class="pick-list-workflow-alert__badge"></span>
+      </div>
+      <p id="pickListWorkflowAlertMessage" class="pick-list-workflow-alert__message"></p>
+      <p class="pick-list-workflow-alert__foot">View only. Order actions and verify/build scanning are disabled.</p>
     </section>
 
     <section class="pick-list-actions">
