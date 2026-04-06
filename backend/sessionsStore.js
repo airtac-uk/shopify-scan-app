@@ -107,6 +107,34 @@ db.prepare(`
   ON order_tracker_events (shop, orderId, createdAt ASC, id ASC)
 `).run();
 
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS awaiting_parts_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop TEXT NOT NULL,
+    orderId TEXT NOT NULL,
+    orderNumber TEXT NOT NULL,
+    partSku TEXT NOT NULL,
+    partTypeRaw TEXT NOT NULL,
+    partTypeGroup TEXT NOT NULL,
+    quantity INTEGER NOT NULL,
+    reportedBy TEXT,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    resolvedAt TEXT
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_awaiting_parts_items_shop_open
+  ON awaiting_parts_items (shop, resolvedAt, partTypeGroup, partSku, createdAt)
+`).run();
+
+db.prepare(`
+  CREATE UNIQUE INDEX IF NOT EXISTS idx_awaiting_parts_items_open_unique
+  ON awaiting_parts_items (shop, orderId, partSku)
+  WHERE resolvedAt IS NULL
+`).run();
+
 function normalizeBarcode(barcode) {
   return String(barcode || '').trim().toUpperCase();
 }
@@ -414,6 +442,233 @@ module.exports = {
     return {
       publicToken,
       lastEventAt: existing?.lastEventAt || nowIso,
+    };
+  },
+
+  upsertAwaitingPartsItems({
+    shop,
+    orderId,
+    orderNumber,
+    reportedBy,
+    items = [],
+    createdAt,
+  }) {
+    const normalizedOrderId = String(orderId || '').trim();
+    const normalizedOrderNumber = String(orderNumber || '').trim();
+    if (!shop || !normalizedOrderId || !normalizedOrderNumber) {
+      return { openItemCount: 0 };
+    }
+
+    const nowIso = createdAt || new Date().toISOString();
+    const normalizedItems = Object.values((items || []).reduce((acc, item) => {
+      const partSku = normalizeBarcode(item?.partSku || item?.sku);
+      if (!partSku) return acc;
+
+      const key = partSku;
+      const quantity = Math.max(1, Number(item?.quantity) || 1);
+      if (!acc[key]) {
+        acc[key] = {
+          partSku,
+          partTypeRaw: String(item?.partTypeRaw || item?.type || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN',
+          partTypeGroup: String(item?.partTypeGroup || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN',
+          quantity: 0,
+        };
+      }
+
+      acc[key].quantity += quantity;
+      return acc;
+    }, {}));
+
+    const existingOpenRows = db.prepare(`
+      SELECT id, partSku
+      FROM awaiting_parts_items
+      WHERE shop = ? AND orderId = ? AND resolvedAt IS NULL
+    `).all(String(shop), normalizedOrderId);
+
+    const existingBySku = new Map(
+      existingOpenRows.map((row) => [String(row.partSku || '').trim().toUpperCase(), row])
+    );
+    const nextSkuSet = new Set(normalizedItems.map((item) => item.partSku));
+
+    const insertStmt = db.prepare(`
+      INSERT INTO awaiting_parts_items (
+        shop, orderId, orderNumber, partSku, partTypeRaw, partTypeGroup,
+        quantity, reportedBy, createdAt, updatedAt, resolvedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    `);
+
+    const updateStmt = db.prepare(`
+      UPDATE awaiting_parts_items
+      SET orderNumber = ?, partTypeRaw = ?, partTypeGroup = ?, quantity = ?, reportedBy = ?, updatedAt = ?
+      WHERE id = ?
+    `);
+
+    const resolveStmt = db.prepare(`
+      UPDATE awaiting_parts_items
+      SET resolvedAt = ?, updatedAt = ?
+      WHERE id = ?
+    `);
+
+    const tx = db.transaction(() => {
+      normalizedItems.forEach((item) => {
+        const existing = existingBySku.get(item.partSku);
+        if (existing) {
+          updateStmt.run(
+            normalizedOrderNumber,
+            item.partTypeRaw,
+            item.partTypeGroup,
+            item.quantity,
+            reportedBy ? String(reportedBy) : null,
+            nowIso,
+            existing.id
+          );
+          return;
+        }
+
+        insertStmt.run(
+          String(shop),
+          normalizedOrderId,
+          normalizedOrderNumber,
+          item.partSku,
+          item.partTypeRaw,
+          item.partTypeGroup,
+          item.quantity,
+          reportedBy ? String(reportedBy) : null,
+          nowIso,
+          nowIso
+        );
+      });
+
+      existingOpenRows.forEach((row) => {
+        const partSku = String(row.partSku || '').trim().toUpperCase();
+        if (nextSkuSet.has(partSku)) return;
+        resolveStmt.run(nowIso, nowIso, row.id);
+      });
+    });
+
+    tx();
+
+    return { openItemCount: normalizedItems.length };
+  },
+
+  resolveAwaitingPartsForOrder({ shop, orderId, resolvedAt }) {
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!shop || !normalizedOrderId) {
+      return 0;
+    }
+
+    const nowIso = resolvedAt || new Date().toISOString();
+    const result = db.prepare(`
+      UPDATE awaiting_parts_items
+      SET resolvedAt = ?, updatedAt = ?
+      WHERE shop = ? AND orderId = ? AND resolvedAt IS NULL
+    `).run(nowIso, nowIso, String(shop), normalizedOrderId);
+
+    return Number(result?.changes || 0);
+  },
+
+  getAwaitingPartsSummary({ shop, typeGroup } = {}) {
+    if (!shop) {
+      return { filters: [], items: [] };
+    }
+
+    const params = [String(shop)];
+    let typeClause = '';
+    const normalizedTypeGroup = String(typeGroup || '').trim().toUpperCase();
+    if (normalizedTypeGroup) {
+      typeClause = ' AND partTypeGroup = ?';
+      params.push(normalizedTypeGroup);
+    }
+
+    const filters = db.prepare(`
+      SELECT
+        partTypeGroup AS typeGroup,
+        COUNT(*) AS openEntryCount,
+        COUNT(DISTINCT partSku) AS distinctSkuCount,
+        COUNT(DISTINCT orderId) AS openOrderCount
+      FROM awaiting_parts_items
+      WHERE shop = ? AND resolvedAt IS NULL
+      GROUP BY partTypeGroup
+      ORDER BY partTypeGroup ASC
+    `).all(String(shop)).map((row) => ({
+      typeGroup: String(row.typeGroup || 'UNKNOWN').trim() || 'UNKNOWN',
+      openEntryCount: Number(row.openEntryCount || 0),
+      distinctSkuCount: Number(row.distinctSkuCount || 0),
+      openOrderCount: Number(row.openOrderCount || 0),
+    }));
+
+    const summaryRows = db.prepare(`
+      SELECT
+        partSku,
+        partTypeRaw,
+        partTypeGroup,
+        SUM(quantity) AS totalQuantity,
+        COUNT(DISTINCT orderId) AS openOrderCount,
+        MIN(createdAt) AS oldestOpenAt,
+        MAX(updatedAt) AS latestReportedAt
+      FROM awaiting_parts_items
+      WHERE shop = ? AND resolvedAt IS NULL${typeClause}
+      GROUP BY partSku, partTypeRaw, partTypeGroup
+    `).all(...params);
+
+    const orderDetailStmt = db.prepare(`
+      SELECT
+        orderId,
+        orderNumber,
+        quantity,
+        reportedBy,
+        createdAt,
+        updatedAt
+      FROM awaiting_parts_items
+      WHERE shop = ? AND resolvedAt IS NULL AND partSku = ? AND partTypeGroup = ?
+      ORDER BY createdAt ASC, orderNumber ASC
+    `);
+
+    const items = summaryRows.map((row) => {
+      const orders = orderDetailStmt.all(
+        String(shop),
+        String(row.partSku || '').trim().toUpperCase(),
+        String(row.partTypeGroup || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN'
+      ).map((orderRow) => ({
+        orderId: String(orderRow.orderId || '').trim(),
+        orderNumber: String(orderRow.orderNumber || '').trim(),
+        quantity: Number(orderRow.quantity || 0),
+        reportedBy: String(orderRow.reportedBy || '').trim(),
+        createdAt: orderRow.createdAt || null,
+        updatedAt: orderRow.updatedAt || null,
+      }));
+
+      return {
+        partSku: String(row.partSku || '').trim().toUpperCase(),
+        partTypeRaw: String(row.partTypeRaw || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN',
+        partTypeGroup: String(row.partTypeGroup || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN',
+        totalQuantity: Number(row.totalQuantity || 0),
+        openOrderCount: Number(row.openOrderCount || 0),
+        oldestOpenAt: row.oldestOpenAt || null,
+        latestReportedAt: row.latestReportedAt || null,
+        orders,
+      };
+    }).sort((a, b) => {
+      const orderDiff = b.openOrderCount - a.openOrderCount;
+      if (orderDiff !== 0) return orderDiff;
+
+      const qtyDiff = b.totalQuantity - a.totalQuantity;
+      if (qtyDiff !== 0) return qtyDiff;
+
+      const aOldest = a.oldestOpenAt || '';
+      const bOldest = b.oldestOpenAt || '';
+      const oldestDiff = aOldest.localeCompare(bOldest);
+      if (oldestDiff !== 0) return oldestDiff;
+
+      return a.partSku.localeCompare(b.partSku);
+    }).map((item, index) => ({
+      ...item,
+      priorityRank: index + 1,
+    }));
+
+    return {
+      filters,
+      items,
     };
   },
 

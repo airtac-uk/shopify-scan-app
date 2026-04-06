@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Awaiting Parts Queue</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body class="pick-list-page awaiting-parts-page">
+  <main class="pick-list-layout awaiting-parts-layout">
+    <header class="pick-list-topbar">
+      <div class="pick-list-link-row">
+        <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
+        <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
+      </div>
+      <h1>Awaiting Parts Queue</h1>
+      <p>Open missing parts across all orders, grouped by part SKU and ranked by operational impact.</p>
+    </header>
+
+    <section class="awaiting-parts-controls">
+      <div class="awaiting-parts-controls__head">
+        <div>
+          <p class="awaiting-parts-controls__eyebrow">Live Summary</p>
+          <p id="awaitingPartsLastUpdated" class="awaiting-parts-controls__updated">Waiting for first load.</p>
+        </div>
+        <div class="awaiting-parts-controls__actions">
+          <span id="awaitingPartsSpinner" class="loader" style="display:none;"></span>
+          <button id="awaitingPartsRefreshBtn" type="button">Refresh</button>
+        </div>
+      </div>
+      <p id="awaitingPartsStatus" class="awaiting-parts-status" data-type="info">Ready.</p>
+      <p class="awaiting-parts-controls__note">Priority order is based on open blocked orders, then total requested quantity, then oldest wait time.</p>
+    </section>
+
+    <section id="awaitingPartsOverview" class="awaiting-parts-summary-grid"></section>
+
+    <section class="awaiting-parts-filters-card">
+      <div class="awaiting-parts-filters-card__head">
+        <h2 class="pick-list-section-title">Filter By Type</h2>
+        <p>Group Adapter and SLS are combined into one queue.</p>
+      </div>
+      <div id="awaitingPartsFilters" class="awaiting-parts-filters"></div>
+    </section>
+
+    <section>
+      <div id="awaitingPartsList" class="awaiting-parts-grid"></div>
+    </section>
+  </main>
+
+  <script src="js/awaiting-parts-dashboard.js"></script>
+</body>
+</html>

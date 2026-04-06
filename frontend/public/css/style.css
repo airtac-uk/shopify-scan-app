@@ -94,6 +94,17 @@ button:hover { background: #0056b3; }
   font-weight: 600;
 }
 
+.pick-list-link-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  margin-bottom: 12px;
+}
+
+.pick-list-link-row .pick-list-link {
+  margin-bottom: 0;
+}
+
 .pick-list-controls {
   background: #161b22;
   border: 1px solid #2b3644;
@@ -556,6 +567,311 @@ button:hover { background: #0056b3; }
   font-size: 13px;
   font-weight: 700;
   background: #2a7dff;
+}
+
+.awaiting-parts-layout {
+  max-width: 1280px;
+}
+
+.awaiting-parts-controls,
+.awaiting-parts-filters-card,
+.awaiting-parts-card,
+.awaiting-parts-summary-stat {
+  background: #161b22;
+  border: 1px solid #2b3644;
+  border-radius: 14px;
+}
+
+.awaiting-parts-controls,
+.awaiting-parts-filters-card {
+  padding: 16px 18px;
+  margin-bottom: 16px;
+}
+
+.awaiting-parts-controls__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.awaiting-parts-controls__eyebrow {
+  margin: 0 0 6px;
+  color: #91a3b7;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.12em;
+  text-transform: uppercase;
+}
+
+.awaiting-parts-controls__updated,
+.awaiting-parts-controls__note {
+  margin: 0;
+  color: #a7b6c6;
+}
+
+.awaiting-parts-controls__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+
+#awaitingPartsSpinner.loader {
+  width: 24px;
+  height: 24px;
+  border-width: 4px;
+}
+
+.awaiting-parts-controls__actions button {
+  width: auto;
+  min-width: 140px;
+  margin: 0;
+  border-radius: 8px;
+  padding: 10px 14px;
+  background: #2a7dff;
+}
+
+.awaiting-parts-status {
+  margin: 12px 0 0;
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.awaiting-parts-status[data-type="success"] {
+  color: #47d18c;
+}
+
+.awaiting-parts-status[data-type="error"] {
+  color: #ff7b72;
+}
+
+.awaiting-parts-controls__note {
+  margin-top: 10px;
+  font-size: 13px;
+}
+
+.awaiting-parts-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.awaiting-parts-summary-stat {
+  padding: 14px 16px;
+}
+
+.awaiting-parts-summary-stat p {
+  margin: 0;
+  color: #91a3b7;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+}
+
+.awaiting-parts-summary-stat strong {
+  display: block;
+  margin-top: 10px;
+  color: #edf3fa;
+  font-size: clamp(24px, 3vw, 34px);
+  line-height: 1;
+}
+
+.awaiting-parts-filters-card__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 12px;
+}
+
+.awaiting-parts-filters-card__head p {
+  margin: 0;
+  color: #91a3b7;
+  font-size: 13px;
+}
+
+.awaiting-parts-filters {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.awaiting-parts-filter-chip {
+  width: auto;
+  min-width: 0;
+  margin: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid #324355;
+  border-radius: 999px;
+  background: #111821;
+  color: #d5dfeb;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.awaiting-parts-filter-chip strong {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 24px;
+  min-height: 24px;
+  padding: 0 8px;
+  border-radius: 999px;
+  background: rgba(124, 200, 255, 0.12);
+  color: #8fd1ff;
+  font-size: 12px;
+}
+
+.awaiting-parts-filter-chip.is-active {
+  border-color: #4d8ad5;
+  background: #19304a;
+  color: #eef7ff;
+}
+
+.awaiting-parts-filter-chip.is-active strong {
+  background: rgba(143, 209, 255, 0.2);
+  color: #dff4ff;
+}
+
+.awaiting-parts-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.awaiting-parts-card {
+  padding: 16px;
+}
+
+.awaiting-parts-card__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.awaiting-parts-card__title-wrap {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  min-width: 0;
+}
+
+.awaiting-parts-card__priority {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 44px;
+  min-height: 44px;
+  border-radius: 12px;
+  background: #203044;
+  color: #9fd1ff;
+  font-size: 16px;
+  font-weight: 800;
+  flex: 0 0 auto;
+}
+
+.awaiting-parts-card__head h3 {
+  margin: 0;
+  font-size: clamp(22px, 3vw, 30px);
+  line-height: 1;
+  color: #ecf4fb;
+  word-break: break-word;
+}
+
+.awaiting-parts-card__head p {
+  margin: 6px 0 0;
+  color: #93a7bc;
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.awaiting-parts-card__raw-type {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 10px;
+  border-radius: 999px;
+  background: #2d2515;
+  border: 1px solid #7e6230;
+  color: #f0cb8c;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.awaiting-parts-card__metrics {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 10px;
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px solid #2b3644;
+}
+
+.awaiting-parts-card__metrics span {
+  display: block;
+  color: #8fa1b4;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.awaiting-parts-card__metrics strong {
+  display: block;
+  margin-top: 6px;
+  color: #ecf4fb;
+  font-size: 18px;
+}
+
+.awaiting-parts-card__orders {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 16px;
+}
+
+.awaiting-parts-order {
+  padding: 12px 14px;
+  border: 1px solid #293545;
+  border-radius: 12px;
+  background: #10161d;
+}
+
+.awaiting-parts-order__head,
+.awaiting-parts-order__meta {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.awaiting-parts-order__head strong {
+  color: #edf3fa;
+  font-size: 15px;
+}
+
+.awaiting-parts-order__head span {
+  color: #9fd1ff;
+  font-size: 14px;
+  font-weight: 800;
+}
+
+.awaiting-parts-order__meta {
+  margin-top: 6px;
+  color: #8ea0b3;
+  font-size: 12px;
 }
 
 .pick-verify-item-btn:disabled {
@@ -1291,8 +1607,32 @@ button:hover { background: #0056b3; }
     padding: 12px;
   }
 
+  .pick-list-link-row {
+    gap: 8px;
+  }
+
   .pick-list-workflow-alert {
     padding: 14px;
+  }
+
+  .awaiting-parts-controls,
+  .awaiting-parts-filters-card,
+  .awaiting-parts-card {
+    padding: 14px;
+  }
+
+  .awaiting-parts-summary-grid,
+  .awaiting-parts-card__metrics {
+    grid-template-columns: 1fr;
+  }
+
+  .awaiting-parts-controls__actions {
+    width: 100%;
+  }
+
+  .awaiting-parts-controls__actions button {
+    width: 100%;
+    min-width: 0;
   }
 
   .pick-list-input-row button {
@@ -1550,6 +1890,85 @@ html.theme-light .pick-modal-textarea {
   background: #ffffff;
   color: #1b2f43;
   border-color: #b7cadf;
+}
+
+html.theme-light .awaiting-parts-controls,
+html.theme-light .awaiting-parts-filters-card,
+html.theme-light .awaiting-parts-card,
+html.theme-light .awaiting-parts-summary-stat {
+  background: #ffffff;
+  border-color: #c7d8ea;
+}
+
+html.theme-light .awaiting-parts-controls__eyebrow,
+html.theme-light .awaiting-parts-summary-stat p,
+html.theme-light .awaiting-parts-filters-card__head p,
+html.theme-light .awaiting-parts-card__head p,
+html.theme-light .awaiting-parts-card__metrics span,
+html.theme-light .awaiting-parts-order__meta {
+  color: #60758b;
+}
+
+html.theme-light .awaiting-parts-controls__updated,
+html.theme-light .awaiting-parts-controls__note {
+  color: #4f647c;
+}
+
+html.theme-light .awaiting-parts-summary-stat strong,
+html.theme-light .awaiting-parts-card__head h3,
+html.theme-light .awaiting-parts-card__metrics strong,
+html.theme-light .awaiting-parts-order__head strong {
+  color: #1b2f43;
+}
+
+html.theme-light .awaiting-parts-controls__actions button {
+  background: #1f67ad;
+}
+
+html.theme-light .awaiting-parts-filter-chip {
+  border-color: #bfd2e5;
+  background: #f5f9fd;
+  color: #29445f;
+}
+
+html.theme-light .awaiting-parts-filter-chip strong {
+  background: rgba(31, 103, 173, 0.1);
+  color: #1f67ad;
+}
+
+html.theme-light .awaiting-parts-filter-chip.is-active {
+  border-color: #7fa9d1;
+  background: #dfeeff;
+  color: #16395d;
+}
+
+html.theme-light .awaiting-parts-filter-chip.is-active strong {
+  background: rgba(31, 103, 173, 0.16);
+  color: #16395d;
+}
+
+html.theme-light .awaiting-parts-card__priority {
+  background: #e3eef9;
+  color: #1f67ad;
+}
+
+html.theme-light .awaiting-parts-card__raw-type {
+  background: #fff5df;
+  border-color: #d9b36d;
+  color: #8c5c09;
+}
+
+html.theme-light .awaiting-parts-card__metrics {
+  border-top-color: #d7e1ec;
+}
+
+html.theme-light .awaiting-parts-order {
+  background: #f5f9fd;
+  border-color: #d0dcea;
+}
+
+html.theme-light .awaiting-parts-order__head span {
+  color: #1f67ad;
 }
 
 html.theme-light .theme-secret-toast {

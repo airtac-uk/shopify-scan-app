@@ -9,6 +9,7 @@ const DESK_TYPE = 'DESK ITEM';
 const NOTE_PRIORITY_HEADERS = ['LOCATION', 'SKU', 'PICK'];
 const TYPE_ORDER = ['RACKED', 'DROP IN', 'DESK ITEM', '3RD PARTY'];
 const TYPE_ORDER_INDEX = new Map(TYPE_ORDER.map((type, index) => [type, index]));
+const COMBINED_WAITING_PARTS_TYPE = 'GROUP ADAPTER / SLS';
 
 let cachedSheet = null;
 let cacheExpiresAt = 0;
@@ -22,6 +23,19 @@ function normalizeHeader(value) {
     .trim()
     .toUpperCase()
     .replace(/[^A-Z0-9]/g, '');
+}
+
+function normalizePickType(value) {
+  return String(value || '').trim().toUpperCase() || 'UNKNOWN';
+}
+
+function getWaitingPartsTypeGroup(value) {
+  const normalized = normalizePickType(value);
+  if (normalized === 'UNKNOWN') return normalized;
+  if (normalized === 'SLS' || normalized.includes('GROUP ADAPTER')) {
+    return COMBINED_WAITING_PARTS_TYPE;
+  }
+  return normalized;
 }
 
 function getTypeSortRank(type) {
@@ -171,7 +185,8 @@ function buildRowsFromTable(table) {
   }
 
   const skuIdx = headers.findIndex((h) => h === 'SKU');
-  const typeIdx = headers.findIndex((h) => h === 'PICK');
+  const pickIdx = headers.findIndex((h) => h === 'PICK');
+  const typeIdx = headers.findIndex((h) => h === 'TYPE');
   const locationIdx = headers.findIndex((h) => h === 'LOCATION');
   const plIndexes = headers
     .map((h, idx) => ({ h, idx }))
@@ -190,6 +205,7 @@ function buildRowsFromTable(table) {
     const sku = normalizeSku(getCellValue(rowCells[skuIdx]));
     if (!sku) continue;
 
+    const pickType = pickIdx >= 0 ? String(getCellValue(rowCells[pickIdx] || '')).trim().toUpperCase() : '';
     const type = typeIdx >= 0 ? String(getCellValue(rowCells[typeIdx] || '')).trim().toUpperCase() : '';
     const location = locationIdx >= 0 ? String(getCellValue(rowCells[locationIdx] || '')).trim() : '';
     const components = plIndexes
@@ -198,6 +214,7 @@ function buildRowsFromTable(table) {
 
     skuMap.set(sku, {
       sku,
+      pickType,
       type,
       location,
       components,
@@ -331,20 +348,22 @@ function classifyComponent(skuMap, sku) {
     };
   }
 
-  if (sheetRow.type === DESK_TYPE) {
+  const pickType = sheetRow.pickType || '';
+
+  if (pickType === DESK_TYPE) {
     return {
       sku,
-      type: sheetRow.type,
+      type: pickType,
       location: sheetRow.location,
       note: sheetRow.note || '',
       classification: 'desk',
     };
   }
 
-  if (PICKABLE_TYPES.has(sheetRow.type)) {
+  if (PICKABLE_TYPES.has(pickType)) {
     return {
       sku,
-      type: sheetRow.type,
+      type: pickType,
       location: sheetRow.location,
       note: sheetRow.note || '',
       classification: 'pick',
@@ -353,7 +372,7 @@ function classifyComponent(skuMap, sku) {
 
   return {
     sku,
-    type: sheetRow.type || 'UNKNOWN',
+    type: pickType || 'UNKNOWN',
     location: sheetRow.location,
     note: sheetRow.note || '',
     classification: 'review',
@@ -529,4 +548,6 @@ module.exports = {
   fetchPickListSheet,
   buildPickListForOrder,
   normalizeSku,
+  normalizePickType,
+  getWaitingPartsTypeGroup,
 };

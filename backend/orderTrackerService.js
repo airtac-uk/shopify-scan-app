@@ -296,6 +296,44 @@ function extractTrackerEventsFromOrderNote(orderNote) {
     .filter(Boolean);
 }
 
+function extractLatestAwaitingPartsSnapshot(orderNote) {
+  const segments = splitOrderNoteSegments(orderNote);
+  let latestSnapshot = null;
+
+  segments.forEach((segment) => {
+    const lines = segment
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (!lines.length) return;
+
+    const headline = lines[0];
+    const headlineMatch = headline.match(/^(.*?)(?:\s+[—-]\s+)(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})$/);
+    const headlineText = headlineMatch?.[1]?.trim() || headline;
+    const timestampText = headlineMatch?.[2]?.trim() || '';
+    const stageKey = extractStageKeyFromOrderNoteHeadline(headlineText);
+    if (stageKey !== 'awaiting_parts') return;
+
+    const details = lines.slice(1);
+    const reportedByLine = details.find((line) => /^Team Member:/i.test(line));
+    const skus = details
+      .filter((line) => /^-\s*/.test(line))
+      .map((line) => line.replace(/^-\s*/, '').trim().toUpperCase())
+      .filter(Boolean);
+
+    latestSnapshot = {
+      createdAt: parseOrderNoteTimestamp(timestampText),
+      reportedBy: reportedByLine
+        ? reportedByLine.replace(/^Team Member:\s*/i, '').trim()
+        : '',
+      skus,
+    };
+  });
+
+  return latestSnapshot;
+}
+
 function deriveTrackerStage({ explicitTag, tags, cancelledAt, displayFulfillmentStatus, orderNote }) {
   if (cancelledAt) {
     return TRACKER_STAGES.cancelled;
@@ -489,6 +527,7 @@ module.exports = {
   formatHumanLabel,
   deriveTrackerStage,
   extractTrackerEventsFromOrderNote,
+  extractLatestAwaitingPartsSnapshot,
   normalizeTrackerLineItems,
   buildPublicTrackerPayload,
 };

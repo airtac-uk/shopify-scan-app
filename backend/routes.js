@@ -7,10 +7,17 @@ const crypto = require('crypto');
 const sessionsStore = require('./sessionsStore'); // your SQLite session store
 const { initShopify, shopifyClient } = require('./shopifyClient');
 const fetch = require('node-fetch'); // for OAuth token exchange
-const { fetchPickListSheet, buildPickListForOrder, normalizeSku } = require('./pickListService');
+const {
+  fetchPickListSheet,
+  buildPickListForOrder,
+  normalizeSku,
+  normalizePickType,
+  getWaitingPartsTypeGroup,
+} = require('./pickListService');
 const {
   deriveTrackerStage,
   extractTrackerEventsFromOrderNote,
+  extractLatestAwaitingPartsSnapshot,
   normalizeTrackerLineItems,
   buildPublicTrackerPayload,
 } = require('./orderTrackerService');
@@ -204,6 +211,7 @@ async function sendGeckoboardEvent(eventData) {
 let geckoboardDatasetChecked = false;
 const wholesaleAdapterBuiltScanCounts = new Map();
 const webhookRegistrationCheckedShops = new Set();
+const awaitingPartsSyncPromises = new Map();
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
 const ORDER_WORKFLOW_STATUS_FIELDS = `
               displayFulfillmentStatus
@@ -426,6 +434,21 @@ function buildCurrentOrderLineItems(edges = []) {
     .filter(Boolean);
 }
 
+function buildTypedAwaitingPartsItems({ skus, skuMap }) {
+  return (skus || []).map((sku) => {
+    const normalizedSku = normalizeSku(sku);
+    const sheetRow = skuMap?.get(normalizedSku);
+    const partTypeRaw = normalizePickType(sheetRow?.type);
+
+    return {
+      partSku: normalizedSku,
+      partTypeRaw,
+      partTypeGroup: getWaitingPartsTypeGroup(partTypeRaw),
+      quantity: 1,
+    };
+  }).filter((item) => item.partSku);
+}
+
 router.post('/webhooks/orders-create', async (req, res) => {
   const topic = String(req.get('X-Shopify-Topic') || '').trim();
   const shop = String(req.get('X-Shopify-Shop-Domain') || '').trim();
@@ -546,6 +569,150 @@ async function fetchOrderTrackingLinks({ client, orderId }) {
   });
 }
 
+async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
+  if (!client || !shop) {
+    return {
+      scannedOrderCount: 0,
+      awaitingPartsOrderCount: 0,
+      upsertedOrderCount: 0,
+      resolvedOrderCount: 0,
+      skippedAwaitingPartsOrderCount: 0,
+      awaitingPartsSkuCount: 0,
+    };
+  }
+
+  const pickListSheet = await fetchPickListSheet();
+  const skuMap = pickListSheet?.skuMap || new Map();
+  const nowIso = new Date().toISOString();
+  const stats = {
+    scannedOrderCount: 0,
+    awaitingPartsOrderCount: 0,
+    upsertedOrderCount: 0,
+    resolvedOrderCount: 0,
+    skippedAwaitingPartsOrderCount: 0,
+    awaitingPartsSkuCount: 0,
+  };
+
+  let after = null;
+  let hasNextPage = true;
+
+  const query = `
+    query syncAwaitingPartsOrders($after: String) {
+      orders(first: 100, after: $after, query: "status:any", sortKey: UPDATED_AT, reverse: true) {
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+        edges {
+          node {
+            id
+            name
+            note
+            tags
+            ${ORDER_WORKFLOW_STATUS_FIELDS}
+          }
+        }
+      }
+    }
+  `;
+
+  while (hasNextPage) {
+    const response = await client.graphql(query, {
+      variables: { after },
+    });
+
+    const ordersConnection = response.data?.orders;
+    const edges = Array.isArray(ordersConnection?.edges) ? ordersConnection.edges : [];
+
+    edges.forEach((edge) => {
+      const order = edge?.node;
+      if (!order?.id) return;
+
+      stats.scannedOrderCount += 1;
+
+      const trackerStage = deriveTrackerStage({
+        explicitTag: '',
+        tags: order.tags,
+        cancelledAt: order.cancelledAt,
+        displayFulfillmentStatus: order.displayFulfillmentStatus,
+        orderNote: order.note,
+      });
+
+      if (trackerStage.key !== 'awaiting_parts') {
+        const resolvedCount = sessionsStore.resolveAwaitingPartsForOrder({
+          shop,
+          orderId: order.id,
+          resolvedAt: nowIso,
+        });
+        if (resolvedCount > 0) {
+          stats.resolvedOrderCount += 1;
+        }
+        return;
+      }
+
+      stats.awaitingPartsOrderCount += 1;
+
+      const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
+      if (!latestAwaitingPartsSnapshot?.skus?.length) {
+        stats.skippedAwaitingPartsOrderCount += 1;
+        return;
+      }
+
+      const typedItems = buildTypedAwaitingPartsItems({
+        skus: latestAwaitingPartsSnapshot.skus,
+        skuMap,
+      });
+      if (!typedItems.length) {
+        stats.skippedAwaitingPartsOrderCount += 1;
+        return;
+      }
+
+      const upsertResult = sessionsStore.upsertAwaitingPartsItems({
+        shop,
+        orderId: order.id,
+        orderNumber: order.name || order.id,
+        reportedBy: latestAwaitingPartsSnapshot.reportedBy || null,
+        items: typedItems,
+        createdAt: latestAwaitingPartsSnapshot.createdAt || nowIso,
+      });
+
+      stats.upsertedOrderCount += 1;
+      stats.awaitingPartsSkuCount += Number(upsertResult?.openItemCount || 0);
+    });
+
+    hasNextPage = Boolean(ordersConnection?.pageInfo?.hasNextPage);
+    after = hasNextPage ? ordersConnection?.pageInfo?.endCursor || null : null;
+  }
+
+  return stats;
+}
+
+async function ensureAwaitingPartsNoteSync({ client, shop }) {
+  if (!client || !shop) {
+    return {
+      scannedOrderCount: 0,
+      awaitingPartsOrderCount: 0,
+      upsertedOrderCount: 0,
+      resolvedOrderCount: 0,
+      skippedAwaitingPartsOrderCount: 0,
+      awaitingPartsSkuCount: 0,
+    };
+  }
+
+  const existingPromise = awaitingPartsSyncPromises.get(shop);
+  if (existingPromise) {
+    return existingPromise;
+  }
+
+  const syncPromise = syncAwaitingPartsFromOrderNotes({ client, shop })
+    .finally(() => {
+      awaitingPartsSyncPromises.delete(shop);
+    });
+
+  awaitingPartsSyncPromises.set(shop, syncPromise);
+  return syncPromise;
+}
+
 async function syncOrderTrackerMetafield({
   client,
   orderId,
@@ -641,6 +808,14 @@ async function persistOrderTrackerSnapshot({
     appendEventIfStageChanged,
     sourceTag: explicitTag || null,
   });
+
+  if (trackerStage.key !== 'awaiting_parts') {
+    sessionsStore.resolveAwaitingPartsForOrder({
+      shop,
+      orderId: order.id,
+      resolvedAt: new Date().toISOString(),
+    });
+  }
 
   if (!trackerSnapshot?.publicToken) {
     return { trackerToken: null, trackerUrl: null };
@@ -1158,6 +1333,39 @@ router.post('/api/awaiting-parts', async (req, res) => {
       });
     }
 
+    let typedAwaitingPartsItems = skus.map((sku) => ({
+      partSku: normalizeSku(sku),
+      partTypeRaw: 'UNKNOWN',
+      partTypeGroup: 'UNKNOWN',
+      quantity: 1,
+    }));
+
+    try {
+      const pickListSheet = await fetchPickListSheet();
+      typedAwaitingPartsItems = skus.map((sku) => {
+        const normalizedSku = normalizeSku(sku);
+        const sheetRow = pickListSheet.skuMap.get(normalizedSku);
+        const partTypeRaw = normalizePickType(sheetRow?.type);
+        return {
+          partSku: normalizedSku,
+          partTypeRaw,
+          partTypeGroup: getWaitingPartsTypeGroup(partTypeRaw),
+          quantity: 1,
+        };
+      });
+    } catch (sheetErr) {
+      console.error('Failed to enrich awaiting parts items with sheet types:', sheetErr);
+    }
+
+    sessionsStore.upsertAwaitingPartsItems({
+      shop,
+      orderId: order.id,
+      orderNumber: order.name,
+      reportedBy: staff,
+      items: typedAwaitingPartsItems,
+      createdAt: new Date().toISOString(),
+    });
+
     // --------------------------------------------------
     // 4️⃣ Notify Google Chat (non-blocking)
     // --------------------------------------------------
@@ -1180,6 +1388,7 @@ router.post('/api/awaiting-parts', async (req, res) => {
       success: true,
       orderNumber: order.name,
       skus,
+      awaitingPartsItems: typedAwaitingPartsItems,
     });
 
   } catch (err) {
@@ -1190,6 +1399,56 @@ router.post('/api/awaiting-parts', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: 'Server error',
+    });
+  }
+});
+
+router.get('/api/awaiting-parts-summary', async (req, res) => {
+  try {
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const rawTypeFilter = String(req.query.type || '').trim();
+    const typeGroupFilter = rawTypeFilter ? getWaitingPartsTypeGroup(rawTypeFilter) : '';
+    const shouldSyncFromNotes = String(req.query.sync || '').trim() === '1';
+    let syncStats = null;
+    let syncError = null;
+
+    if (shouldSyncFromNotes) {
+      try {
+        const client = shopifyClient(session);
+        syncStats = await ensureAwaitingPartsNoteSync({ client, shop });
+      } catch (err) {
+        console.error('Awaiting parts note sync failed:', err);
+        syncError = err.message || 'Failed to sync awaiting-parts notes';
+      }
+    }
+
+    const summary = sessionsStore.getAwaitingPartsSummary({
+      shop,
+      typeGroup: typeGroupFilter,
+    });
+
+    return res.json({
+      success: true,
+      typeGroupFilter: typeGroupFilter || null,
+      filters: summary.filters,
+      items: summary.items,
+      syncStats,
+      syncError,
+    });
+  } catch (err) {
+    console.error('Error in /api/awaiting-parts-summary:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
     });
   }
 });
