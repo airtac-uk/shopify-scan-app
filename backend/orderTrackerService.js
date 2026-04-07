@@ -10,8 +10,8 @@ const TRACKER_STAGES = {
   },
   queued: {
     key: 'queued',
-    label: 'Queued for build',
-    description: 'Your order has reached the workshop queue.',
+    label: 'Ready for build',
+    description: 'All parts for your order are ready and it is queued for one of the team to build.',
     tone: 'active',
     progress: 0.28,
     isTerminal: false,
@@ -142,9 +142,9 @@ const QUOTES_BY_STAGE = {
     'Fresh order energy detected.',
   ],
   queued: [
-    'Your parts are standing by with their tiny hard hats on.',
-    'The build bench has your order on its radar.',
-    'The workshop playlist has acknowledged your existence.',
+    'All parts are ready and your order is waiting for bench time.',
+    'Your order is build-ready and queued for one of the team.',
+    'The parts are printed, prepped, and standing by for assembly.',
   ],
   building: [
     'Somewhere in the workshop, useful noises are happening.',
@@ -294,6 +294,153 @@ function extractTrackerEventsFromOrderNote(orderNote) {
       };
     })
     .filter(Boolean);
+}
+
+function formatInternalTimelineTimestamp(rawValue) {
+  const value = String(rawValue || '').trim();
+  if (!value) return '';
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return value;
+
+  const year = date.getUTCFullYear();
+  const month = String(date.getUTCMonth() + 1).padStart(2, '0');
+  const day = String(date.getUTCDate()).padStart(2, '0');
+  const hours = String(date.getUTCHours()).padStart(2, '0');
+  const minutes = String(date.getUTCMinutes()).padStart(2, '0');
+  return `${year}-${month}-${day} ${hours}:${minutes}`;
+}
+
+function buildTimelineMatchKey(stageKey, createdAt) {
+  const normalizedStageKey = String(stageKey || '').trim();
+  const normalizedCreatedAt = String(createdAt || '').trim();
+  if (!normalizedStageKey || !normalizedCreatedAt) return '';
+  return `${normalizedStageKey}|${normalizedCreatedAt.slice(0, 16)}`;
+}
+
+function mergeTimelineDetailLists(primaryDetails, secondaryDetails) {
+  const merged = [];
+  const seen = new Set();
+
+  [primaryDetails, secondaryDetails].forEach((detailList) => {
+    (Array.isArray(detailList) ? detailList : []).forEach((detail) => {
+      const normalizedDetail = String(detail || '').trim();
+      if (!normalizedDetail) return;
+
+      const dedupeKey = normalizedDetail.toLowerCase();
+      if (seen.has(dedupeKey)) return;
+      seen.add(dedupeKey);
+      merged.push(normalizedDetail);
+    });
+  });
+
+  return merged;
+}
+
+function buildOrderNoteTimeline(orderNote) {
+  return splitOrderNoteSegments(orderNote)
+    .map((segment, index) => {
+      const lines = segment
+        .split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean);
+
+      if (!lines.length) return null;
+
+      const headline = lines[0] || '';
+      const headlineMatch = headline.match(/^(.*?)(?:\s+[—-]\s+)(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})$/);
+      const title = String(headlineMatch?.[1] || headline).trim() || 'Order update';
+      const rawTimestamp = String(headlineMatch?.[2] || '').trim();
+      const createdAt = parseOrderNoteTimestamp(rawTimestamp);
+      const stageKey = extractStageKeyFromOrderNoteHeadline(title) || '';
+
+      return {
+        id: `note-${index}-${title}-${rawTimestamp}`,
+        stageKey,
+        title,
+        createdAt: createdAt || null,
+        timestamp: rawTimestamp || formatInternalTimelineTimestamp(createdAt),
+        details: lines.slice(1),
+        source: 'order_note',
+        sequence: index,
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildPersistedTrackerTimeline(trackerRecord) {
+  return (Array.isArray(trackerRecord?.events) ? trackerRecord.events : [])
+    .map((event, index) => {
+      const stageKey = String(event?.stageKey || '').trim();
+      const title = String(event?.stageLabel || '').trim() || formatHumanLabel(stageKey || 'order_update');
+      const description = String(event?.stageDescription || '').trim();
+      const createdAt = String(event?.createdAt || '').trim() || null;
+
+      return {
+        id: `tracker-${index}-${stageKey}-${createdAt || title}`,
+        stageKey,
+        title,
+        createdAt,
+        timestamp: formatInternalTimelineTimestamp(createdAt),
+        details: description ? [description] : [],
+        source: 'tracker',
+        sequence: index,
+      };
+    });
+}
+
+function buildInternalOrderTimeline({ trackerRecord, orderNote }) {
+  const noteEvents = buildOrderNoteTimeline(orderNote);
+  const trackerEvents = buildPersistedTrackerTimeline(trackerRecord);
+  const noteEventsByMatchKey = new Map();
+
+  noteEvents.forEach((event) => {
+    const matchKey = buildTimelineMatchKey(event.stageKey, event.createdAt);
+    if (!matchKey) return;
+    noteEventsByMatchKey.set(matchKey, event);
+  });
+
+  const mergedEvents = noteEvents.slice();
+
+  trackerEvents.forEach((trackerEvent) => {
+    const matchKey = buildTimelineMatchKey(trackerEvent.stageKey, trackerEvent.createdAt);
+    const matchingNoteEvent = matchKey ? noteEventsByMatchKey.get(matchKey) : null;
+
+    if (matchingNoteEvent) {
+      matchingNoteEvent.details = mergeTimelineDetailLists(
+        matchingNoteEvent.details,
+        trackerEvent.details
+      );
+      return;
+    }
+
+    mergedEvents.push(trackerEvent);
+  });
+
+  return mergedEvents
+    .slice()
+    .sort((left, right) => {
+      const leftTime = left.createdAt ? Date.parse(left.createdAt) : Number.NaN;
+      const rightTime = right.createdAt ? Date.parse(right.createdAt) : Number.NaN;
+      const leftHasTime = Number.isFinite(leftTime);
+      const rightHasTime = Number.isFinite(rightTime);
+
+      if (leftHasTime && rightHasTime && leftTime !== rightTime) {
+        return leftTime - rightTime;
+      }
+
+      if (leftHasTime !== rightHasTime) {
+        return leftHasTime ? -1 : 1;
+      }
+
+      return Number(left.sequence || 0) - Number(right.sequence || 0);
+    })
+    .map((event, index) => ({
+      id: event.id || `${event.source || 'timeline'}-${index}`,
+      title: event.title || 'Order update',
+      timestamp: event.timestamp || '',
+      details: Array.isArray(event.details) ? event.details.filter(Boolean) : [],
+    }));
 }
 
 function extractLatestAwaitingPartsSnapshot(orderNote) {
@@ -622,4 +769,5 @@ module.exports = {
   extractLatestAwaitingPartsSnapshot,
   normalizeTrackerLineItems,
   buildPublicTrackerPayload,
+  buildInternalOrderTimeline,
 };

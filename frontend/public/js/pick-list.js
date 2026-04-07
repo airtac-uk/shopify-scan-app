@@ -12,6 +12,7 @@ let hasRenderedPickList = false;
 let currentOrderBarcode = '';
 let currentOrderNumber = '';
 let currentOrderNote = '';
+let currentOrderTimeline = [];
 let currentWorkflowBlock = null;
 let currentTrackerUrl = '';
 let currentAwaitingPartsSkuMap = new Map();
@@ -166,6 +167,7 @@ function clearLoadedOrderState() {
   currentOrderBarcode = '';
   currentOrderNumber = '';
   currentOrderNote = '';
+  currentOrderTimeline = [];
   currentWorkflowBlock = null;
   currentTrackerUrl = '';
   currentAwaitingPartsSkuMap = new Map();
@@ -298,7 +300,9 @@ function renderOrderTimeline() {
   section.hidden = false;
   container.innerHTML = '';
 
-  const events = parseTimelineEvents(currentOrderNote);
+  const events = Array.isArray(currentOrderTimeline) && currentOrderTimeline.length > 0
+    ? currentOrderTimeline
+    : parseTimelineEvents(currentOrderNote);
   if (!events.length) {
     const empty = document.createElement('p');
     empty.className = 'pick-list-empty';
@@ -1530,6 +1534,7 @@ async function fetchPickList(barcodeInput) {
     currentOrderBarcode = data.barcode;
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
+    currentOrderTimeline = Array.isArray(data.orderTimeline) ? data.orderTimeline : [];
     currentTrackerUrl = String(data.trackerUrl || '').trim();
     setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsItems) ? data.awaitingPartsItems : []);
     currentWorkflowBlock = data.workflowBlocked

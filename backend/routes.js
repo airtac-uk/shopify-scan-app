@@ -20,6 +20,7 @@ const {
   extractLatestAwaitingPartsSnapshot,
   normalizeTrackerLineItems,
   buildPublicTrackerPayload,
+  buildInternalOrderTimeline,
 } = require('./orderTrackerService');
 
 router.use(cookieParser());
@@ -1903,12 +1904,18 @@ router.post('/api/pick-list', async (req, res) => {
       explicitTag: '',
       appendEventIfStageChanged: true,
     });
+    const trackerRecord = sessionsStore.getOrderTrackerByOrderId(order.id);
+    const orderTimeline = buildInternalOrderTimeline({
+      trackerRecord,
+      orderNote: order.note || '',
+    });
 
     return res.json({
       success: true,
       barcode: normalizedBarcode,
       orderNumber: order.name,
       orderNote: order.note || '',
+      orderTimeline,
       sheetFetchedAt: pickListSheet.fetchedAt,
       sheetSkuCount: pickListSheet.sourceRowCount,
       notesEnabled: pickListSheet.notesEnabled || false,
