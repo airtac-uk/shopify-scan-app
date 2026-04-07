@@ -564,6 +564,48 @@ async function findOrCreateTrackerRecordByOrderId({ req, orderId }) {
   return null;
 }
 
+async function refreshTrackerRecordFromShopify({ req, trackerRecord }) {
+  if (!trackerRecord?.shop || !trackerRecord?.orderId) {
+    return trackerRecord || null;
+  }
+
+  const session = sessionsStore.get(trackerRecord.shop);
+  if (!session?.accessToken) {
+    return trackerRecord;
+  }
+
+  try {
+    const client = shopifyClient(session);
+    const order = await fetchOrderForTrackerById({
+      client,
+      orderId: trackerRecord.orderId,
+    });
+
+    if (!order) {
+      return trackerRecord;
+    }
+
+    const lineItems = buildCurrentOrderLineItems(order?.lineItems?.edges || []);
+    const barcode = normalizeScanBarcode(trackerRecord.barcode || order?.name || trackerRecord.orderId);
+
+    await persistOrderTrackerSnapshot({
+      req,
+      client,
+      shop: trackerRecord.shop,
+      order,
+      barcode,
+      lineItems,
+      explicitTag: '',
+      appendEventIfStageChanged: true,
+    });
+
+    return sessionsStore.getOrderTrackerByOrderId(trackerRecord.orderId) || trackerRecord;
+  } catch (err) {
+    console.error(`Failed to refresh tracker ${trackerRecord.orderId} from Shopify:`, err);
+    return trackerRecord;
+  }
+}
+
 router.post('/webhooks/orders-create', async (req, res) => {
   const topic = String(req.get('X-Shopify-Topic') || '').trim();
   const shop = String(req.get('X-Shopify-Shop-Domain') || '').trim();
@@ -1909,27 +1951,29 @@ router.get('/api/order-tracker/:token', async (req, res) => {
       return res.status(404).json({ success: false, error: 'Tracker not found' });
     }
 
+    const liveTrackerRecord = await refreshTrackerRecordFromShopify({ req, trackerRecord });
+
     let trackingLinks = [];
     let awaitingPartsItems = [];
-    const currentStageKey = String(trackerRecord.currentStageKey || '').trim();
+    const currentStageKey = String(liveTrackerRecord?.currentStageKey || '').trim();
     if (currentStageKey === 'awaiting_parts') {
       awaitingPartsItems = sessionsStore.getOpenAwaitingPartsItemsForOrder({
-        shop: trackerRecord.shop,
-        orderId: trackerRecord.orderId,
+        shop: liveTrackerRecord.shop,
+        orderId: liveTrackerRecord.orderId,
       });
     }
 
     if (currentStageKey === 'fulfilled' || currentStageKey === 'partially_fulfilled') {
-      const session = sessionsStore.get(trackerRecord.shop);
+      const session = sessionsStore.get(liveTrackerRecord.shop);
       if (session) {
         try {
           const client = shopifyClient(session);
           trackingLinks = await fetchOrderTrackingLinks({
             client,
-            orderId: trackerRecord.orderId,
+            orderId: liveTrackerRecord.orderId,
           });
         } catch (trackingErr) {
-          console.error(`Failed to fetch tracking links for ${trackerRecord.orderId}:`, trackingErr);
+          console.error(`Failed to fetch tracking links for ${liveTrackerRecord.orderId}:`, trackingErr);
         }
       }
     }
@@ -1938,7 +1982,7 @@ router.get('/api/order-tracker/:token', async (req, res) => {
 
     return res.json({
       success: true,
-      tracker: buildPublicTrackerPayload(trackerRecord, {
+      tracker: buildPublicTrackerPayload(liveTrackerRecord, {
         trackingLinks,
         awaitingPartsItems,
       }),
