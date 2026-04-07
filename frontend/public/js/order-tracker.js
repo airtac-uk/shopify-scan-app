@@ -28,6 +28,8 @@ const TRACKER_IDLE_FACTS = [
   'Buying a new sidearm is always faster than reloading',
   'Wind only affects your opponents shots.',
   'If you think you\'ve hit someone, stop playing and immediately tell a marshal. You\'ll feel SO much better',
+  'The Dominos pizza tracker is my second cousin',
+  'Every one in three airsofters is a bot'
 ];
 const TRACKER_REGGIE_MAD_MESSAGES = [
   'OI. EASY ON THE TAPPING.',
