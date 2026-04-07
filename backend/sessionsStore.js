@@ -567,6 +567,30 @@ module.exports = {
     return Number(result?.changes || 0);
   },
 
+  getOpenAwaitingPartsItemsForOrder({ shop, orderId }) {
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!shop || !normalizedOrderId) {
+      return [];
+    }
+
+    const rows = db.prepare(`
+      SELECT partSku, quantity
+      FROM awaiting_parts_items
+      WHERE shop = ? AND orderId = ? AND resolvedAt IS NULL
+      ORDER BY partSku ASC
+    `).all(String(shop), normalizedOrderId);
+
+    return rows.map((row) => ({
+      partSku: normalizeBarcode(row?.partSku),
+      quantity: Math.max(1, Number(row?.quantity) || 1),
+    })).filter((row) => row.partSku);
+  },
+
+  getOpenAwaitingPartsSkusForOrder({ shop, orderId }) {
+    return this.getOpenAwaitingPartsItemsForOrder({ shop, orderId })
+      .map((item) => item.partSku);
+  },
+
   getAwaitingPartsSummary({ shop, typeGroup } = {}) {
     if (!shop) {
       return { filters: [], items: [] };

@@ -1,8 +1,10 @@
 const AWAITING_PARTS_POLL_MS = 30000;
+const AWAITING_PARTS_MINIMAL_MODE_KEY = 'awaiting_parts_minimal_mode';
 
 let awaitingPartsActiveType = '';
 let awaitingPartsLoading = false;
 let awaitingPartsPollId = null;
+let awaitingPartsMinimalModeEnabled = false;
 
 function escapeHtml(value) {
   return String(value || '')
@@ -54,6 +56,22 @@ function getInitialTypeFilter() {
   return String(params.get('type') || '').trim().toUpperCase();
 }
 
+function loadMinimalModePreference() {
+  try {
+    return localStorage.getItem(AWAITING_PARTS_MINIMAL_MODE_KEY) === '1';
+  } catch (err) {
+    return false;
+  }
+}
+
+function saveMinimalModePreference(enabled) {
+  try {
+    localStorage.setItem(AWAITING_PARTS_MINIMAL_MODE_KEY, enabled ? '1' : '0');
+  } catch (err) {
+    // Ignore storage failures.
+  }
+}
+
 function syncTypeFilterToUrl() {
   const url = new URL(window.location.href);
   if (awaitingPartsActiveType) {
@@ -62,6 +80,20 @@ function syncTypeFilterToUrl() {
     url.searchParams.delete('type');
   }
   window.history.replaceState({}, '', `${url.pathname}${url.search}`);
+}
+
+function buildOrderViewerUrl(orderLookupValue) {
+  const normalizedValue = String(orderLookupValue || '').trim();
+  if (!normalizedValue) return '/pick_list.html';
+
+  const params = new URLSearchParams();
+  params.set('order', normalizedValue);
+  return `/pick_list.html?${params.toString()}`;
+}
+
+function formatCompactReporter(value) {
+  const reporter = String(value || '').trim();
+  return reporter ? ` · ${reporter}` : '';
 }
 
 function renderOverview(items) {
@@ -163,6 +195,58 @@ function renderAwaitingPartsList(items) {
     return;
   }
 
+  if (awaitingPartsMinimalModeEnabled) {
+    container.innerHTML = `
+      <div class="awaiting-parts-minimal-wrap">
+        <table class="awaiting-parts-minimal-table">
+          <thead>
+            <tr>
+              <th>#</th>
+              <th>Part SKU</th>
+              <th>Type</th>
+              <th>Orders</th>
+              <th>Qty</th>
+              <th>Oldest</th>
+              <th>Last</th>
+              <th>Order Links</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${safeItems.map((item) => {
+              const orders = Array.isArray(item.orders) ? item.orders : [];
+              const firstSeen = item.oldestOpenAt ? formatTimestamp(item.oldestOpenAt) : '-';
+              const lastSeen = item.latestReportedAt ? formatTimestamp(item.latestReportedAt) : '-';
+              const orderLinks = orders.length > 0
+                ? orders.map((order) => `
+                    <a class="awaiting-parts-minimal-order-link" href="${escapeHtml(buildOrderViewerUrl(order.orderNumber || order.orderId))}">
+                      ${escapeHtml(order.orderNumber || order.orderId)} x${escapeHtml(order.quantity)}${escapeHtml(formatCompactReporter(order.reportedBy))}
+                    </a>
+                  `).join('')
+                : '<span class="awaiting-parts-minimal-empty">-</span>';
+
+              return `
+                <tr>
+                  <td>${escapeHtml(item.priorityRank)}</td>
+                  <td>
+                    <div class="awaiting-parts-minimal-sku">${escapeHtml(item.partSku)}</div>
+                    <div class="awaiting-parts-minimal-raw-type">${escapeHtml(item.partTypeRaw)}</div>
+                  </td>
+                  <td>${escapeHtml(item.partTypeGroup)}</td>
+                  <td>${escapeHtml(item.openOrderCount)}</td>
+                  <td>${escapeHtml(item.totalQuantity)}</td>
+                  <td>${escapeHtml(firstSeen)}</td>
+                  <td>${escapeHtml(lastSeen)}</td>
+                  <td class="awaiting-parts-minimal-order-cell">${orderLinks}</td>
+                </tr>
+              `;
+            }).join('')}
+          </tbody>
+        </table>
+      </div>
+    `;
+    return;
+  }
+
   container.innerHTML = safeItems.map((item) => {
     const orders = Array.isArray(item.orders) ? item.orders : [];
     const firstSeen = item.oldestOpenAt ? formatTimestamp(item.oldestOpenAt) : '-';
@@ -202,7 +286,7 @@ function renderAwaitingPartsList(items) {
 
         <div class="awaiting-parts-card__orders">
           ${orders.map((order) => `
-            <div class="awaiting-parts-order">
+            <a class="awaiting-parts-order" href="${escapeHtml(buildOrderViewerUrl(order.orderNumber || order.orderId))}">
               <div class="awaiting-parts-order__head">
                 <strong>${escapeHtml(order.orderNumber || order.orderId)}</strong>
                 <span>x${escapeHtml(order.quantity)}</span>
@@ -211,7 +295,7 @@ function renderAwaitingPartsList(items) {
                 <span>Reported ${escapeHtml(formatTimestamp(order.createdAt))}</span>
                 ${order.reportedBy ? `<span>${escapeHtml(order.reportedBy)}</span>` : ''}
               </div>
-            </div>
+            </a>
           `).join('')}
         </div>
       </article>
@@ -278,11 +362,22 @@ async function fetchAwaitingPartsSummary({ silent = false, sync = false } = {}) 
 
 document.addEventListener('DOMContentLoaded', () => {
   awaitingPartsActiveType = getInitialTypeFilter();
+  awaitingPartsMinimalModeEnabled = loadMinimalModePreference();
 
   const refreshBtn = document.getElementById('awaitingPartsRefreshBtn');
+  const minimalModeToggle = document.getElementById('awaitingPartsMinimalModeToggle');
   if (refreshBtn) {
     refreshBtn.addEventListener('click', () => {
       fetchAwaitingPartsSummary({ sync: true });
+    });
+  }
+
+  if (minimalModeToggle) {
+    minimalModeToggle.checked = awaitingPartsMinimalModeEnabled;
+    minimalModeToggle.addEventListener('change', () => {
+      awaitingPartsMinimalModeEnabled = Boolean(minimalModeToggle.checked);
+      saveMinimalModePreference(awaitingPartsMinimalModeEnabled);
+      fetchAwaitingPartsSummary({ silent: true, sync: false });
     });
   }
 

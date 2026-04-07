@@ -434,9 +434,19 @@ function buildCurrentOrderLineItems(edges = []) {
     .filter(Boolean);
 }
 
-function buildTypedAwaitingPartsItems({ skus, skuMap }) {
-  return (skus || []).map((sku) => {
-    const normalizedSku = normalizeSku(sku);
+function buildTypedAwaitingPartsItems({ skus, items, skuMap }) {
+  const normalizedItems = Array.isArray(items) && items.length > 0
+    ? items.map((item) => ({
+        sku: normalizeSku(item?.sku || item?.partSku),
+        quantity: Math.max(1, Number(item?.quantity) || 1),
+      }))
+    : (skus || []).map((sku) => ({
+        sku: normalizeSku(sku),
+        quantity: 1,
+      }));
+
+  return normalizedItems.map((item) => {
+    const normalizedSku = normalizeSku(item.sku);
     const sheetRow = skuMap?.get(normalizedSku);
     const partTypeRaw = normalizePickType(sheetRow?.type);
 
@@ -444,7 +454,7 @@ function buildTypedAwaitingPartsItems({ skus, skuMap }) {
       partSku: normalizedSku,
       partTypeRaw,
       partTypeGroup: getWaitingPartsTypeGroup(partTypeRaw),
-      quantity: 1,
+      quantity: Math.max(1, Number(item.quantity) || 1),
     };
   }).filter((item) => item.partSku);
 }
@@ -659,6 +669,7 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
       }
 
       const typedItems = buildTypedAwaitingPartsItems({
+        items: latestAwaitingPartsSnapshot.items,
         skus: latestAwaitingPartsSnapshot.skus,
         skuMap,
       });
@@ -1224,14 +1235,17 @@ router.post('/api/tag-order', async (req, res) => {
 
 router.post('/api/awaiting-parts', async (req, res) => {
   try {
-    const { orderId, skus } = req.body;
+    const { orderId, skus, items } = req.body;
 
     var barcode = orderId;
+    const requestedItems = Array.isArray(items) && items.length > 0
+      ? items
+      : (Array.isArray(skus) ? skus.map((sku) => ({ sku, quantity: 1 })) : []);
 
-    if (!barcode || !Array.isArray(skus) || skus.length === 0) {
+    if (!barcode || !requestedItems.length) {
       return res.status(400).json({
         success: false,
-        error: 'Missing barcode or SKUs',
+        error: 'Missing barcode or awaiting-parts items',
       });
     }
 
@@ -1294,11 +1308,27 @@ router.post('/api/awaiting-parts', async (req, res) => {
       .replace('T', ' ')
       .slice(0, 16);
 
+    const normalizedAwaitingPartsItems = requestedItems.map((item) => ({
+      sku: normalizeSku(item?.sku || item?.partSku),
+      quantity: Math.max(1, Number(item?.quantity) || 1),
+    })).filter((item) => item.sku);
+
+    if (!normalizedAwaitingPartsItems.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'No valid awaiting-parts items selected',
+      });
+    }
+
     const awaitingPartsBlock = [
       '~',
       `AWAITING PARTS — ${timestamp}`,
       `Team Member: ${staff}`,
-      ...skus.map(sku => `- ${sku}`),
+      ...normalizedAwaitingPartsItems.map((item) =>
+        item.quantity > 1
+          ? `- ${item.sku} | QTY ${item.quantity}`
+          : `- ${item.sku}`
+      ),
       '',
     ].join('\n');
 
@@ -1333,24 +1363,24 @@ router.post('/api/awaiting-parts', async (req, res) => {
       });
     }
 
-    let typedAwaitingPartsItems = skus.map((sku) => ({
-      partSku: normalizeSku(sku),
+    let typedAwaitingPartsItems = normalizedAwaitingPartsItems.map((item) => ({
+      partSku: normalizeSku(item.sku),
       partTypeRaw: 'UNKNOWN',
       partTypeGroup: 'UNKNOWN',
-      quantity: 1,
+      quantity: Math.max(1, Number(item.quantity) || 1),
     }));
 
     try {
       const pickListSheet = await fetchPickListSheet();
-      typedAwaitingPartsItems = skus.map((sku) => {
-        const normalizedSku = normalizeSku(sku);
+      typedAwaitingPartsItems = normalizedAwaitingPartsItems.map((item) => {
+        const normalizedSku = normalizeSku(item.sku);
         const sheetRow = pickListSheet.skuMap.get(normalizedSku);
         const partTypeRaw = normalizePickType(sheetRow?.type);
         return {
           partSku: normalizedSku,
           partTypeRaw,
           partTypeGroup: getWaitingPartsTypeGroup(partTypeRaw),
-          quantity: 1,
+          quantity: Math.max(1, Number(item.quantity) || 1),
         };
       });
     } catch (sheetErr) {
@@ -1376,7 +1406,11 @@ router.post('/api/awaiting-parts', async (req, res) => {
           `⏳ Awaiting parts for order ${order.name}`,
           `Reported by: ${staff}`,
           '',
-          ...skus.map(sku => `, ${sku}`),
+          ...normalizedAwaitingPartsItems.map((item) =>
+            item.quantity > 1
+              ? `, ${item.sku} x${item.quantity}`
+              : `, ${item.sku}`
+          ),
         ].join('\n')
       );
     } catch (chatErr) {
@@ -1387,7 +1421,8 @@ router.post('/api/awaiting-parts', async (req, res) => {
     return res.json({
       success: true,
       orderNumber: order.name,
-      skus,
+      skus: normalizedAwaitingPartsItems.map((item) => item.sku),
+      awaitingPartsSelection: normalizedAwaitingPartsItems,
       awaitingPartsItems: typedAwaitingPartsItems,
     });
 
@@ -1683,6 +1718,30 @@ router.post('/api/pick-list', async (req, res) => {
       skuMap: pickListSheet.skuMap,
       lineItems: orderLineItems,
     });
+    let awaitingPartsItems = sessionsStore.getOpenAwaitingPartsItemsForOrder({
+      shop,
+      orderId: order.id,
+    });
+    if (!awaitingPartsItems.length) {
+      const trackerStage = deriveTrackerStage({
+        explicitTag: '',
+        tags: order.tags,
+        cancelledAt: order.cancelledAt,
+        displayFulfillmentStatus: order.displayFulfillmentStatus,
+        orderNote: order.note,
+      });
+
+      if (trackerStage.key === 'awaiting_parts') {
+        const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
+        awaitingPartsItems = Array.isArray(latestAwaitingPartsSnapshot?.items)
+          ? latestAwaitingPartsSnapshot.items.map((item) => ({
+              partSku: normalizeSku(item?.sku),
+              quantity: Math.max(1, Number(item?.quantity) || 1),
+            })).filter((item) => item.partSku)
+          : [];
+      }
+    }
+    const awaitingPartsSkus = awaitingPartsItems.map((item) => item.partSku);
     const wholesaleProgressByItemKey = sessionsStore.getWholesaleBuildProgress({
       shop,
       barcode: normalizedBarcode,
@@ -1713,6 +1772,8 @@ router.post('/api/pick-list', async (req, res) => {
       workflowBlockCode: workflowBlock?.code || null,
       workflowStatus: workflowBlock?.status || null,
       workflowWarning: workflowBlock?.message || '',
+      awaitingPartsItems,
+      awaitingPartsSkus,
       trackerToken: trackerInfo.trackerToken,
       trackerUrl: trackerInfo.trackerUrl,
       wholesaleProgressByItemKey,
@@ -1739,7 +1800,15 @@ router.get('/api/order-tracker/:token', async (req, res) => {
     }
 
     let trackingLinks = [];
+    let awaitingPartsItems = [];
     const currentStageKey = String(trackerRecord.currentStageKey || '').trim();
+    if (currentStageKey === 'awaiting_parts') {
+      awaitingPartsItems = sessionsStore.getOpenAwaitingPartsItemsForOrder({
+        shop: trackerRecord.shop,
+        orderId: trackerRecord.orderId,
+      });
+    }
+
     if (currentStageKey === 'fulfilled' || currentStageKey === 'partially_fulfilled') {
       const session = sessionsStore.get(trackerRecord.shop);
       if (session) {
@@ -1759,7 +1828,10 @@ router.get('/api/order-tracker/:token', async (req, res) => {
 
     return res.json({
       success: true,
-      tracker: buildPublicTrackerPayload(trackerRecord, { trackingLinks }),
+      tracker: buildPublicTrackerPayload(trackerRecord, {
+        trackingLinks,
+        awaitingPartsItems,
+      }),
     });
   } catch (err) {
     console.error('Error in /api/order-tracker/:token:', err);

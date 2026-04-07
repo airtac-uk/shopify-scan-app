@@ -14,6 +14,7 @@ let currentOrderNumber = '';
 let currentOrderNote = '';
 let currentWorkflowBlock = null;
 let currentTrackerUrl = '';
+let currentAwaitingPartsSkuMap = new Map();
 let lastActionTag = '';
 let lastActionBarcode = '';
 let actionButtons = [];
@@ -51,6 +52,33 @@ function focusBarcodeInput({ selectAll = false } = {}) {
   if (selectAll) {
     input.select();
   }
+}
+
+function getInitialOrderLookupValue() {
+  const params = new URLSearchParams(window.location.search);
+  return String(params.get('order') || params.get('barcode') || '').trim().toUpperCase();
+}
+
+function normalizeDisplaySku(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function isAwaitingPartsSku(value) {
+  return currentAwaitingPartsSkuMap.has(normalizeDisplaySku(value));
+}
+
+function getAwaitingPartsQty(value) {
+  return currentAwaitingPartsSkuMap.get(normalizeDisplaySku(value)) || 0;
+}
+
+function setCurrentAwaitingPartsItems(items) {
+  currentAwaitingPartsSkuMap = new Map();
+
+  (items || []).forEach((item) => {
+    const sku = normalizeDisplaySku(item?.sku || item?.partSku);
+    if (!sku) return;
+    currentAwaitingPartsSkuMap.set(sku, Math.max(1, Number(item?.quantity) || 1));
+  });
 }
 
 function setStatus(message, type = 'info') {
@@ -140,6 +168,7 @@ function clearLoadedOrderState() {
   currentOrderNote = '';
   currentWorkflowBlock = null;
   currentTrackerUrl = '';
+  currentAwaitingPartsSkuMap = new Map();
   verifyItems = [];
   verifyCodeIndex = new Map();
 
@@ -417,10 +446,21 @@ function renderRows(container, rows, emptyText) {
   rows.forEach((row) => {
     const item = document.createElement('li');
     item.className = 'pick-list-item';
+    const isAwaitingParts = isAwaitingPartsSku(row.sku);
+    const awaitingPartsQty = getAwaitingPartsQty(row.sku);
+    if (isAwaitingParts) {
+      item.classList.add('pick-list-item--awaiting-parts');
+    }
 
     const main = document.createElement('div');
     main.className = 'pick-list-cell pick-list-col-sku pick-list-item-main';
     main.textContent = `${row.sku}`;
+    if (isAwaitingParts) {
+      const badge = document.createElement('span');
+      badge.className = 'pick-list-awaiting-parts-badge';
+      badge.textContent = awaitingPartsQty > 1 ? `Awaiting Parts x${awaitingPartsQty}` : 'Awaiting Parts';
+      main.appendChild(badge);
+    }
 
     const location = document.createElement('div');
     location.className = 'pick-list-cell pick-list-col-location pick-list-item-location';
@@ -490,6 +530,10 @@ function renderLineCards(lineItems) {
     if (bundleGroupId) {
       card.classList.add('pick-list-card--bundled');
     }
+    const awaitingPartsQty = getAwaitingPartsQty(line.sku);
+    if (awaitingPartsQty > 0) {
+      card.classList.add('pick-list-card--awaiting-parts');
+    }
 
     const header = document.createElement('header');
     header.className = 'pick-list-card-header';
@@ -506,6 +550,14 @@ function renderLineCards(lineItems) {
         ? `Bundle item (${bundleGroupQty} item bundle)`
         : 'Bundle item';
       header.appendChild(bundleMeta);
+    }
+    if (awaitingPartsQty > 0) {
+      const awaitingPartsMeta = document.createElement('p');
+      awaitingPartsMeta.className = 'pick-list-card-awaiting-meta';
+      awaitingPartsMeta.textContent = awaitingPartsQty > 1
+        ? `Marked as awaiting parts x${awaitingPartsQty}`
+        : 'Marked as awaiting parts';
+      header.appendChild(awaitingPartsMeta);
     }
 
     card.appendChild(header);
@@ -1160,16 +1212,40 @@ function openAwaitingPartsDialog(orderId, lineItems) {
   uniqueSkuItems.forEach((item) => {
     const label = document.createElement('label');
     label.className = 'pick-modal-item';
+    const currentQty = getAwaitingPartsQty(item.sku);
+    const lineQty = Math.max(1, Number(item.quantity) || 1);
+    const maxQty = Math.max(lineQty, currentQty || 0, 1);
+    const defaultQty = currentQty > 0 ? currentQty : lineQty;
 
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
     checkbox.value = item.sku;
+    checkbox.checked = currentQty > 0;
+
+    const body = document.createElement('div');
+    body.className = 'pick-modal-item__body';
 
     const text = document.createElement('span');
     text.textContent = `${item.sku} — ${item.title || ''}`;
 
+    const qtyInput = document.createElement('input');
+    qtyInput.type = 'number';
+    qtyInput.className = 'pick-modal-qty';
+    qtyInput.min = '1';
+    qtyInput.step = '1';
+    qtyInput.max = String(maxQty);
+    qtyInput.value = String(defaultQty);
+    qtyInput.dataset.sku = item.sku;
+    qtyInput.disabled = !checkbox.checked;
+
+    checkbox.addEventListener('change', () => {
+      qtyInput.disabled = !checkbox.checked;
+    });
+
+    body.appendChild(text);
+    body.appendChild(qtyInput);
     label.appendChild(checkbox);
-    label.appendChild(text);
+    label.appendChild(body);
     form.appendChild(label);
   });
 
@@ -1193,14 +1269,21 @@ async function submitAwaitingParts() {
   if (!form) return;
 
   const orderId = form.dataset.orderId;
-  const skus = Array.from(form.querySelectorAll('input:checked')).map((input) => input.value);
+  const items = Array.from(form.querySelectorAll('input[type="checkbox"]:checked')).map((input) => {
+    const sku = input.value;
+    const qtyInput = form.querySelector(`.pick-modal-qty[data-sku="${CSS.escape(sku)}"]`);
+    return {
+      sku,
+      quantity: Math.max(1, Number(qtyInput?.value) || 1),
+    };
+  });
 
   if (!orderId) {
     setStatus('Error: Missing order id for awaiting parts.', 'error');
     return;
   }
 
-  if (!skus.length) {
+  if (!items.length) {
     setStatus('Select at least one SKU for awaiting parts.', 'error');
     return;
   }
@@ -1212,7 +1295,7 @@ async function submitAwaitingParts() {
     const response = await fetch('/api/awaiting-parts', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ orderId, skus }),
+      body: JSON.stringify({ orderId, items }),
     });
 
     const data = await response.json();
@@ -1220,6 +1303,10 @@ async function submitAwaitingParts() {
       throw new Error(data.error || 'Failed to save awaiting parts');
     }
 
+    setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsSelection) ? data.awaitingPartsSelection : items);
+    if (hasRenderedPickList) {
+      renderCurrentOrderSection();
+    }
     setStatus(`Awaiting parts saved for ${data.orderNumber || currentOrderNumber}.`, 'success');
     closeAwaitingPartsDialog();
   } catch (err) {
@@ -1389,6 +1476,9 @@ async function runOrderAction(tag) {
       openAwaitingPartsDialog(normalizedBarcode, data.lineItems || []);
     } else if (tag === 'qc_fail') {
       openQcFailDialog(normalizedBarcode, data.lineItems || []);
+    } else if (hasRenderedPickList) {
+      setCurrentAwaitingPartsItems([]);
+      renderCurrentOrderSection();
     }
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
@@ -1404,8 +1494,8 @@ async function fetchPickList(barcodeInput) {
     return;
   }
 
-  if (!barcode.startsWith('AT')) {
-    setStatus('Invalid code. Order barcode must begin with AT.', 'error');
+  if (!barcode.startsWith('AT') && !barcode.startsWith('#')) {
+    setStatus('Invalid code. Scan an AT barcode or open by Shopify order number.', 'error');
     return;
   }
 
@@ -1441,6 +1531,7 @@ async function fetchPickList(barcodeInput) {
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
     currentTrackerUrl = String(data.trackerUrl || '').trim();
+    setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsItems) ? data.awaitingPartsItems : []);
     currentWorkflowBlock = data.workflowBlocked
       ? {
           blocked: true,
@@ -1737,10 +1828,17 @@ document.addEventListener('DOMContentLoaded', () => {
     applyModeState();
   }
 
+  registerModalHandlers();
+  setupHidScan();
+
+  const initialOrderLookup = getInitialOrderLookupValue();
+  if (initialOrderLookup && input) {
+    input.value = initialOrderLookup;
+    fetchPickList(initialOrderLookup);
+    return;
+  }
+
   if (input && window.matchMedia('(min-width: 900px)').matches) {
     setTimeout(() => focusBarcodeInput({ selectAll: true }), 0);
   }
-
-  registerModalHandlers();
-  setupHidScan();
 });

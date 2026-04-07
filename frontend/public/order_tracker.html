@@ -15,24 +15,30 @@
       <p id="trackerUpdated" class="tracker-updated">Checking for updates...</p>
     </header>
 
-    <section id="trackerStatusCard" class="tracker-orb-card" data-tone="info">
+    <section id="trackerStatusCard" class="tracker-orb-card" data-tone="info" data-awake="sleeping">
       <div class="tracker-orb-wrap">
         <div class="tracker-orb">
           <svg class="tracker-orb-ring" viewBox="0 0 240 240" aria-hidden="true">
             <g id="trackerProgressSegments"></g>
           </svg>
           <div class="tracker-orb-core">
-            <p class="tracker-orb-kicker">Current status</p>
-            <h1 id="trackerStageLabel">Preparing your tracker</h1>
-            <p id="trackerProgressValue" class="tracker-orb-progress">Step 0 of 5</p>
+            <div class="tracker-orb-face" aria-hidden="true">
+              <span class="tracker-orb-dial-scale tracker-orb-dial-scale--rim"></span>
+              <span class="tracker-orb-dial-scale tracker-orb-dial-scale--rim-major"></span>
+              <span class="tracker-orb-eye tracker-orb-eye--left"></span>
+              <span class="tracker-orb-eye tracker-orb-eye--right"></span>
+            </div>
           </div>
         </div>
       </div>
 
-      <p id="trackerStageText" class="tracker-stage-copy">Fetching the latest workshop update.</p>
+      <div class="tracker-terminal" role="status" aria-live="polite">
+        <span class="tracker-terminal-label">REGGIE //</span>
+        <span id="trackerStageText" class="tracker-terminal-text">Fetching the latest workshop update.</span>
+        <span class="tracker-terminal-caret" aria-hidden="true"></span>
+      </div>
+
       <div id="trackerTrackingLinks" class="tracker-tracking-links" hidden></div>
-      <blockquote id="trackerQuote" class="tracker-quote">Loading today's nonsense...</blockquote>
-      <div id="trackerMilestones" class="tracker-milestones"></div>
     </section>
 
     <section class="tracker-help-strip">

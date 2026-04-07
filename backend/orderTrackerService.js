@@ -28,8 +28,8 @@ const TRACKER_STAGES = {
   },
   awaiting_parts: {
     key: 'awaiting_parts',
-    label: 'Waiting on parts',
-    description: 'We are waiting on one or more parts before the build can continue.',
+    label: 'Parts in production',
+    description: 'We are manufacturing one or more parts for your order before the build can continue.',
     tone: 'warn',
     progress: 0.36,
     isTerminal: false,
@@ -152,9 +152,9 @@ const QUOTES_BY_STAGE = {
     'A respectable amount of tinkering is underway.',
   ],
   awaiting_parts: [
-    'One critical component is making a dramatic entrance later than planned.',
-    'A small but important part is currently on its own side quest.',
-    'The build is paused while we wait for the missing hero to arrive.',
+    'Your custom parts are currently being made in-house.',
+    'One or two workshop-made components are still in production.',
+    'This order is in the manufacturing bit of the story arc.',
   ],
   quality_check: [
     'The quality-check clipboard brigade has entered the chat.',
@@ -317,16 +317,25 @@ function extractLatestAwaitingPartsSnapshot(orderNote) {
 
     const details = lines.slice(1);
     const reportedByLine = details.find((line) => /^Team Member:/i.test(line));
-    const skus = details
+    const items = details
       .filter((line) => /^-\s*/.test(line))
-      .map((line) => line.replace(/^-\s*/, '').trim().toUpperCase())
+      .map((line) => {
+        const rawValue = line.replace(/^-\s*/, '').trim();
+        const match = rawValue.match(/^(.*?)(?:\s*\|\s*QTY\s+(\d+))?$/i);
+        const sku = String(match?.[1] || rawValue).trim().toUpperCase();
+        const quantity = Math.max(1, Number(match?.[2]) || 1);
+        if (!sku) return null;
+        return { sku, quantity };
+      })
       .filter(Boolean);
+    const skus = items.map((item) => item.sku);
 
     latestSnapshot = {
       createdAt: parseOrderNoteTimestamp(timestampText),
       reportedBy: reportedByLine
         ? reportedByLine.replace(/^Team Member:\s*/i, '').trim()
         : '',
+      items,
       skus,
     };
   });
@@ -394,7 +403,7 @@ function buildTips(lineItems, currentStageKey) {
   const tips = [];
 
   if (currentStageKey === 'awaiting_parts') {
-    tips.push('Tip: if you need the order for a specific game day, leave a little buffer for final dispatch.');
+    tips.push('Tip: custom manufacturing and finishing take a little longer than pulling a stocked part from the shelf.');
   }
   if (currentStageKey === 'quality_check' || currentStageKey === 'rebuild') {
     tips.push('Tip: this stage is where we slow down on purpose so the order leaves in the right condition.');
@@ -478,9 +487,87 @@ function buildMilestones(currentStageKey) {
   }));
 }
 
+function normalizeAwaitingPartsItems(items) {
+  return (items || [])
+    .map((item) => {
+      const partSku = String(item?.partSku || item?.sku || '').trim().toUpperCase();
+      const quantity = Math.max(1, Number(item?.quantity) || 1);
+      if (!partSku) return null;
+      return { partSku, quantity };
+    })
+    .filter(Boolean);
+}
+
+function extractAwaitingPartsItemsFromTrackerEvents(events) {
+  const awaitingEvents = Array.isArray(events)
+    ? events.filter((event) => String(event?.stageKey || '').trim() === 'awaiting_parts')
+    : [];
+  const latestAwaitingEvent = awaitingEvents[awaitingEvents.length - 1];
+  const description = String(latestAwaitingEvent?.stageDescription || '').trim();
+  if (!description || !description.includes('- ')) {
+    return [];
+  }
+
+  const rawItems = description
+    .replace(/^\-\s*/, '')
+    .split(/\s+\-\s+/)
+    .map((segment) => {
+      const match = String(segment || '').trim().match(/^(.*?)(?:\s*\|\s*QTY\s+(\d+))?$/i);
+      const partSku = String(match?.[1] || segment).trim().toUpperCase();
+      const quantity = Math.max(1, Number(match?.[2]) || 1);
+      if (!partSku) return null;
+      return { partSku, quantity };
+    })
+    .filter(Boolean);
+
+  return normalizeAwaitingPartsItems(rawItems);
+}
+
+function formatAwaitingPartsList(items) {
+  const normalizedItems = normalizeAwaitingPartsItems(items);
+  if (!normalizedItems.length) {
+    return '';
+  }
+
+  const visibleItems = normalizedItems.slice(0, 4).map((item) => (
+    item.quantity > 1 ? `${item.partSku} x${item.quantity}` : item.partSku
+  ));
+  const remainingCount = Math.max(0, normalizedItems.length - visibleItems.length);
+
+  if (remainingCount > 0) {
+    visibleItems.push(`plus ${remainingCount} more part${remainingCount === 1 ? '' : 's'}`);
+  }
+
+  if (visibleItems.length === 1) {
+    return visibleItems[0];
+  }
+
+  if (visibleItems.length === 2) {
+    return `${visibleItems[0]} and ${visibleItems[1]}`;
+  }
+
+  return `${visibleItems.slice(0, -1).join(', ')}, and ${visibleItems[visibleItems.length - 1]}`;
+}
+
+function buildAwaitingPartsStageDescription(trackerRecord, awaitingPartsItems, fallbackDescription) {
+  const normalizedItems = normalizeAwaitingPartsItems(awaitingPartsItems);
+  const items = normalizedItems.length > 0
+    ? normalizedItems
+    : extractAwaitingPartsItemsFromTrackerEvents(trackerRecord?.events);
+
+  if (!items.length) {
+    return fallbackDescription;
+  }
+
+  const partList = formatAwaitingPartsList(items);
+  return `We are manufacturing ${partList} before the build can continue.`;
+}
+
 function buildPublicTrackerPayload(trackerRecord, options = {}) {
   const currentStage = getTrackerStageByKey(trackerRecord?.currentStageKey);
   const items = normalizeTrackerLineItems(trackerRecord?.lineItems);
+  const storedStageDescription = String(trackerRecord?.currentStageDescription || '').trim();
+  const baseStageDescription = storedStageDescription || currentStage.description;
   const trackingLinks = Array.isArray(options.trackingLinks)
     ? options.trackingLinks
         .map((trackingLink) => ({
@@ -498,6 +585,10 @@ function buildPublicTrackerPayload(trackerRecord, options = {}) {
         createdAt: event.createdAt,
       }))
     : [];
+  const awaitingPartsItems = normalizeAwaitingPartsItems(options.awaitingPartsItems);
+  const currentStageDescription = currentStage.key === 'awaiting_parts'
+    ? buildAwaitingPartsStageDescription(trackerRecord, awaitingPartsItems, baseStageDescription)
+    : baseStageDescription;
 
   return {
     orderNumber: String(trackerRecord?.orderNumber || '').trim(),
@@ -508,13 +599,14 @@ function buildPublicTrackerPayload(trackerRecord, options = {}) {
     currentStage: {
       key: currentStage.key,
       label: currentStage.label,
-      description: currentStage.description,
+      description: currentStageDescription,
       tone: currentStage.tone,
       progress: currentStage.progress,
       isTerminal: currentStage.isTerminal,
     },
     milestones: buildMilestones(currentStage.key),
     items,
+    awaitingPartsItems,
     trackingLinks,
     tips: buildTips(items, currentStage.key),
     quote: selectQuote(currentStage.key, `${trackerRecord?.orderNumber || ''}:${trackerRecord?.updatedAt || ''}`),

@@ -1,6 +1,16 @@
 const TRACKER_POLL_MS = 15000;
 const TRACKER_INTRO_STEP_MS = 520;
 const TRACKER_INTRO_FINAL_PAUSE_MS = 180;
+const TRACKER_WAKEUP_START_DELAY_MS = 140;
+const TRACKER_WAKEUP_DURATION_MS = 980;
+const TRACKER_TERMINAL_BOOT_PAUSE_MS = 140;
+const TRACKER_TERMINAL_INTRO_HOLD_MS = 2200;
+const TRACKER_TERMINAL_CHAR_MS = 14;
+const TRACKER_IDLE_FACT_DELAY_MS = 18000;
+const TRACKER_IDLE_FACT_INTERVAL_MS = 14000;
+const TRACKER_REGGIE_SPAM_WINDOW_MS = 1400;
+const TRACKER_REGGIE_SPAM_THRESHOLD = 2;
+const TRACKER_REGGIE_MAD_DURATION_MS = 3600;
 const TRACKER_DEFAULT_STEP_COUNT = 5;
 const TRACKER_SEGMENT_GAP = 5;
 const TRACKER_ORB_CENTER = 120;
@@ -14,9 +24,34 @@ const TRACKER_SEGMENT_SHORT_LABELS = {
   'PART FULFILLED': 'PARTIAL',
   'CANCELLED': 'CANCELLED',
 };
+const TRACKER_IDLE_FACTS = [
+  'Buying a new sidearm is always faster than reloading',
+  'Wind only affects your opponents shots.',
+  'If you think you\'ve hit someone, stop playing and immediately tell a marshal. You\'ll feel SO much better',
+];
+const TRACKER_REGGIE_MAD_MESSAGES = [
+  'OI. EASY ON THE TAPPING.',
+  'PLEASE STOP POKING THE REGULATOR.',
+  'THAT IS QUITE ENOUGH CLICKING.',
+  'I AM TRYING TO MAINTAIN PROFESSIONAL COMPOSURE.',
+];
 let trackerPollId = null;
 let trackerHasPlayedIntro = false;
 let trackerIntroRunId = 0;
+let trackerAudioContext = null;
+let trackerPendingCue = null;
+let trackerLastRenderedStageKey = '';
+let trackerLastStatusStageKey = '';
+let trackerLastStatusMessage = '';
+let trackerLastTerminalText = '';
+let trackerTerminalRunId = 0;
+let trackerIdleFactTimerId = null;
+let trackerIdleFactContextKey = '';
+let trackerIdleFactQueue = [];
+let trackerReggieClickTimes = [];
+let trackerReggieMadTimerId = null;
+let trackerHasScheduledWakeUp = false;
+let trackerWakeUpTimerIds = [];
 const TRACKER_RING_RADIUS = 92;
 const TRACKER_RING_CIRCUMFERENCE = 2 * Math.PI * TRACKER_RING_RADIUS;
 
@@ -56,6 +91,263 @@ function formatTrackerTimestamp(value) {
 function wait(ms) {
   return new Promise((resolve) => {
     window.setTimeout(resolve, ms);
+  });
+}
+
+function clearTrackerWakeUpTimers() {
+  trackerWakeUpTimerIds.forEach((timerId) => {
+    window.clearTimeout(timerId);
+  });
+  trackerWakeUpTimerIds = [];
+}
+
+function setTrackerWakeState(state) {
+  const card = document.getElementById('trackerStatusCard');
+  if (!card) return;
+
+  card.dataset.awake = state;
+}
+
+function scheduleTrackerWakeUp() {
+  if (trackerHasScheduledWakeUp) {
+    setTrackerWakeState('awake');
+    return;
+  }
+
+  trackerHasScheduledWakeUp = true;
+  clearTrackerWakeUpTimers();
+
+  if (prefersReducedMotion()) {
+    setTrackerWakeState('awake');
+    return;
+  }
+
+  setTrackerWakeState('sleeping');
+
+  trackerWakeUpTimerIds.push(window.setTimeout(() => {
+    setTrackerWakeState('waking');
+  }, TRACKER_WAKEUP_START_DELAY_MS));
+
+  trackerWakeUpTimerIds.push(window.setTimeout(() => {
+    setTrackerWakeState('awake');
+    clearTrackerWakeUpTimers();
+  }, TRACKER_WAKEUP_START_DELAY_MS + TRACKER_WAKEUP_DURATION_MS));
+}
+
+function getTrackerAudioContext() {
+  const AudioCtx = window.AudioContext || window.webkitAudioContext;
+  if (!AudioCtx) return null;
+
+  if (!trackerAudioContext) {
+    trackerAudioContext = new AudioCtx();
+  }
+
+  return trackerAudioContext;
+}
+
+async function resumeTrackerAudioContext() {
+  const ctx = getTrackerAudioContext();
+  if (!ctx) return null;
+
+  if (ctx.state === 'suspended') {
+    try {
+      await ctx.resume();
+    } catch (err) {
+      return null;
+    }
+  }
+
+  return ctx.state === 'running' ? ctx : null;
+}
+
+function playTrackerTone(ctx, options = {}) {
+  const {
+    startOffset = 0,
+    frequency = 520,
+    endFrequency = frequency,
+    duration = 0.1,
+    gain = 0.018,
+    type = 'triangle',
+  } = options;
+
+  const oscillator = ctx.createOscillator();
+  const volume = ctx.createGain();
+  const startAt = ctx.currentTime + startOffset;
+  const endAt = startAt + duration;
+
+  oscillator.type = type;
+  oscillator.frequency.setValueAtTime(Math.max(1, frequency), startAt);
+  oscillator.frequency.exponentialRampToValueAtTime(Math.max(1, endFrequency), endAt);
+
+  volume.gain.setValueAtTime(Math.max(0.0001, gain), startAt);
+  volume.gain.exponentialRampToValueAtTime(0.0001, endAt);
+
+  oscillator.connect(volume).connect(ctx.destination);
+  oscillator.start(startAt);
+  oscillator.stop(endAt);
+}
+
+function playTrackerStartupCue(ctx) {
+  playTrackerTone(ctx, {
+    startOffset: 0,
+    frequency: 420,
+    endFrequency: 560,
+    duration: 0.09,
+    gain: 0.018,
+    type: 'triangle',
+  });
+  playTrackerTone(ctx, {
+    startOffset: 0.11,
+    frequency: 560,
+    endFrequency: 710,
+    duration: 0.09,
+    gain: 0.018,
+    type: 'triangle',
+  });
+  playTrackerTone(ctx, {
+    startOffset: 0.22,
+    frequency: 710,
+    endFrequency: 920,
+    duration: 0.12,
+    gain: 0.02,
+    type: 'sine',
+  });
+}
+
+function playTrackerStageChangeCue(ctx, stageKey) {
+  switch (String(stageKey || '').trim()) {
+    case 'awaiting_parts':
+      playTrackerTone(ctx, {
+        startOffset: 0,
+        frequency: 480,
+        endFrequency: 560,
+        duration: 0.11,
+        gain: 0.018,
+        type: 'triangle',
+      });
+      playTrackerTone(ctx, {
+        startOffset: 0.16,
+        frequency: 540,
+        endFrequency: 470,
+        duration: 0.14,
+        gain: 0.017,
+        type: 'triangle',
+      });
+      return;
+    case 'quality_check':
+      playTrackerTone(ctx, {
+        startOffset: 0,
+        frequency: 760,
+        endFrequency: 860,
+        duration: 0.08,
+        gain: 0.017,
+        type: 'sine',
+      });
+      playTrackerTone(ctx, {
+        startOffset: 0.1,
+        frequency: 860,
+        endFrequency: 940,
+        duration: 0.08,
+        gain: 0.015,
+        type: 'sine',
+      });
+      return;
+    case 'passed_qc':
+    case 'packaged':
+    case 'fulfilled':
+      playTrackerTone(ctx, {
+        startOffset: 0,
+        frequency: 620,
+        endFrequency: 780,
+        duration: 0.08,
+        gain: 0.018,
+        type: 'triangle',
+      });
+      playTrackerTone(ctx, {
+        startOffset: 0.1,
+        frequency: 780,
+        endFrequency: 980,
+        duration: 0.1,
+        gain: 0.018,
+        type: 'triangle',
+      });
+      return;
+    case 'cancelled':
+    case 'on_hold':
+      playTrackerTone(ctx, {
+        startOffset: 0,
+        frequency: 420,
+        endFrequency: 300,
+        duration: 0.14,
+        gain: 0.018,
+        type: 'sawtooth',
+      });
+      return;
+    default:
+      playTrackerTone(ctx, {
+        startOffset: 0,
+        frequency: 520,
+        endFrequency: 680,
+        duration: 0.09,
+        gain: 0.017,
+        type: 'triangle',
+      });
+      playTrackerTone(ctx, {
+        startOffset: 0.1,
+        frequency: 680,
+        endFrequency: 760,
+        duration: 0.08,
+        gain: 0.015,
+        type: 'triangle',
+      });
+  }
+}
+
+function triggerTrackerCue(cue) {
+  const ctx = getTrackerAudioContext();
+  if (!ctx) return;
+
+  if (ctx.state !== 'running') {
+    trackerPendingCue = cue;
+    return;
+  }
+
+  if (cue?.type === 'startup') {
+    playTrackerStartupCue(ctx);
+    return;
+  }
+
+  playTrackerStageChangeCue(ctx, cue?.stageKey);
+}
+
+async function flushTrackerPendingCue() {
+  if (!trackerPendingCue) return;
+
+  const ctx = await resumeTrackerAudioContext();
+  if (!ctx) return;
+
+  const nextCue = trackerPendingCue;
+  trackerPendingCue = null;
+
+  if (nextCue?.type === 'startup') {
+    playTrackerStartupCue(ctx);
+    return;
+  }
+
+  playTrackerStageChangeCue(ctx, nextCue?.stageKey);
+}
+
+function installTrackerAudioUnlock() {
+  const unlockAudio = () => {
+    flushTrackerPendingCue().catch(() => {});
+  };
+
+  document.addEventListener('pointerdown', unlockAudio, { passive: true });
+  document.addEventListener('keydown', unlockAudio);
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') {
+      unlockAudio();
+    }
   });
 }
 
@@ -117,6 +409,248 @@ function setTrackerStageLabelText(label, fallbackText = 'Status unavailable') {
   if (!stageLabel) return;
 
   stageLabel.textContent = String(label || '').trim() || fallbackText;
+}
+
+function getTrackerTerminalMessage(message, fallbackText = 'Workshop update incoming.') {
+  const normalized = String(message || '').trim();
+  return normalized || fallbackText;
+}
+
+function getTrackerIntroductionMessage() {
+  return 'HELLO. I AM REGGIE THE REG.';
+}
+
+function setTrackerReggieMood(mood = '') {
+  const card = document.getElementById('trackerStatusCard');
+  if (!card) return;
+
+  if (mood) {
+    card.dataset.mood = mood;
+    return;
+  }
+
+  delete card.dataset.mood;
+}
+
+function clearTrackerReggieMadTimer() {
+  if (trackerReggieMadTimerId) {
+    window.clearTimeout(trackerReggieMadTimerId);
+    trackerReggieMadTimerId = null;
+  }
+}
+
+function getTrackerReggieMadMessage() {
+  if (!TRACKER_REGGIE_MAD_MESSAGES.length) {
+    return 'PLEASE STOP POKING THE REGULATOR.';
+  }
+
+  const index = Math.floor(Math.random() * TRACKER_REGGIE_MAD_MESSAGES.length);
+  return TRACKER_REGGIE_MAD_MESSAGES[index];
+}
+
+function clearTrackerIdleFactTimer() {
+  if (trackerIdleFactTimerId) {
+    window.clearTimeout(trackerIdleFactTimerId);
+    trackerIdleFactTimerId = null;
+  }
+}
+
+function restoreTrackerStatusMessage() {
+  const restoreMessage = trackerLastStatusMessage || 'Workshop update incoming.';
+
+  setTrackerTerminalText(restoreMessage, {
+    forceAnimate: true,
+    fallbackText: restoreMessage,
+  }).then((completed) => {
+    if (completed && trackerLastStatusStageKey && trackerLastStatusStageKey !== 'error') {
+      scheduleTrackerIdleFactCycle(trackerLastStatusStageKey, restoreMessage);
+    }
+  }).catch(() => {});
+}
+
+function shuffleTrackerIdleFacts(facts) {
+  const nextFacts = Array.from(facts || []);
+  for (let index = nextFacts.length - 1; index > 0; index -= 1) {
+    const randomIndex = Math.floor(Math.random() * (index + 1));
+    [nextFacts[index], nextFacts[randomIndex]] = [nextFacts[randomIndex], nextFacts[index]];
+  }
+  return nextFacts;
+}
+
+function getNextTrackerIdleFact() {
+  if (!TRACKER_IDLE_FACTS.length) {
+    return '';
+  }
+
+  if (trackerIdleFactQueue.length === 0) {
+    trackerIdleFactQueue = shuffleTrackerIdleFacts(TRACKER_IDLE_FACTS);
+  }
+
+  return trackerIdleFactQueue.shift() || '';
+}
+
+async function runTrackerIdleFactCycle(contextKey) {
+  if (!contextKey || contextKey !== trackerIdleFactContextKey) {
+    return;
+  }
+
+  const fact = getNextTrackerIdleFact();
+  if (!fact) {
+    return;
+  }
+
+  const completed = await setTrackerTerminalText(`AIRSOFT FACT: ${fact}`, {
+    forceAnimate: true,
+    fallbackText: fact,
+  });
+
+  if (!completed || contextKey !== trackerIdleFactContextKey) {
+    return;
+  }
+
+  trackerIdleFactTimerId = window.setTimeout(() => {
+    runTrackerIdleFactCycle(contextKey).catch(() => {});
+  }, TRACKER_IDLE_FACT_INTERVAL_MS);
+}
+
+function scheduleTrackerIdleFactCycle(stageKey, statusMessage) {
+  clearTrackerIdleFactTimer();
+  trackerIdleFactContextKey = '';
+
+  const normalizedStageKey = String(stageKey || '').trim();
+  const normalizedMessage = String(statusMessage || '').trim();
+  if (!normalizedStageKey || !normalizedMessage) {
+    return;
+  }
+
+  const contextKey = `${normalizedStageKey}::${normalizedMessage}`;
+  trackerIdleFactContextKey = contextKey;
+  trackerIdleFactTimerId = window.setTimeout(() => {
+    runTrackerIdleFactCycle(contextKey).catch(() => {});
+  }, TRACKER_IDLE_FACT_DELAY_MS);
+}
+
+function triggerTrackerReggieMad() {
+  trackerReggieClickTimes = [];
+  clearTrackerReggieMadTimer();
+  clearTrackerIdleFactTimer();
+  trackerIdleFactContextKey = '';
+  setTrackerReggieMood('mad');
+
+  const madMessage = getTrackerReggieMadMessage();
+  setTrackerTerminalText(madMessage, {
+    forceAnimate: true,
+    fallbackText: madMessage,
+  }).catch(() => {});
+
+  trackerReggieMadTimerId = window.setTimeout(() => {
+    trackerReggieMadTimerId = null;
+    setTrackerReggieMood('');
+    restoreTrackerStatusMessage();
+  }, TRACKER_REGGIE_MAD_DURATION_MS);
+}
+
+function handleTrackerReggieClick() {
+  const now = Date.now();
+  trackerReggieClickTimes = trackerReggieClickTimes.filter(
+    (timestamp) => now - timestamp <= TRACKER_REGGIE_SPAM_WINDOW_MS,
+  );
+  trackerReggieClickTimes.push(now);
+
+  if (trackerReggieClickTimes.length >= TRACKER_REGGIE_SPAM_THRESHOLD) {
+    triggerTrackerReggieMad();
+  }
+}
+
+function installTrackerReggieInteraction() {
+  const orb = document.querySelector('.tracker-orb');
+  if (!orb) return;
+
+  orb.addEventListener('click', handleTrackerReggieClick);
+}
+
+async function setTrackerTerminalText(message, options = {}) {
+  const {
+    forceAnimate = false,
+    fallbackText = 'Workshop update incoming.',
+    introMessage = '',
+    introHoldMs = TRACKER_TERMINAL_INTRO_HOLD_MS,
+  } = options;
+
+  const terminalText = document.getElementById('trackerStageText');
+  const card = document.getElementById('trackerStatusCard');
+  if (!terminalText) return;
+
+  const nextText = getTrackerTerminalMessage(message, fallbackText);
+  const introText = String(introMessage || '').trim();
+  const shouldAnimate = forceAnimate || nextText !== trackerLastTerminalText;
+  const runId = ++trackerTerminalRunId;
+
+  trackerLastTerminalText = nextText;
+
+  if (card) {
+    card.dataset.terminalState = shouldAnimate ? 'typing' : 'idle';
+  }
+
+  if (!shouldAnimate || prefersReducedMotion()) {
+    terminalText.textContent = nextText;
+    if (card) {
+      card.dataset.terminalState = 'idle';
+    }
+    return true;
+  }
+
+  const typeTerminalLine = async (text, includeBootPause = true) => {
+    terminalText.textContent = '';
+
+    if (includeBootPause) {
+      await wait(TRACKER_TERMINAL_BOOT_PAUSE_MS);
+      if (runId !== trackerTerminalRunId) {
+        return false;
+      }
+    }
+
+    for (let index = 0; index < text.length; index += 1) {
+      if (runId !== trackerTerminalRunId) {
+        return false;
+      }
+
+      terminalText.textContent = text.slice(0, index + 1);
+      const charDelay = /[,:.;!?]/.test(text[index])
+        ? TRACKER_TERMINAL_CHAR_MS * 2
+        : TRACKER_TERMINAL_CHAR_MS;
+      await wait(charDelay);
+    }
+
+    return runId === trackerTerminalRunId;
+  };
+
+  if (introText) {
+    const introCompleted = await typeTerminalLine(introText, true);
+    if (!introCompleted) {
+      return false;
+    }
+
+    await wait(introHoldMs);
+    if (runId !== trackerTerminalRunId) {
+      return false;
+    }
+  }
+
+  const finalCompleted = await typeTerminalLine(nextText, !introText);
+  if (!finalCompleted) {
+    return false;
+  }
+
+  if (runId !== trackerTerminalRunId) {
+    return false;
+  }
+
+  if (card) {
+    card.dataset.terminalState = 'idle';
+  }
+
+  return true;
 }
 
 function getCurrentMilestoneIndex(milestones) {
@@ -367,8 +901,6 @@ function getTrackerIntroFrames(tracker) {
 function setTrackerError(message) {
   const orderNumber = document.getElementById('trackerOrderNumber');
   const stageLabel = document.getElementById('trackerStageLabel');
-  const stageText = document.getElementById('trackerStageText');
-  const quote = document.getElementById('trackerQuote');
   const updated = document.getElementById('trackerUpdated');
   const tips = document.getElementById('trackerTips');
   const items = document.getElementById('trackerItems');
@@ -376,11 +908,23 @@ function setTrackerError(message) {
   const trackingLinks = document.getElementById('trackerTrackingLinks');
   const milestones = document.getElementById('trackerMilestones');
   const card = document.getElementById('trackerStatusCard');
+  const fallbackMessage = message || 'This tracker link is invalid or not ready yet.';
+
+  clearTrackerIdleFactTimer();
+  clearTrackerReggieMadTimer();
+  trackerReggieClickTimes = [];
+  setTrackerReggieMood('');
+  trackerIdleFactContextKey = '';
+  trackerLastStatusStageKey = 'error';
+  trackerLastStatusMessage = fallbackMessage;
 
   if (orderNumber) orderNumber.textContent = 'Order tracker';
   if (stageLabel) stageLabel.textContent = 'No live tracker found';
-  if (stageText) stageText.textContent = message || 'This tracker link is invalid or not ready yet.';
-  if (quote) quote.textContent = 'The tracker lights are currently off.';
+  setTrackerTerminalText(fallbackMessage, {
+    forceAnimate: true,
+    fallbackText: fallbackMessage,
+    introMessage: getTrackerIntroductionMessage(),
+  }).catch(() => {});
   if (updated) updated.textContent = 'This page could not load a live update.';
   if (tips) tips.innerHTML = '<li>Please check the link or try again later.</li>';
   if (items) items.innerHTML = '<p class="tracker-empty">No order details available.</p>';
@@ -558,15 +1102,42 @@ async function playTrackerIntro(tracker) {
 function renderTracker(tracker) {
   const orderNumber = document.getElementById('trackerOrderNumber');
   const stageLabel = document.getElementById('trackerStageLabel');
-  const stageText = document.getElementById('trackerStageText');
-  const quote = document.getElementById('trackerQuote');
   const updated = document.getElementById('trackerUpdated');
   const card = document.getElementById('trackerStatusCard');
+  const nextStageKey = String(tracker?.currentStage?.key || '').trim();
+  const previousStageKey = trackerLastRenderedStageKey;
+  const nextStatusMessage = getTrackerTerminalMessage(tracker.currentStage?.description);
+  const statusChanged = nextStageKey !== trackerLastStatusStageKey
+    || nextStatusMessage !== trackerLastStatusMessage;
+
+  if (!previousStageKey && nextStageKey) {
+    triggerTrackerCue({ type: 'startup', stageKey: nextStageKey });
+  } else if (previousStageKey && nextStageKey && previousStageKey !== nextStageKey) {
+    triggerTrackerCue({ type: 'stage_change', stageKey: nextStageKey });
+  }
+
+  trackerLastRenderedStageKey = nextStageKey;
 
   if (orderNumber) orderNumber.textContent = tracker.orderNumber ? `Order ${tracker.orderNumber}` : 'AIRTAC order';
   if (stageLabel) stageLabel.textContent = tracker.currentStage?.label || 'Status unavailable';
-  if (stageText) stageText.textContent = tracker.currentStage?.description || '';
-  if (quote) quote.textContent = tracker.quote || 'Workshop update incoming.';
+  if (statusChanged) {
+    clearTrackerReggieMadTimer();
+    trackerReggieClickTimes = [];
+    setTrackerReggieMood('');
+    clearTrackerIdleFactTimer();
+    trackerIdleFactContextKey = '';
+    trackerLastStatusStageKey = nextStageKey;
+    trackerLastStatusMessage = nextStatusMessage;
+
+    setTrackerTerminalText(nextStatusMessage, {
+      forceAnimate: !previousStageKey,
+      introMessage: !previousStageKey ? getTrackerIntroductionMessage() : '',
+    }).then((completed) => {
+      if (completed) {
+        scheduleTrackerIdleFactCycle(nextStageKey, nextStatusMessage);
+      }
+    }).catch(() => {});
+  }
   if (updated) {
     const updatedText = formatTrackerTimestamp(tracker.updatedAt);
     updated.textContent = updatedText ? `Last updated ${updatedText}` : 'Waiting for live workshop updates.';
@@ -625,6 +1196,9 @@ async function loadTracker() {
 document.addEventListener('DOMContentLoaded', () => {
   renderTrackerStepSegments(buildPlaceholderMilestones());
   setTrackerProgressSummary(null, -1);
+  installTrackerAudioUnlock();
+  installTrackerReggieInteraction();
+  scheduleTrackerWakeUp();
   loadTracker();
 
   if (trackerPollId) {
