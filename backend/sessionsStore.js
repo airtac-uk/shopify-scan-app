@@ -151,6 +151,24 @@ function generatePublicToken() {
   return crypto.randomBytes(18).toString('hex');
 }
 
+function buildOrderTrackerRecord(tracker) {
+  if (!tracker) return null;
+
+  const events = db.prepare(`
+    SELECT stageKey, stageLabel, stageDescription, sourceTag, createdAt
+    FROM order_tracker_events
+    WHERE shop = ? AND orderId = ?
+    ORDER BY createdAt ASC, id ASC
+  `).all(tracker.shop, tracker.orderId);
+
+  return {
+    ...tracker,
+    currentStageIsTerminal: Boolean(tracker.currentStageIsTerminal),
+    lineItems: safeJsonParse(tracker.lineItemsJson || '[]', []),
+    events,
+  };
+}
+
 module.exports = {
   /**
    * Save session for a shop
@@ -191,6 +209,17 @@ module.exports = {
       expires: row.expires ? new Date(row.expires) : null,
       associated_user: row.associatedUser ? JSON.parse(row.associatedUser) : null
     };
+  },
+
+  list() {
+    return db.prepare('SELECT * FROM sessions ORDER BY shop ASC').all().map((row) => ({
+      shop: row.shop,
+      accessToken: row.accessToken,
+      scope: row.scope,
+      isOnline: !!row.isOnline,
+      expires: row.expires ? new Date(row.expires) : null,
+      associated_user: row.associatedUser ? JSON.parse(row.associatedUser) : null,
+    }));
   },
 
   recordWaitingQcEvent({ barcode, staff, createdAt }) {
@@ -707,20 +736,20 @@ module.exports = {
       LIMIT 1
     `).get(token);
 
-    if (!tracker) return null;
+    return buildOrderTrackerRecord(tracker);
+  },
 
-    const events = db.prepare(`
-      SELECT stageKey, stageLabel, stageDescription, sourceTag, createdAt
-      FROM order_tracker_events
-      WHERE shop = ? AND orderId = ?
-      ORDER BY createdAt ASC, id ASC
-    `).all(tracker.shop, tracker.orderId);
+  getOrderTrackerByOrderId(orderId) {
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!normalizedOrderId) return null;
 
-    return {
-      ...tracker,
-      currentStageIsTerminal: Boolean(tracker.currentStageIsTerminal),
-      lineItems: safeJsonParse(tracker.lineItemsJson || '[]', []),
-      events,
-    };
+    const tracker = db.prepare(`
+      SELECT *
+      FROM order_trackers
+      WHERE orderId = ?
+      LIMIT 1
+    `).get(normalizedOrderId);
+
+    return buildOrderTrackerRecord(tracker);
   },
 };

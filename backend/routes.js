@@ -459,6 +459,111 @@ function buildTypedAwaitingPartsItems({ skus, items, skuMap }) {
   }).filter((item) => item.partSku);
 }
 
+function normalizeTrackerOrderId(ref) {
+  const value = String(ref || '').trim();
+  if (!value) return '';
+
+  if (/^gid:\/\/shopify\/Order\/\d+$/i.test(value)) {
+    return value;
+  }
+
+  if (/^\d+$/.test(value)) {
+    return `gid://shopify/Order/${value}`;
+  }
+
+  return '';
+}
+
+async function fetchOrderForTrackerById({ client, orderId }) {
+  if (!client || !orderId) {
+    return null;
+  }
+
+  const query = `
+    query getOrderForTrackerById($id: ID!) {
+      order(id: $id) {
+        id
+        name
+        createdAt
+        note
+        tags
+        ${ORDER_WORKFLOW_STATUS_FIELDS}
+        ${ORDER_TRACKER_METAFIELD_FIELD}
+        lineItems(first: 200) {
+          edges {
+            node {
+              id
+              title
+              sku
+              quantity
+              currentQuantity
+              variantTitle
+              variant {
+                barcode
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  const response = await client.graphql(query, {
+    variables: { id: orderId },
+  });
+
+  return response.data?.order || null;
+}
+
+async function findOrCreateTrackerRecordByOrderId({ req, orderId }) {
+  const normalizedOrderId = normalizeTrackerOrderId(orderId);
+  if (!normalizedOrderId) {
+    return null;
+  }
+
+  const existingRecord = sessionsStore.getOrderTrackerByOrderId(normalizedOrderId);
+  if (existingRecord) {
+    return existingRecord;
+  }
+
+  const sessions = sessionsStore.list()
+    .filter((session) => session?.shop && session?.accessToken);
+
+  for (const session of sessions) {
+    try {
+      const client = shopifyClient(session);
+      const order = await fetchOrderForTrackerById({
+        client,
+        orderId: normalizedOrderId,
+      });
+
+      if (!order) {
+        continue;
+      }
+
+      const lineItems = buildCurrentOrderLineItems(order?.lineItems?.edges || []);
+      const barcode = normalizeScanBarcode(order?.name || normalizedOrderId);
+
+      await persistOrderTrackerSnapshot({
+        req,
+        client,
+        shop: session.shop,
+        order,
+        barcode,
+        lineItems,
+        explicitTag: '',
+        appendEventIfStageChanged: false,
+      });
+
+      return sessionsStore.getOrderTrackerByOrderId(normalizedOrderId);
+    } catch (err) {
+      console.error(`Failed to backfill tracker for order ${normalizedOrderId} via ${session.shop}:`, err);
+    }
+  }
+
+  return null;
+}
+
 router.post('/webhooks/orders-create', async (req, res) => {
   const topic = String(req.get('X-Shopify-Topic') || '').trim();
   const shop = String(req.get('X-Shopify-Shop-Domain') || '').trim();
@@ -1791,10 +1896,15 @@ router.get('/api/order-tracker/:token', async (req, res) => {
   try {
     const token = String(req.params.token || '').trim();
     if (!token) {
-      return res.status(400).json({ success: false, error: 'Missing tracker token' });
+      return res.status(400).json({ success: false, error: 'Missing tracker reference' });
     }
 
-    const trackerRecord = sessionsStore.getOrderTrackerByToken(token);
+    const normalizedOrderId = normalizeTrackerOrderId(token);
+    const trackerRecord = sessionsStore.getOrderTrackerByToken(token)
+      || (normalizedOrderId
+        ? (sessionsStore.getOrderTrackerByOrderId(normalizedOrderId)
+          || await findOrCreateTrackerRecordByOrderId({ req, orderId: normalizedOrderId }))
+        : null);
     if (!trackerRecord) {
       return res.status(404).json({ success: false, error: 'Tracker not found' });
     }
