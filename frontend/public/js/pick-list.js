@@ -16,6 +16,7 @@ let currentOrderTimeline = [];
 let currentWorkflowBlock = null;
 let currentTrackerUrl = '';
 let currentAwaitingPartsSkuMap = new Map();
+let currentAwaitingPartsCatalog = new Map();
 let lastActionTag = '';
 let lastActionBarcode = '';
 let actionButtons = [];
@@ -30,7 +31,7 @@ let wholesaleSaveQueued = false;
 const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
 const WHOLESALE_MODE_COOKIE = 'pick_list_wholesale_mode';
-const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built']);
+const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built', 'on_hold']);
 
 function getCookieValue(name) {
   const prefix = `${name}=`;
@@ -60,6 +61,22 @@ function getInitialOrderLookupValue() {
   return String(params.get('order') || params.get('barcode') || '').trim().toUpperCase();
 }
 
+function setOrderLookupInUrl(value) {
+  const url = new URL(window.location.href);
+  const normalizedValue = String(value || '').trim().toUpperCase();
+
+  if (normalizedValue) {
+    url.searchParams.set('order', normalizedValue);
+  } else {
+    url.searchParams.delete('order');
+  }
+  url.searchParams.delete('barcode');
+
+  const nextSearch = url.searchParams.toString();
+  const nextUrl = `${url.pathname}${nextSearch ? `?${nextSearch}` : ''}${url.hash}`;
+  window.history.replaceState({}, '', nextUrl);
+}
+
 function normalizeDisplaySku(value) {
   return String(value || '').trim().toUpperCase();
 }
@@ -72,13 +89,98 @@ function getAwaitingPartsQty(value) {
   return currentAwaitingPartsSkuMap.get(normalizeDisplaySku(value)) || 0;
 }
 
+function getAwaitingPartsTargetQty(value) {
+  return currentAwaitingPartsCatalog.get(normalizeDisplaySku(value))?.quantity || 0;
+}
+
+function getCurrentAwaitingPartsSelection() {
+  return Array.from(currentAwaitingPartsSkuMap.entries())
+    .map(([sku, quantity]) => ({
+      sku,
+      quantity: Math.max(1, Number(quantity) || 1),
+    }))
+    .sort((left, right) => left.sku.localeCompare(right.sku));
+}
+
 function setCurrentAwaitingPartsItems(items) {
   currentAwaitingPartsSkuMap = new Map();
 
   (items || []).forEach((item) => {
     const sku = normalizeDisplaySku(item?.sku || item?.partSku);
     if (!sku) return;
-    currentAwaitingPartsSkuMap.set(sku, Math.max(1, Number(item?.quantity) || 1));
+    const quantity = Math.max(1, Number(item?.quantity) || 1);
+    currentAwaitingPartsSkuMap.set(sku, (currentAwaitingPartsSkuMap.get(sku) || 0) + quantity);
+  });
+}
+
+function buildAwaitingPartsCatalog(lineItems) {
+  const catalog = new Map();
+
+  const addRowToCatalog = (row, contextLabel) => {
+    const sku = normalizeDisplaySku(row?.sku);
+    const quantity = Math.max(1, Number(row?.quantity) || 1);
+    if (!sku) return;
+
+    if (!catalog.has(sku)) {
+      catalog.set(sku, {
+        sku,
+        quantity: 0,
+        contexts: [],
+        location: String(row?.location || '').trim(),
+        note: String(row?.note || '').trim(),
+        type: String(row?.type || '').trim(),
+      });
+    }
+
+    const existing = catalog.get(sku);
+    existing.quantity += quantity;
+
+    if (contextLabel && !existing.contexts.includes(contextLabel)) {
+      existing.contexts.push(contextLabel);
+    }
+    if (!existing.location) {
+      existing.location = String(row?.location || '').trim();
+    }
+    if (!existing.note) {
+      existing.note = String(row?.note || '').trim();
+    }
+    if (!existing.type) {
+      existing.type = String(row?.type || '').trim();
+    }
+  };
+
+  (lineItems || []).forEach((line) => {
+    const lineSku = normalizeDisplaySku(line?.sku);
+    const lineQty = Math.max(1, Number(line?.quantity) || 1);
+    const lineTitleParts = [
+      lineSku ? `${lineSku}${lineQty > 1 ? ` x${lineQty}` : ''}` : '',
+      String(line?.title || '').trim(),
+      String(line?.variantTitle || '').trim(),
+    ].filter(Boolean);
+    const lineLabel = lineTitleParts.join(' — ');
+
+    [
+      ['Must Pick', line?.mustPick],
+      ['Desk Items', line?.deskItems],
+      ['Needs Review', line?.reviewItems],
+    ].forEach(([sectionLabel, rows]) => {
+      (rows || []).forEach((row) => {
+        addRowToCatalog(row, [sectionLabel, lineLabel].filter(Boolean).join(' • '));
+      });
+    });
+  });
+
+  return catalog;
+}
+
+function refreshAwaitingPartsCatalog(lineItems = lastRenderedLineItems) {
+  currentAwaitingPartsCatalog = buildAwaitingPartsCatalog(lineItems);
+}
+
+function syncAwaitingToggleDisabledState() {
+  const disabled = loading || isCurrentOrderWorkflowBlocked();
+  document.querySelectorAll('.pick-list-awaiting-toggle').forEach((button) => {
+    button.disabled = disabled;
   });
 }
 
@@ -159,7 +261,7 @@ function isCurrentOrderWorkflowBlocked() {
   return Boolean(currentWorkflowBlock && currentWorkflowBlock.blocked);
 }
 
-function clearLoadedOrderState() {
+function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   lastRenderedLineItems = [];
   lastOrderItems = [];
   lastWholesaleProgressByItemKey = {};
@@ -171,6 +273,7 @@ function clearLoadedOrderState() {
   currentWorkflowBlock = null;
   currentTrackerUrl = '';
   currentAwaitingPartsSkuMap = new Map();
+  currentAwaitingPartsCatalog = new Map();
   verifyItems = [];
   verifyCodeIndex = new Map();
 
@@ -183,6 +286,9 @@ function clearLoadedOrderState() {
   if (lineItems) lineItems.innerHTML = '';
   if (timelineSection) timelineSection.hidden = true;
   if (timelineCard) timelineCard.innerHTML = '';
+  if (!preserveOrderLookup) {
+    setOrderLookupInUrl('');
+  }
 
   renderWorkflowAlert();
   renderTrackerLink();
@@ -362,6 +468,7 @@ function setLoading(isLoading) {
   if (fetchButton) fetchButton.disabled = isLoading;
   setActionButtonsEnabled(actionButtonsUnlocked);
   syncVerifyButtonDisabledState();
+  syncAwaitingToggleDisabledState();
 }
 
 function normalizeTypeKey(type) {
@@ -406,11 +513,113 @@ function formatActionLabel(tag) {
 function isAnyDialogOpen() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
   const qcFailModal = document.getElementById('qcFailModal');
+  const onHoldModal = document.getElementById('onHoldModal');
 
   return Boolean(
     awaitingPartsModal?.classList.contains('is-open') ||
-    qcFailModal?.classList.contains('is-open')
+    qcFailModal?.classList.contains('is-open') ||
+    onHoldModal?.classList.contains('is-open')
   );
+}
+
+async function saveAwaitingPartsSelection({ orderId, items, closeDialog = false } = {}) {
+  const normalizedOrderId = String(orderId || currentOrderBarcode || '').trim().toUpperCase();
+  const normalizedItems = (Array.isArray(items) ? items : [])
+    .map((item) => ({
+      sku: normalizeDisplaySku(item?.sku || item?.partSku),
+      quantity: Math.max(1, Number(item?.quantity) || 1),
+    }))
+    .filter((item) => item.sku);
+
+  if (!normalizedOrderId) {
+    setStatus('Error: Missing order id for awaiting parts.', 'error');
+    return false;
+  }
+
+  if (loading) return false;
+
+  setLoading(true);
+  try {
+    const response = await fetch('/api/awaiting-parts', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ orderId: normalizedOrderId, items: normalizedItems }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to save awaiting parts');
+    }
+
+    setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsSelection) ? data.awaitingPartsSelection : normalizedItems);
+    if (hasRenderedPickList) {
+      renderCurrentOrderSection();
+    }
+
+    const savedOrderNumber = data.orderNumber || currentOrderNumber || normalizedOrderId;
+    setStatus(
+      normalizedItems.length > 0
+        ? `Awaiting parts updated for ${savedOrderNumber}.`
+        : `Awaiting parts cleared for ${savedOrderNumber}.`,
+      'success'
+    );
+
+    if (closeDialog) {
+      closeAwaitingPartsDialog();
+    }
+
+    return true;
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, 'error');
+    return false;
+  } finally {
+    setLoading(false);
+  }
+}
+
+async function toggleAwaitingPart(sku) {
+  const normalizedSku = normalizeDisplaySku(sku);
+  if (!normalizedSku || !hasRenderedPickList || isCurrentOrderWorkflowBlocked()) {
+    return false;
+  }
+
+  const nextSelectionMap = new Map(currentAwaitingPartsSkuMap);
+  if (nextSelectionMap.has(normalizedSku)) {
+    nextSelectionMap.delete(normalizedSku);
+  } else {
+    nextSelectionMap.set(
+      normalizedSku,
+      Math.max(1, getAwaitingPartsTargetQty(normalizedSku) || getAwaitingPartsQty(normalizedSku) || 1)
+    );
+  }
+
+  const nextItems = Array.from(nextSelectionMap.entries())
+    .map(([nextSku, quantity]) => ({ sku: nextSku, quantity }))
+    .sort((left, right) => left.sku.localeCompare(right.sku));
+
+  return saveAwaitingPartsSelection({
+    orderId: currentOrderBarcode,
+    items: nextItems,
+  });
+}
+
+function createAwaitingToggleButton(sku) {
+  const normalizedSku = normalizeDisplaySku(sku);
+  const isAwaiting = isAwaitingPartsSku(normalizedSku);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `pick-list-awaiting-toggle${isAwaiting ? ' is-active' : ''}`;
+  button.textContent = isAwaiting ? 'Clear' : 'Await';
+  button.title = isAwaiting
+    ? `Mark ${normalizedSku} as no longer awaiting parts`
+    : `Mark ${normalizedSku} as awaiting parts`;
+  button.disabled = loading || isCurrentOrderWorkflowBlocked();
+  button.addEventListener('click', async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    await toggleAwaitingPart(normalizedSku);
+  });
+  return button;
 }
 
 function renderRows(container, rows, emptyText) {
@@ -442,9 +651,14 @@ function renderRows(container, rows, emptyText) {
   noteHeader.className = 'pick-list-cell pick-list-col-note';
   noteHeader.textContent = 'Note';
 
+  const actionHeader = document.createElement('div');
+  actionHeader.className = 'pick-list-cell pick-list-col-action';
+  actionHeader.textContent = 'Action';
+
   headerItem.appendChild(skuHeader);
   headerItem.appendChild(locationHeader);
   headerItem.appendChild(noteHeader);
+  headerItem.appendChild(actionHeader);
   list.appendChild(headerItem);
 
   rows.forEach((row) => {
@@ -458,7 +672,9 @@ function renderRows(container, rows, emptyText) {
 
     const main = document.createElement('div');
     main.className = 'pick-list-cell pick-list-col-sku pick-list-item-main';
-    main.textContent = `${row.sku}`;
+    const skuText = document.createElement('span');
+    skuText.textContent = Number(row.quantity) > 1 ? `${row.sku} x${row.quantity}` : `${row.sku}`;
+    main.appendChild(skuText);
     if (isAwaitingParts) {
       const badge = document.createElement('span');
       badge.className = 'pick-list-awaiting-parts-badge';
@@ -474,9 +690,14 @@ function renderRows(container, rows, emptyText) {
     note.className = 'pick-list-cell pick-list-col-note pick-list-item-note';
     note.textContent = String(row.note || '').trim();
 
+    const action = document.createElement('div');
+    action.className = 'pick-list-cell pick-list-col-action pick-list-item-action';
+    action.appendChild(createAwaitingToggleButton(row.sku));
+
     item.appendChild(main);
     item.appendChild(location);
     item.appendChild(note);
+    item.appendChild(action);
 
     list.appendChild(item);
   });
@@ -1196,30 +1417,43 @@ function processVerifyScan(scannedCode) {
   return true;
 }
 
-function openAwaitingPartsDialog(orderId, lineItems) {
+function openAwaitingPartsDialog(orderId, lineItems = lastRenderedLineItems) {
   const modal = document.getElementById('awaitingPartsModal');
   const form = document.getElementById('awaitingPartsForm');
   if (!modal || !form) return;
 
   form.innerHTML = '';
-
-  const uniqueSkuItems = [];
-  const seenSkus = new Set();
-
-  (lineItems || []).forEach((item) => {
-    if (!item || !item.sku) return;
-    if (seenSkus.has(item.sku)) return;
-    seenSkus.add(item.sku);
-    uniqueSkuItems.push(item);
+  const modalCatalog = buildAwaitingPartsCatalog(lineItems);
+  getCurrentAwaitingPartsSelection().forEach((item) => {
+    const sku = normalizeDisplaySku(item?.sku || item?.partSku);
+    if (!sku || modalCatalog.has(sku)) return;
+    modalCatalog.set(sku, {
+      sku,
+      quantity: Math.max(1, Number(item?.quantity) || 1),
+      contexts: ['Currently awaiting (not on current pick list)'],
+      location: '',
+      note: '',
+      type: '',
+    });
   });
 
-  uniqueSkuItems.forEach((item) => {
+  const modalItems = Array.from(modalCatalog.values())
+    .sort((left, right) => left.sku.localeCompare(right.sku));
+
+  if (!modalItems.length) {
+    const empty = document.createElement('p');
+    empty.className = 'pick-list-empty';
+    empty.textContent = 'No SKU or component rows available to mark as awaiting parts.';
+    form.appendChild(empty);
+  }
+
+  modalItems.forEach((item) => {
     const label = document.createElement('label');
     label.className = 'pick-modal-item';
     const currentQty = getAwaitingPartsQty(item.sku);
-    const lineQty = Math.max(1, Number(item.quantity) || 1);
-    const maxQty = Math.max(lineQty, currentQty || 0, 1);
-    const defaultQty = currentQty > 0 ? currentQty : lineQty;
+    const suggestedQty = Math.max(1, Number(item.quantity) || 1);
+    const maxQty = Math.max(suggestedQty, currentQty || 0, 1);
+    const defaultQty = currentQty > 0 ? currentQty : suggestedQty;
 
     const checkbox = document.createElement('input');
     checkbox.type = 'checkbox';
@@ -1229,8 +1463,34 @@ function openAwaitingPartsDialog(orderId, lineItems) {
     const body = document.createElement('div');
     body.className = 'pick-modal-item__body';
 
+    const textWrap = document.createElement('div');
+    textWrap.className = 'pick-modal-item__text';
+
     const text = document.createElement('span');
-    text.textContent = `${item.sku} — ${item.title || ''}`;
+    text.textContent = suggestedQty > 1 ? `${item.sku} x${suggestedQty}` : item.sku;
+
+    const metaParts = [];
+    if (item.contexts.length > 0) {
+      const visibleContexts = item.contexts.slice(0, 2);
+      const remainingContextCount = Math.max(0, item.contexts.length - visibleContexts.length);
+      metaParts.push(
+        visibleContexts.join(' | ') + (remainingContextCount > 0 ? ` | +${remainingContextCount} more` : '')
+      );
+    }
+    if (item.location) {
+      metaParts.push(`Loc: ${item.location}`);
+    }
+    if (item.note) {
+      metaParts.push(item.note);
+    }
+
+    textWrap.appendChild(text);
+    if (metaParts.length > 0) {
+      const meta = document.createElement('small');
+      meta.className = 'pick-modal-item__meta';
+      meta.textContent = metaParts.join(' | ');
+      textWrap.appendChild(meta);
+    }
 
     const qtyInput = document.createElement('input');
     qtyInput.type = 'number';
@@ -1246,7 +1506,7 @@ function openAwaitingPartsDialog(orderId, lineItems) {
       qtyInput.disabled = !checkbox.checked;
     });
 
-    body.appendChild(text);
+    body.appendChild(textWrap);
     body.appendChild(qtyInput);
     label.appendChild(checkbox);
     label.appendChild(body);
@@ -1287,37 +1547,11 @@ async function submitAwaitingParts() {
     return;
   }
 
-  if (!items.length) {
-    setStatus('Select at least one SKU for awaiting parts.', 'error');
-    return;
-  }
-
-  if (loading) return;
-
-  setLoading(true);
-  try {
-    const response = await fetch('/api/awaiting-parts', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ orderId, items }),
-    });
-
-    const data = await response.json();
-    if (!response.ok || !data.success) {
-      throw new Error(data.error || 'Failed to save awaiting parts');
-    }
-
-    setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsSelection) ? data.awaitingPartsSelection : items);
-    if (hasRenderedPickList) {
-      renderCurrentOrderSection();
-    }
-    setStatus(`Awaiting parts saved for ${data.orderNumber || currentOrderNumber}.`, 'success');
-    closeAwaitingPartsDialog();
-  } catch (err) {
-    setStatus(`Error: ${err.message}`, 'error');
-  } finally {
-    setLoading(false);
-  }
+  await saveAwaitingPartsSelection({
+    orderId,
+    items,
+    closeDialog: true,
+  });
 }
 
 function openQcFailDialog(orderId, lineItems) {
@@ -1366,6 +1600,74 @@ function closeQcFailDialog() {
     skuSelect.dataset.orderId = '';
   }
   if (reasonInput) reasonInput.value = '';
+}
+
+function openOnHoldDialog(orderId) {
+  const modal = document.getElementById('onHoldModal');
+  const reasonInput = document.getElementById('onHoldReason');
+  if (!modal || !reasonInput) return;
+
+  reasonInput.dataset.orderId = String(orderId || '').trim().toUpperCase();
+  reasonInput.value = '';
+  modal.classList.add('is-open');
+  window.requestAnimationFrame(() => reasonInput.focus());
+}
+
+function closeOnHoldDialog() {
+  const modal = document.getElementById('onHoldModal');
+  const reasonInput = document.getElementById('onHoldReason');
+
+  if (modal) modal.classList.remove('is-open');
+  if (reasonInput) {
+    reasonInput.dataset.orderId = '';
+    reasonInput.value = '';
+  }
+}
+
+async function submitOnHold() {
+  const reasonInput = document.getElementById('onHoldReason');
+  if (!reasonInput) return;
+
+  const orderId = String(reasonInput.dataset.orderId || '').trim().toUpperCase();
+  const reason = reasonInput.value.trim();
+
+  if (!orderId) {
+    setStatus('Error: Missing order id for On Hold.', 'error');
+    return;
+  }
+
+  if (!reason) {
+    setStatus('Enter a reason for putting this order on hold.', 'error');
+    reasonInput.focus();
+    return;
+  }
+
+  if (loading) return;
+
+  setLoading(true);
+  setStatus('Applying On Hold...', 'info');
+
+  try {
+    const response = await fetch('/api/tag-order', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ barcode: orderId, tag: 'on_hold', reason }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to apply action');
+    }
+
+    lastActionTag = 'on_hold';
+    lastActionBarcode = orderId;
+    closeOnHoldDialog();
+    setStatus(`Order ${data.orderNumber} put on hold by ${data.staff}: ${reason}`, 'success');
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, 'error');
+  } finally {
+    setLoading(false);
+  }
 }
 
 async function submitQcFail() {
@@ -1449,6 +1751,16 @@ async function runOrderAction(tag) {
     return;
   }
 
+  if (tag === 'awaiting_parts') {
+    openAwaitingPartsDialog(normalizedBarcode, lastRenderedLineItems);
+    return;
+  }
+
+  if (tag === 'on_hold') {
+    openOnHoldDialog(normalizedBarcode);
+    return;
+  }
+
   setLoading(true);
   setStatus(`Applying ${formatActionLabel(tag)}...`, 'info');
 
@@ -1477,7 +1789,7 @@ async function runOrderAction(tag) {
     }
 
     if (tag === 'awaiting_parts') {
-      openAwaitingPartsDialog(normalizedBarcode, data.lineItems || []);
+      openAwaitingPartsDialog(normalizedBarcode, lastRenderedLineItems);
     } else if (tag === 'qc_fail') {
       openQcFailDialog(normalizedBarcode, data.lineItems || []);
     } else if (hasRenderedPickList) {
@@ -1518,7 +1830,8 @@ async function fetchPickList(barcodeInput) {
     const data = await response.json();
     if (!response.ok || !data.success) {
       if (data.workflowBlocked) {
-        clearLoadedOrderState();
+        setOrderLookupInUrl(barcode);
+        clearLoadedOrderState({ preserveOrderLookup: true });
         playVerifyErrorSound();
         setStatus(data.error || 'This order cannot be picked or built.', 'error');
         return;
@@ -1537,6 +1850,7 @@ async function fetchPickList(barcodeInput) {
     currentOrderTimeline = Array.isArray(data.orderTimeline) ? data.orderTimeline : [];
     currentTrackerUrl = String(data.trackerUrl || '').trim();
     setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsItems) ? data.awaitingPartsItems : []);
+    setOrderLookupInUrl(data.barcode || barcode);
     currentWorkflowBlock = data.workflowBlocked
       ? {
           blocked: true,
@@ -1554,6 +1868,7 @@ async function fetchPickList(barcodeInput) {
 
     lastRenderedLineItems = Array.isArray(data.lineItems) ? data.lineItems : [];
     lastOrderItems = Array.isArray(data.orderItems) ? data.orderItems : [];
+    refreshAwaitingPartsCatalog(lastRenderedLineItems);
     lastWholesaleProgressByItemKey =
       data.wholesaleProgressByItemKey && typeof data.wholesaleProgressByItemKey === 'object'
         ? data.wholesaleProgressByItemKey
@@ -1657,16 +1972,21 @@ function setupHidScan() {
 function registerModalHandlers() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
   const qcFailModal = document.getElementById('qcFailModal');
+  const onHoldModal = document.getElementById('onHoldModal');
 
   const awaitingCancel = document.getElementById('awaitingPartsCancelBtn');
   const awaitingConfirm = document.getElementById('awaitingPartsConfirmBtn');
   const qcCancel = document.getElementById('qcFailCancelBtn');
   const qcConfirm = document.getElementById('qcFailConfirmBtn');
+  const onHoldCancel = document.getElementById('onHoldCancelBtn');
+  const onHoldConfirm = document.getElementById('onHoldConfirmBtn');
 
   if (awaitingCancel) awaitingCancel.addEventListener('click', closeAwaitingPartsDialog);
   if (awaitingConfirm) awaitingConfirm.addEventListener('click', submitAwaitingParts);
   if (qcCancel) qcCancel.addEventListener('click', closeQcFailDialog);
   if (qcConfirm) qcConfirm.addEventListener('click', submitQcFail);
+  if (onHoldCancel) onHoldCancel.addEventListener('click', closeOnHoldDialog);
+  if (onHoldConfirm) onHoldConfirm.addEventListener('click', submitOnHold);
 
   if (awaitingPartsModal) {
     awaitingPartsModal.addEventListener('click', (event) => {
@@ -1680,6 +2000,14 @@ function registerModalHandlers() {
     qcFailModal.addEventListener('click', (event) => {
       if (event.target === event.currentTarget) {
         closeQcFailDialog();
+      }
+    });
+  }
+
+  if (onHoldModal) {
+    onHoldModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeOnHoldDialog();
       }
     });
   }

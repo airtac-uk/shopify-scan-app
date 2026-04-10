@@ -4,12 +4,13 @@ const cookieParser = require('cookie-parser');
 const path = require('path');
 
 const { initShopify } = require('./shopifyClient');
-const routes = require('./routes'); // <-- no () at the end
 
+console.log('Starting backend bootstrap...');
 const app = express();
 
 // Initialize Shopify
 initShopify();
+const routes = require('./routes');
 
 // Middleware
 app.use(cookieParser());
@@ -29,4 +30,5 @@ app.get('*', (req, res) => {
 });
 
 // Start server
-app.listen(3000, () => console.log('Server running on 3000'));
+const port = Number(process.env.PORT) || 3000;
+app.listen(port, () => console.log(`Server running on ${port}`));

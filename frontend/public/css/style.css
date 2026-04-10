@@ -1015,6 +1015,12 @@ button:hover { background: #0056b3; }
   box-shadow: inset 0 0 0 1px rgba(240, 203, 140, 0.08);
 }
 
+.pick-list-action-note {
+  margin: -6px 0 12px;
+  color: #9fb2c8;
+  font-size: 13px;
+}
+
 .pick-list-section {
   margin-top: 10px;
 }
@@ -1034,7 +1040,7 @@ button:hover { background: #0056b3; }
 
 .pick-list-item {
   display: grid;
-  grid-template-columns: minmax(0, 1.65fr) minmax(0, 1.05fr) minmax(0, 0.95fr);
+  grid-template-columns: minmax(0, 1.55fr) minmax(0, 1fr) minmax(0, 0.95fr) auto;
   gap: 10px;
   padding: 7px 0;
   border-bottom: 1px dashed #2b3644;
@@ -1064,6 +1070,10 @@ button:hover { background: #0056b3; }
 .pick-list-col-location {
   overflow: hidden;
   text-overflow: ellipsis;
+}
+
+.pick-list-col-action {
+  text-align: right;
 }
 
 .pick-list-item-main {
@@ -1096,6 +1106,37 @@ button:hover { background: #0056b3; }
   text-transform: uppercase;
 }
 
+.pick-list-awaiting-toggle {
+  width: auto;
+  min-width: 68px;
+  padding: 6px 10px;
+  border-radius: 999px;
+  border: 1px solid #33506f;
+  background: rgba(25, 41, 58, 0.92);
+  color: #dbe9f7;
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+
+.pick-list-awaiting-toggle:hover:not(:disabled),
+.pick-list-awaiting-toggle:focus-visible:not(:disabled) {
+  background: rgba(43, 72, 102, 0.96);
+  border-color: #5f8fbc;
+}
+
+.pick-list-awaiting-toggle.is-active {
+  background: rgba(126, 54, 31, 0.92);
+  border-color: rgba(240, 203, 140, 0.42);
+  color: #f6ddaf;
+}
+
+.pick-list-awaiting-toggle:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .pick-list-item-location {
   color: #9fb2c8;
   font-size: 13px;
@@ -1111,6 +1152,12 @@ button:hover { background: #0056b3; }
   word-break: break-word;
   border-left: 2px solid #b89a54;
   padding-left: 6px;
+}
+
+.pick-list-item-action {
+  display: flex;
+  justify-content: flex-end;
+  align-items: flex-start;
 }
 
 .pick-list-item-header .pick-list-cell {
@@ -1243,14 +1290,27 @@ button:hover { background: #0056b3; }
   flex: 1 1 auto;
   min-width: 0;
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   justify-content: space-between;
   gap: 12px;
+}
+
+.pick-modal-item__text {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
 }
 
 .pick-modal-item__body span {
   min-width: 0;
   overflow-wrap: anywhere;
+}
+
+.pick-modal-item__meta {
+  color: #9fb2c8;
+  font-size: 12px;
+  line-height: 1.4;
 }
 
 .pick-modal-qty {
@@ -2284,16 +2344,39 @@ button:hover { background: #0056b3; }
   }
 
   .pick-list-item {
-    grid-template-columns: 1fr;
-    gap: 2px;
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 4px 8px;
   }
 
   .pick-list-item-header {
     display: none;
   }
 
+  .pick-list-col-sku {
+    grid-column: 1;
+    grid-row: 1;
+    white-space: normal;
+    overflow: visible;
+    text-overflow: clip;
+  }
+
   .pick-list-item-location {
+    grid-column: 1;
+    grid-row: 2;
     text-align: left;
+  }
+
+  .pick-list-item-note {
+    grid-column: 1;
+    grid-row: 3;
+  }
+
+  .pick-list-item-action {
+    grid-column: 2;
+    grid-row: 1 / span 3;
+    justify-content: flex-end;
+    align-self: start;
+    margin-top: 0;
   }
 
   .pick-verify-item {
@@ -2503,6 +2586,10 @@ html.theme-light .pick-list-item--awaiting-parts {
   background: rgba(255, 227, 178, 0.42);
 }
 
+html.theme-light .pick-list-action-note {
+  color: #4e647c;
+}
+
 html.theme-light .pick-list-item-header {
   border-bottom-color: #d1dce8;
 }
@@ -2524,6 +2611,24 @@ html.theme-light .pick-list-awaiting-parts-badge {
   background: rgba(196, 154, 78, 0.16);
   border-color: rgba(196, 154, 78, 0.34);
   color: #855a15;
+}
+
+html.theme-light .pick-list-awaiting-toggle {
+  background: #eef5fc;
+  border-color: #b9ccdf;
+  color: #23415e;
+}
+
+html.theme-light .pick-list-awaiting-toggle:hover:not(:disabled),
+html.theme-light .pick-list-awaiting-toggle:focus-visible:not(:disabled) {
+  background: #dfeaf6;
+  border-color: #8fb1d3;
+}
+
+html.theme-light .pick-list-awaiting-toggle.is-active {
+  background: #fff1d9;
+  border-color: #d6ae61;
+  color: #8d5f18;
 }
 
 html.theme-light .pick-list-timeline-item {
@@ -2562,6 +2667,10 @@ html.theme-light .pick-verify-item-progress {
 
 html.theme-light .pick-modal-item {
   background: #f3f8fe;
+}
+
+html.theme-light .pick-modal-item__meta {
+  color: #5f7690;
 }
 
 html.theme-light .pick-modal-qty {

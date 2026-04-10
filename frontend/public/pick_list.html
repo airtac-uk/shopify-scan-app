@@ -66,6 +66,7 @@
 
     <section class="pick-list-actions">
       <h2 class="pick-list-section-title">Order Actions</h2>
+      <p class="pick-list-action-note">Use the `Await` buttons beside SKU rows to mark individual sub-SKUs without opening the bulk editor.</p>
       <div class="pick-list-action-grid">
         <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false">Racked</button>
         <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true">Awaiting Parts</button>
@@ -94,7 +95,7 @@
   <div id="awaitingPartsModal" class="pick-modal" aria-hidden="true">
     <div class="pick-modal__panel">
       <h3>Awaiting Parts</h3>
-      <p>Select the parts we are waiting on:</p>
+      <p>Select the SKU or component rows we are waiting on. Clear every selection to remove the awaiting-parts state.</p>
       <form id="awaitingPartsForm" class="pick-modal-form"></form>
       <div class="pick-modal-actions">
         <button id="awaitingPartsCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
@@ -115,6 +116,23 @@
       <div class="pick-modal-actions">
         <button id="qcFailCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
         <button id="qcFailConfirmBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="onHoldModal" class="pick-modal" aria-hidden="true">
+    <div class="pick-modal__panel">
+      <h3>On Hold</h3>
+      <p>Why is this order being put on hold?</p>
+      <textarea
+        id="onHoldReason"
+        class="pick-modal-textarea"
+        placeholder="Enter the hold reason"
+      ></textarea>
+
+      <div class="pick-modal-actions">
+        <button id="onHoldCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
+        <button id="onHoldConfirmBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">Confirm</button>
       </div>
     </div>
   </div>

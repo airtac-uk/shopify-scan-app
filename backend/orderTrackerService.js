@@ -260,6 +260,15 @@ function extractStageKeyFromOrderNoteHeadline(headline) {
   return matchedRule?.stageKey || null;
 }
 
+function extractReportedByFromOrderNoteDetails(details) {
+  const reportedByLine = (Array.isArray(details) ? details : [])
+    .find((line) => /^Team Member:/i.test(line));
+
+  return reportedByLine
+    ? reportedByLine.replace(/^Team Member:\s*/i, '').trim()
+    : '';
+}
+
 function extractTrackerEventsFromOrderNote(orderNote) {
   return splitOrderNoteSegments(orderNote)
     .map((segment) => {
@@ -280,6 +289,7 @@ function extractTrackerEventsFromOrderNote(orderNote) {
       const timestamp = parseOrderNoteTimestamp(timestampText);
       const stage = getTrackerStageByKey(stageKey);
       const details = lines.slice(1);
+      const staff = extractReportedByFromOrderNoteDetails(details);
       const extraDetailLines = details.filter((line) => !/^Team Member:/i.test(line));
       const description = extraDetailLines.length > 0
         ? extraDetailLines.join(' ')
@@ -289,6 +299,7 @@ function extractTrackerEventsFromOrderNote(orderNote) {
         stageKey: stage.key,
         stageLabel: stage.label,
         stageDescription: description,
+        staff: staff || null,
         createdAt: timestamp,
         sourceTag: 'order_note',
       };
@@ -374,7 +385,16 @@ function buildPersistedTrackerTimeline(trackerRecord) {
       const stageKey = String(event?.stageKey || '').trim();
       const title = String(event?.stageLabel || '').trim() || formatHumanLabel(stageKey || 'order_update');
       const description = String(event?.stageDescription || '').trim();
+      const staff = String(event?.staff || '').trim();
       const createdAt = String(event?.createdAt || '').trim() || null;
+      const details = [];
+
+      if (description) {
+        details.push(description);
+      }
+      if (staff) {
+        details.push(`Team Member: ${staff}`);
+      }
 
       return {
         id: `tracker-${index}-${stageKey}-${createdAt || title}`,
@@ -382,7 +402,7 @@ function buildPersistedTrackerTimeline(trackerRecord) {
         title,
         createdAt,
         timestamp: formatInternalTimelineTimestamp(createdAt),
-        details: description ? [description] : [],
+        details,
         source: 'tracker',
         sequence: index,
       };
@@ -463,7 +483,6 @@ function extractLatestAwaitingPartsSnapshot(orderNote) {
     if (stageKey !== 'awaiting_parts') return;
 
     const details = lines.slice(1);
-    const reportedByLine = details.find((line) => /^Team Member:/i.test(line));
     const items = details
       .filter((line) => /^-\s*/.test(line))
       .map((line) => {
@@ -479,15 +498,42 @@ function extractLatestAwaitingPartsSnapshot(orderNote) {
 
     latestSnapshot = {
       createdAt: parseOrderNoteTimestamp(timestampText),
-      reportedBy: reportedByLine
-        ? reportedByLine.replace(/^Team Member:\s*/i, '').trim()
-        : '',
+      reportedBy: extractReportedByFromOrderNoteDetails(details),
       items,
       skus,
     };
   });
 
   return latestSnapshot;
+}
+
+function extractLatestStageStaffFromOrderNote(orderNote, targetStageKey) {
+  const normalizedTargetStageKey = String(targetStageKey || '').trim();
+  if (!normalizedTargetStageKey) return null;
+
+  let latestStaff = null;
+
+  splitOrderNoteSegments(orderNote).forEach((segment) => {
+    const lines = segment
+      .split('\n')
+      .map((line) => line.trim())
+      .filter(Boolean);
+
+    if (!lines.length) return;
+
+    const headline = lines[0];
+    const headlineMatch = headline.match(/^(.*?)(?:\s+[—-]\s+)(\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2})$/);
+    const headlineText = headlineMatch?.[1]?.trim() || headline;
+    const stageKey = extractStageKeyFromOrderNoteHeadline(headlineText);
+    if (stageKey !== normalizedTargetStageKey) return;
+
+    const staff = extractReportedByFromOrderNoteDetails(lines.slice(1));
+    if (staff) {
+      latestStaff = staff;
+    }
+  });
+
+  return latestStaff;
 }
 
 function deriveTrackerStage({ explicitTag, tags, cancelledAt, displayFulfillmentStatus, orderNote }) {
@@ -767,6 +813,7 @@ module.exports = {
   deriveTrackerStage,
   extractTrackerEventsFromOrderNote,
   extractLatestAwaitingPartsSnapshot,
+  extractLatestStageStaffFromOrderNote,
   normalizeTrackerLineItems,
   buildPublicTrackerPayload,
   buildInternalOrderTimeline,

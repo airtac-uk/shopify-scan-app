@@ -5,7 +5,7 @@ const path = require('path');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
 const sessionsStore = require('./sessionsStore'); // your SQLite session store
-const { initShopify, shopifyClient } = require('./shopifyClient');
+const { shopifyClient } = require('./shopifyClient');
 const fetch = require('node-fetch'); // for OAuth token exchange
 const {
   fetchPickListSheet,
@@ -18,15 +18,13 @@ const {
   deriveTrackerStage,
   extractTrackerEventsFromOrderNote,
   extractLatestAwaitingPartsSnapshot,
+  extractLatestStageStaffFromOrderNote,
   normalizeTrackerLineItems,
   buildPublicTrackerPayload,
   buildInternalOrderTimeline,
 } = require('./orderTrackerService');
 
 router.use(cookieParser());
-
-// Initialize Shopify API once
-initShopify();
 
 async function appendOrderNote( client, orderGid, appendText ) {
   // 1) Fetch existing note
@@ -229,6 +227,44 @@ const ORDER_TRACKER_METAFIELD_FIELD = `
 
 function normalizeScanBarcode(barcode) {
   return normalizeSku(barcode);
+}
+
+function normalizeOrderTags(tags) {
+  if (Array.isArray(tags)) {
+    return tags
+      .map((tag) => String(tag || '').trim())
+      .filter(Boolean);
+  }
+
+  return String(tags || '')
+    .split(',')
+    .map((tag) => String(tag || '').trim())
+    .filter(Boolean);
+}
+
+function hasAwaitingPartsTag(tags) {
+  return normalizeOrderTags(tags)
+    .some((tag) => String(tag || '').trim().toLowerCase() === 'awaiting_parts');
+}
+
+function resolveLatestWaitingQcStaff({ shop, normalizedBarcode, orderId, orderNote }) {
+  const normalizedOrderNote = String(orderNote || '');
+
+  const waitingQcStaff = sessionsStore.getLatestWaitingQcStaffByBarcode(normalizedBarcode);
+  if (waitingQcStaff) {
+    return waitingQcStaff;
+  }
+
+  const orderNoteStaff = extractLatestStageStaffFromOrderNote(normalizedOrderNote, 'quality_check');
+  if (orderNoteStaff) {
+    return orderNoteStaff;
+  }
+
+  return sessionsStore.getLatestOrderTrackerStaffByStage({
+    shop,
+    orderId,
+    stageKey: 'quality_check',
+  });
 }
 
 function verifyShopifyWebhook(rawBody, hmacHeader) {
@@ -788,15 +824,8 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
 
       stats.scannedOrderCount += 1;
 
-      const trackerStage = deriveTrackerStage({
-        explicitTag: '',
-        tags: order.tags,
-        cancelledAt: order.cancelledAt,
-        displayFulfillmentStatus: order.displayFulfillmentStatus,
-        orderNote: order.note,
-      });
-
-      if (trackerStage.key !== 'awaiting_parts') {
+      const isAwaitingPartsTagged = hasAwaitingPartsTag(order.tags);
+      if (!isAwaitingPartsTagged) {
         const resolvedCount = sessionsStore.resolveAwaitingPartsForOrder({
           shop,
           orderId: order.id,
@@ -808,12 +837,24 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
         return;
       }
 
-      stats.awaitingPartsOrderCount += 1;
-
       const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
-      if (!latestAwaitingPartsSnapshot?.skus?.length) {
+      if (!latestAwaitingPartsSnapshot) {
+        const resolvedCount = sessionsStore.resolveAwaitingPartsForOrder({
+          shop,
+          orderId: order.id,
+          resolvedAt: nowIso,
+        });
+        if (resolvedCount > 0) {
+          stats.resolvedOrderCount += 1;
+        }
         stats.skippedAwaitingPartsOrderCount += 1;
         return;
+      }
+
+      const hasOpenAwaitingParts = Array.isArray(latestAwaitingPartsSnapshot.items)
+        && latestAwaitingPartsSnapshot.items.length > 0;
+      if (hasOpenAwaitingParts) {
+        stats.awaitingPartsOrderCount += 1;
       }
 
       const typedItems = buildTypedAwaitingPartsItems({
@@ -821,10 +862,6 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
         skus: latestAwaitingPartsSnapshot.skus,
         skuMap,
       });
-      if (!typedItems.length) {
-        stats.skippedAwaitingPartsOrderCount += 1;
-        return;
-      }
 
       const upsertResult = sessionsStore.upsertAwaitingPartsItems({
         shop,
@@ -938,6 +975,7 @@ async function persistOrderTrackerSnapshot({
   lineItems,
   explicitTag = '',
   appendEventIfStageChanged = false,
+  staff = null,
 }) {
   if (!shop || !order?.id || !barcode) {
     return { trackerToken: null, trackerUrl: null };
@@ -951,6 +989,8 @@ async function persistOrderTrackerSnapshot({
     orderNote: order.note,
   });
   const legacyEvents = extractTrackerEventsFromOrderNote(order.note || '');
+  const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
+  const isAwaitingPartsTagged = hasAwaitingPartsTag(order.tags);
 
   const trackerSnapshot = sessionsStore.saveOrderTrackerSnapshot({
     shop,
@@ -966,9 +1006,12 @@ async function persistOrderTrackerSnapshot({
     legacyEvents,
     appendEventIfStageChanged,
     sourceTag: explicitTag || null,
+    staff,
   });
 
-  if (trackerStage.key !== 'awaiting_parts') {
+  const hasOpenAwaitingParts = Array.isArray(latestAwaitingPartsSnapshot?.items)
+    && latestAwaitingPartsSnapshot.items.length > 0;
+  if (!isAwaitingPartsTagged || !hasOpenAwaitingParts) {
     sessionsStore.resolveAwaitingPartsForOrder({
       shop,
       orderId: order.id,
@@ -1091,9 +1134,14 @@ async function ensureGeckoboardDataset({ authHeader, datasetId }) {
 
 router.post('/api/tag-order', async (req, res) => {
   try {
-    const { barcode, tag } = req.body;
+    const { barcode, tag, reason } = req.body;
     if (!barcode || !tag) {
       return res.status(400).json({ success: false, error: 'Missing barcode or tag' });
+    }
+
+    const normalizedReason = String(reason || '').trim();
+    if (tag === 'on_hold' && !normalizedReason) {
+      return res.status(400).json({ success: false, error: 'Missing On Hold reason' });
     }
 
     const shop = req.cookies.shop;
@@ -1113,12 +1161,6 @@ router.post('/api/tag-order', async (req, res) => {
 
     const staff = userId;
     const normalizedBarcode = normalizeScanBarcode(barcode);
-    const latestWaitingQcStaff = tag == "qc_fail"
-      ? sessionsStore.getLatestWaitingQcStaffByBarcode(normalizedBarcode)
-      : null;
-    const attributedStaff = tag == "qc_fail"
-      ? (latestWaitingQcStaff || staff)
-      : staff;
     const client = shopifyClient(session);
 
     console.log(`Looking up order ${barcode} for shop ${shop}`);
@@ -1172,6 +1214,17 @@ router.post('/api/tag-order', async (req, res) => {
     }
 
     const order = orderEdge.node;
+    const latestWaitingQcStaff = tag == "qc_fail"
+      ? resolveLatestWaitingQcStaff({
+          shop,
+          normalizedBarcode,
+          orderId: order.id,
+          orderNote: order.note || '',
+        })
+      : null;
+    const attributedStaff = tag == "qc_fail"
+      ? (latestWaitingQcStaff || staff)
+      : staff;
     const lineItemArray = buildCurrentOrderLineItems(order.lineItems?.edges || []);
     const workflowBlock = getOrderWorkflowBlock(order);
     if (workflowBlock) {
@@ -1253,13 +1306,17 @@ router.post('/api/tag-order', async (req, res) => {
       //   `🏷️ Order ${order.name} tagged "${tag}" by ${staff}`
       // );
     } else {
+      const activityMessage = tag == "on_hold" && normalizedReason
+        ? `🏷️ Order ${order.name} tagged "${tag}" by ${attributedStaff} — ${normalizedReason}`
+        : `🏷️ Order ${order.name} tagged "${tag}" by ${attributedStaff}`;
+
        await sendGoogleChatMessage(
         process.env.GCHAT_ALL_ACTIVITY_WEBHOOK_URL,
-        `🏷️ Order ${order.name} tagged "${tag}" by ${attributedStaff}`
+        activityMessage
       );
 
       
-      if (newTag || tag == "wholesale_adapter_built") {
+      if (newTag || tag == "wholesale_adapter_built" || tag == "on_hold") {
         const timestamp = new Date()
           .toISOString()
           .replace('T', ' ')
@@ -1309,12 +1366,23 @@ router.post('/api/tag-order', async (req, res) => {
             `Team Member: ${staff}`,
             '',
           ].join('\n');
+        } else if (tag == "on_hold") {
+            orderNoteBlock = [
+            '~',
+            `ON HOLD — ${timestamp}`,
+            `Team Member: ${staff}`,
+            `Reason: ${normalizedReason}`,
+            '',
+          ].join('\n');
         }
 
-        appendOrderNote(client, order.id, orderNoteBlock)
-    } else {
+        if (orderNoteBlock) {
+          await appendOrderNote(client, order.id, orderNoteBlock);
+          order.note = `${order.note || ''}${orderNoteBlock}`;
+        }
+      } else {
       console.log("Skipped as already tagged")
-    }
+      }
     }
     
     try {
@@ -1353,6 +1421,7 @@ router.post('/api/tag-order', async (req, res) => {
       lineItems: lineItemArray,
       explicitTag: tag,
       appendEventIfStageChanged: true,
+      staff: attributedStaff,
     });
 
     let wholesaleAdapterBuiltCount = null;
@@ -1386,11 +1455,11 @@ router.post('/api/awaiting-parts', async (req, res) => {
     const { orderId, skus, items } = req.body;
 
     var barcode = orderId;
-    const requestedItems = Array.isArray(items) && items.length > 0
+    const requestedItems = Array.isArray(items)
       ? items
-      : (Array.isArray(skus) ? skus.map((sku) => ({ sku, quantity: 1 })) : []);
+      : (Array.isArray(skus) ? skus.map((sku) => ({ sku, quantity: 1 })) : null);
 
-    if (!barcode || !requestedItems.length) {
+    if (!barcode || !Array.isArray(requestedItems)) {
       return res.status(400).json({
         success: false,
         error: 'Missing barcode or awaiting-parts items',
@@ -1426,6 +1495,7 @@ router.post('/api/awaiting-parts', async (req, res) => {
               id
               name
               note
+              tags
             }
           }
         }
@@ -1460,12 +1530,11 @@ router.post('/api/awaiting-parts', async (req, res) => {
       sku: normalizeSku(item?.sku || item?.partSku),
       quantity: Math.max(1, Number(item?.quantity) || 1),
     })).filter((item) => item.sku);
+    const nextTags = normalizeOrderTags(order.tags)
+      .filter((tag) => tag.toLowerCase() !== 'awaiting_parts');
 
-    if (!normalizedAwaitingPartsItems.length) {
-      return res.status(400).json({
-        success: false,
-        error: 'No valid awaiting-parts items selected',
-      });
+    if (normalizedAwaitingPartsItems.length > 0) {
+      nextTags.push('awaiting_parts');
     }
 
     const awaitingPartsBlock = [
@@ -1486,8 +1555,8 @@ router.post('/api/awaiting-parts', async (req, res) => {
     // 3️⃣ Append to order note (GraphQL)
     // --------------------------------------------------
     const updateNoteMutation = `
-      mutation updateOrderNote($id: ID!, $note: String) {
-        orderUpdate(input: { id: $id, note: $note }) {
+      mutation updateOrderAwaitingParts($id: ID!, $note: String, $tags: [String!]) {
+        orderUpdate(input: { id: $id, note: $note, tags: $tags }) {
           userErrors {
             field
             message
@@ -1500,6 +1569,7 @@ router.post('/api/awaiting-parts', async (req, res) => {
       variables: {
         id: order.id,
         note: updatedNote,
+        tags: nextTags,
       },
     });
 
@@ -1518,21 +1588,23 @@ router.post('/api/awaiting-parts', async (req, res) => {
       quantity: Math.max(1, Number(item.quantity) || 1),
     }));
 
-    try {
-      const pickListSheet = await fetchPickListSheet();
-      typedAwaitingPartsItems = normalizedAwaitingPartsItems.map((item) => {
-        const normalizedSku = normalizeSku(item.sku);
-        const sheetRow = pickListSheet.skuMap.get(normalizedSku);
-        const partTypeRaw = normalizePickType(sheetRow?.type);
-        return {
-          partSku: normalizedSku,
-          partTypeRaw,
-          partTypeGroup: getWaitingPartsTypeGroup(partTypeRaw),
-          quantity: Math.max(1, Number(item.quantity) || 1),
-        };
-      });
-    } catch (sheetErr) {
-      console.error('Failed to enrich awaiting parts items with sheet types:', sheetErr);
+    if (normalizedAwaitingPartsItems.length > 0) {
+      try {
+        const pickListSheet = await fetchPickListSheet();
+        typedAwaitingPartsItems = normalizedAwaitingPartsItems.map((item) => {
+          const normalizedSku = normalizeSku(item.sku);
+          const sheetRow = pickListSheet.skuMap.get(normalizedSku);
+          const partTypeRaw = normalizePickType(sheetRow?.type);
+          return {
+            partSku: normalizedSku,
+            partTypeRaw,
+            partTypeGroup: getWaitingPartsTypeGroup(partTypeRaw),
+            quantity: Math.max(1, Number(item.quantity) || 1),
+          };
+        });
+      } catch (sheetErr) {
+        console.error('Failed to enrich awaiting parts items with sheet types:', sheetErr);
+      }
     }
 
     sessionsStore.upsertAwaitingPartsItems({
@@ -1547,23 +1619,25 @@ router.post('/api/awaiting-parts', async (req, res) => {
     // --------------------------------------------------
     // 4️⃣ Notify Google Chat (non-blocking)
     // --------------------------------------------------
-    try {
-      await sendGoogleChatMessage(
-        process.env.GCHAT_WEBHOOK_URL,
-        [
-          `⏳ Awaiting parts for order ${order.name}`,
-          `Reported by: ${staff}`,
-          '',
-          ...normalizedAwaitingPartsItems.map((item) =>
-            item.quantity > 1
-              ? `, ${item.sku} x${item.quantity}`
-              : `, ${item.sku}`
-          ),
-        ].join('\n')
-      );
-    } catch (chatErr) {
-      console.error('Google Chat notification failed:', chatErr);
-      // ❗ Intentionally ignored
+    if (normalizedAwaitingPartsItems.length > 0) {
+      try {
+        await sendGoogleChatMessage(
+          process.env.GCHAT_WEBHOOK_URL,
+          [
+            `⏳ Awaiting parts for order ${order.name}`,
+            `Reported by: ${staff}`,
+            '',
+            ...normalizedAwaitingPartsItems.map((item) =>
+              item.quantity > 1
+                ? `, ${item.sku} x${item.quantity}`
+                : `, ${item.sku}`
+            ),
+          ].join('\n')
+        );
+      } catch (chatErr) {
+        console.error('Google Chat notification failed:', chatErr);
+        // ❗ Intentionally ignored
+      }
     }
 
     return res.json({
@@ -1665,7 +1739,6 @@ router.post('/api/qc-fail', async (req, res) => {
 
     const staff = userId || 'Unknown';
     const normalizedBarcode = normalizeScanBarcode(barcode);
-    const latestWaitingQcStaff = sessionsStore.getLatestWaitingQcStaffByBarcode(normalizedBarcode);
     const client = shopifyClient(session);
 
     const findOrderQuery = `
@@ -1697,6 +1770,12 @@ router.post('/api/qc-fail', async (req, res) => {
     }
 
     const order = orderEdge.node;
+    const latestWaitingQcStaff = resolveLatestWaitingQcStaff({
+      shop,
+      normalizedBarcode,
+      orderId: order.id,
+      orderNote: order.note || '',
+    });
 
     const timestamp = new Date()
       .toISOString()

@@ -98,6 +98,7 @@ db.prepare(`
     stageLabel TEXT NOT NULL,
     stageDescription TEXT NOT NULL,
     sourceTag TEXT,
+    staff TEXT,
     createdAt TEXT NOT NULL
   )
 `).run();
@@ -106,6 +107,17 @@ db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_order_tracker_events_shop_order_createdAt
   ON order_tracker_events (shop, orderId, createdAt ASC, id ASC)
 `).run();
+
+const orderTrackerEventColumns = db.prepare(`
+  PRAGMA table_info(order_tracker_events)
+`).all();
+
+if (!orderTrackerEventColumns.some((column) => column?.name === 'staff')) {
+  db.prepare(`
+    ALTER TABLE order_tracker_events
+    ADD COLUMN staff TEXT
+  `).run();
+}
 
 db.prepare(`
   CREATE TABLE IF NOT EXISTS awaiting_parts_items (
@@ -155,7 +167,7 @@ function buildOrderTrackerRecord(tracker) {
   if (!tracker) return null;
 
   const events = db.prepare(`
-    SELECT stageKey, stageLabel, stageDescription, sourceTag, createdAt
+    SELECT stageKey, stageLabel, stageDescription, sourceTag, staff, createdAt
     FROM order_tracker_events
     WHERE shop = ? AND orderId = ?
     ORDER BY createdAt ASC, id ASC
@@ -312,6 +324,7 @@ module.exports = {
     legacyEvents = [],
     appendEventIfStageChanged = false,
     sourceTag = null,
+    staff = null,
   }) {
     const normalizedBarcode = normalizeBarcode(barcode);
     const normalizedOrderId = String(orderId || '').trim();
@@ -333,6 +346,7 @@ module.exports = {
       : 0;
     const stageIsTerminal = currentStage?.isTerminal ? 1 : 0;
     const normalizedWorkflowStatus = String(workflowStatus || '').trim() || null;
+    const normalizedStaff = String(staff || '').trim() || null;
     const safeLegacyEvents = Array.isArray(legacyEvents)
       ? legacyEvents
           .map((event) => ({
@@ -340,6 +354,7 @@ module.exports = {
             stageLabel: String(event?.stageLabel || '').trim(),
             stageDescription: String(event?.stageDescription || '').trim(),
             sourceTag: String(event?.sourceTag || '').trim() || null,
+            staff: String(event?.staff || '').trim() || null,
             createdAt: String(event?.createdAt || '').trim() || null,
           }))
           .filter((event) => event.stageKey && event.stageLabel)
@@ -390,8 +405,8 @@ module.exports = {
 
     const insertEventStmt = db.prepare(`
       INSERT INTO order_tracker_events (
-        shop, orderId, stageKey, stageLabel, stageDescription, sourceTag, createdAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        shop, orderId, stageKey, stageLabel, stageDescription, sourceTag, staff, createdAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
     `);
 
     const tx = db.transaction(() => {
@@ -406,6 +421,7 @@ module.exports = {
           'received',
           'Order received',
           'We have your order and it is in the queue.',
+          null,
           null,
           initialCreatedAt
         );
@@ -422,6 +438,7 @@ module.exports = {
             event.stageLabel,
             event.stageDescription,
             event.sourceTag,
+            event.staff,
             eventCreatedAt
           );
           priorStageKey = event.stageKey;
@@ -441,6 +458,7 @@ module.exports = {
           stageLabel,
           stageDescription,
           sourceTag ? String(sourceTag) : null,
+          normalizedStaff,
           nowIso
         );
         lastEventAt = nowIso;
@@ -751,5 +769,26 @@ module.exports = {
     `).get(normalizedOrderId);
 
     return buildOrderTrackerRecord(tracker);
+  },
+
+  getLatestOrderTrackerStaffByStage({ shop, orderId, stageKey }) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedOrderId = String(orderId || '').trim();
+    const normalizedStageKey = String(stageKey || '').trim();
+    if (!normalizedShop || !normalizedOrderId || !normalizedStageKey) return null;
+
+    const row = db.prepare(`
+      SELECT staff
+      FROM order_tracker_events
+      WHERE shop = ?
+        AND orderId = ?
+        AND stageKey = ?
+        AND staff IS NOT NULL
+        AND TRIM(staff) != ''
+      ORDER BY createdAt DESC, id DESC
+      LIMIT 1
+    `).get(normalizedShop, normalizedOrderId, normalizedStageKey);
+
+    return row?.staff || null;
   },
 };
