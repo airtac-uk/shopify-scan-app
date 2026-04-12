@@ -96,6 +96,54 @@ function formatCompactReporter(value) {
   return reporter ? ` · ${reporter}` : '';
 }
 
+function escapeHtmlAttribute(value) {
+  return escapeHtml(value);
+}
+
+async function markAwaitingPartsOrderFulfilled(orderId, orderNumber) {
+  const normalizedOrderId = String(orderId || '').trim();
+  const normalizedOrderNumber = String(orderNumber || '').trim();
+  if (!normalizedOrderId || !normalizedOrderNumber || awaitingPartsLoading) {
+    return;
+  }
+
+  const confirmed = window.confirm(`Mark ${normalizedOrderNumber} as fulfilled and remove it from the awaiting-parts queue?`);
+  if (!confirmed) return;
+
+  setLoading(true);
+  setStatus(`Marking ${normalizedOrderNumber} fulfilled locally...`, 'info');
+
+  try {
+    const response = await fetch('/api/awaiting-parts/mark-fulfilled', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        orderId: normalizedOrderId,
+        orderNumber: normalizedOrderNumber,
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to mark order fulfilled');
+    }
+
+    setLoading(false);
+    await fetchAwaitingPartsSummary({ silent: true, sync: false });
+    setStatus(
+      data.remoteTagUpdated
+        ? `Marked ${normalizedOrderNumber} fulfilled locally and retagged it as Packaged in Shopify.`
+        : `Marked ${normalizedOrderNumber} fulfilled locally.`,
+      'success'
+    );
+    return;
+  } catch (err) {
+    setLoading(false);
+    setStatus(`Error: ${err.message}`, 'error');
+    return;
+  }
+}
+
 function renderOverview(items) {
   const container = document.getElementById('awaitingPartsOverview');
   if (!container) return;
@@ -209,6 +257,7 @@ function renderAwaitingPartsList(items) {
               <th>Oldest</th>
               <th>Last</th>
               <th>Order Links</th>
+              <th>Actions</th>
             </tr>
           </thead>
           <tbody>
@@ -217,11 +266,31 @@ function renderAwaitingPartsList(items) {
               const firstSeen = item.oldestOpenAt ? formatTimestamp(item.oldestOpenAt) : '-';
               const lastSeen = item.latestReportedAt ? formatTimestamp(item.latestReportedAt) : '-';
               const orderLinks = orders.length > 0
-                ? orders.map((order) => `
-                    <a class="awaiting-parts-minimal-order-link" href="${escapeHtml(buildOrderViewerUrl(order.orderNumber || order.orderId))}">
-                      ${escapeHtml(order.orderNumber || order.orderId)} x${escapeHtml(order.quantity)}${escapeHtml(formatCompactReporter(order.reportedBy))}
-                    </a>
-                  `).join('')
+                ? `
+                    <div class="awaiting-parts-minimal-order-stack">
+                      ${orders.map((order) => `
+                        <a class="awaiting-parts-minimal-order-link" href="${escapeHtml(buildOrderViewerUrl(order.orderNumber || order.orderId))}">
+                          ${escapeHtml(order.orderNumber || order.orderId)} x${escapeHtml(order.quantity)}${escapeHtml(formatCompactReporter(order.reportedBy))}
+                        </a>
+                      `).join('')}
+                    </div>
+                  `
+                : '<span class="awaiting-parts-minimal-empty">-</span>';
+              const orderActions = orders.length > 0
+                ? `
+                    <div class="awaiting-parts-minimal-actions-stack">
+                      ${orders.map((order) => `
+                        <button
+                          type="button"
+                          class="awaiting-parts-fulfill-btn awaiting-parts-fulfill-btn--minimal"
+                          data-awaiting-order-id="${escapeHtmlAttribute(order.orderId)}"
+                          data-awaiting-order-number="${escapeHtmlAttribute(order.orderNumber || order.orderId)}"
+                        >
+                          Mark Fulfilled
+                        </button>
+                      `).join('')}
+                    </div>
+                  `
                 : '<span class="awaiting-parts-minimal-empty">-</span>';
 
               return `
@@ -237,6 +306,7 @@ function renderAwaitingPartsList(items) {
                   <td>${escapeHtml(firstSeen)}</td>
                   <td>${escapeHtml(lastSeen)}</td>
                   <td class="awaiting-parts-minimal-order-cell">${orderLinks}</td>
+                  <td class="awaiting-parts-minimal-actions-cell">${orderActions}</td>
                 </tr>
               `;
             }).join('')}
@@ -286,16 +356,28 @@ function renderAwaitingPartsList(items) {
 
         <div class="awaiting-parts-card__orders">
           ${orders.map((order) => `
-            <a class="awaiting-parts-order" href="${escapeHtml(buildOrderViewerUrl(order.orderNumber || order.orderId))}">
-              <div class="awaiting-parts-order__head">
-                <strong>${escapeHtml(order.orderNumber || order.orderId)}</strong>
-                <span>x${escapeHtml(order.quantity)}</span>
+            <div class="awaiting-parts-order">
+              <a class="awaiting-parts-order__link" href="${escapeHtml(buildOrderViewerUrl(order.orderNumber || order.orderId))}">
+                <div class="awaiting-parts-order__head">
+                  <strong>${escapeHtml(order.orderNumber || order.orderId)}</strong>
+                  <span>x${escapeHtml(order.quantity)}</span>
+                </div>
+                <div class="awaiting-parts-order__meta">
+                  <span>Reported ${escapeHtml(formatTimestamp(order.createdAt))}</span>
+                  ${order.reportedBy ? `<span>${escapeHtml(order.reportedBy)}</span>` : ''}
+                </div>
+              </a>
+              <div class="awaiting-parts-order__actions">
+                <button
+                  type="button"
+                  class="awaiting-parts-fulfill-btn"
+                  data-awaiting-order-id="${escapeHtmlAttribute(order.orderId)}"
+                  data-awaiting-order-number="${escapeHtmlAttribute(order.orderNumber || order.orderId)}"
+                >
+                  Mark Fulfilled
+                </button>
               </div>
-              <div class="awaiting-parts-order__meta">
-                <span>Reported ${escapeHtml(formatTimestamp(order.createdAt))}</span>
-                ${order.reportedBy ? `<span>${escapeHtml(order.reportedBy)}</span>` : ''}
-              </div>
-            </a>
+            </div>
           `).join('')}
         </div>
       </article>
@@ -366,6 +448,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const refreshBtn = document.getElementById('awaitingPartsRefreshBtn');
   const minimalModeToggle = document.getElementById('awaitingPartsMinimalModeToggle');
+  const listContainer = document.getElementById('awaitingPartsList');
   if (refreshBtn) {
     refreshBtn.addEventListener('click', () => {
       fetchAwaitingPartsSummary({ sync: true });
@@ -378,6 +461,20 @@ document.addEventListener('DOMContentLoaded', () => {
       awaitingPartsMinimalModeEnabled = Boolean(minimalModeToggle.checked);
       saveMinimalModePreference(awaitingPartsMinimalModeEnabled);
       fetchAwaitingPartsSummary({ silent: true, sync: false });
+    });
+  }
+
+  if (listContainer) {
+    listContainer.addEventListener('click', (event) => {
+      const button = event.target instanceof Element
+        ? event.target.closest('.awaiting-parts-fulfill-btn')
+        : null;
+      if (!button) return;
+
+      event.preventDefault();
+      const orderId = String(button.getAttribute('data-awaiting-order-id') || '').trim();
+      const orderNumber = String(button.getAttribute('data-awaiting-order-number') || '').trim();
+      markAwaitingPartsOrderFulfilled(orderId, orderNumber);
     });
   }
 

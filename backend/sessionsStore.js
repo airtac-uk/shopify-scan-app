@@ -647,20 +647,26 @@ module.exports = {
     let typeClause = '';
     const normalizedTypeGroup = String(typeGroup || '').trim().toUpperCase();
     if (normalizedTypeGroup) {
-      typeClause = ' AND partTypeGroup = ?';
+      typeClause = ' AND api.partTypeGroup = ?';
       params.push(normalizedTypeGroup);
     }
 
     const filters = db.prepare(`
       SELECT
-        partTypeGroup AS typeGroup,
+        api.partTypeGroup AS typeGroup,
         COUNT(*) AS openEntryCount,
-        COUNT(DISTINCT partSku) AS distinctSkuCount,
-        COUNT(DISTINCT orderId) AS openOrderCount
-      FROM awaiting_parts_items
-      WHERE shop = ? AND resolvedAt IS NULL
-      GROUP BY partTypeGroup
-      ORDER BY partTypeGroup ASC
+        COUNT(DISTINCT api.partSku) AS distinctSkuCount,
+        COUNT(DISTINCT api.orderId) AS openOrderCount
+      FROM awaiting_parts_items api
+      INNER JOIN order_trackers ot
+        ON ot.shop = api.shop
+       AND ot.orderId = api.orderId
+      WHERE api.shop = ?
+        AND api.resolvedAt IS NULL
+        AND ot.currentStageKey = 'awaiting_parts'
+        AND COALESCE(UPPER(ot.workflowStatus), '') != 'CANCELLED'
+      GROUP BY api.partTypeGroup
+      ORDER BY api.partTypeGroup ASC
     `).all(String(shop)).map((row) => ({
       typeGroup: String(row.typeGroup || 'UNKNOWN').trim() || 'UNKNOWN',
       openEntryCount: Number(row.openEntryCount || 0),
@@ -670,29 +676,43 @@ module.exports = {
 
     const summaryRows = db.prepare(`
       SELECT
-        partSku,
-        partTypeRaw,
-        partTypeGroup,
-        SUM(quantity) AS totalQuantity,
-        COUNT(DISTINCT orderId) AS openOrderCount,
-        MIN(createdAt) AS oldestOpenAt,
-        MAX(updatedAt) AS latestReportedAt
-      FROM awaiting_parts_items
-      WHERE shop = ? AND resolvedAt IS NULL${typeClause}
-      GROUP BY partSku, partTypeRaw, partTypeGroup
+        api.partSku AS partSku,
+        api.partTypeRaw AS partTypeRaw,
+        api.partTypeGroup AS partTypeGroup,
+        SUM(api.quantity) AS totalQuantity,
+        COUNT(DISTINCT api.orderId) AS openOrderCount,
+        MIN(api.createdAt) AS oldestOpenAt,
+        MAX(api.updatedAt) AS latestReportedAt
+      FROM awaiting_parts_items api
+      INNER JOIN order_trackers ot
+        ON ot.shop = api.shop
+       AND ot.orderId = api.orderId
+      WHERE api.shop = ?
+        AND api.resolvedAt IS NULL
+        AND ot.currentStageKey = 'awaiting_parts'
+        AND COALESCE(UPPER(ot.workflowStatus), '') != 'CANCELLED'${typeClause}
+      GROUP BY api.partSku, api.partTypeRaw, api.partTypeGroup
     `).all(...params);
 
     const orderDetailStmt = db.prepare(`
       SELECT
-        orderId,
-        orderNumber,
-        quantity,
-        reportedBy,
-        createdAt,
-        updatedAt
-      FROM awaiting_parts_items
-      WHERE shop = ? AND resolvedAt IS NULL AND partSku = ? AND partTypeGroup = ?
-      ORDER BY createdAt ASC, orderNumber ASC
+        api.orderId AS orderId,
+        api.orderNumber AS orderNumber,
+        api.quantity AS quantity,
+        api.reportedBy AS reportedBy,
+        api.createdAt AS createdAt,
+        api.updatedAt AS updatedAt
+      FROM awaiting_parts_items api
+      INNER JOIN order_trackers ot
+        ON ot.shop = api.shop
+       AND ot.orderId = api.orderId
+      WHERE api.shop = ?
+        AND api.resolvedAt IS NULL
+        AND api.partSku = ?
+        AND api.partTypeGroup = ?
+        AND ot.currentStageKey = 'awaiting_parts'
+        AND COALESCE(UPPER(ot.workflowStatus), '') != 'CANCELLED'
+      ORDER BY api.createdAt ASC, api.orderNumber ASC
     `);
 
     const items = summaryRows.map((row) => {

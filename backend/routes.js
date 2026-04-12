@@ -15,6 +15,7 @@ const {
   getWaitingPartsTypeGroup,
 } = require('./pickListService');
 const {
+  TRACKER_STAGES,
   deriveTrackerStage,
   extractTrackerEventsFromOrderNote,
   extractLatestAwaitingPartsSnapshot,
@@ -212,6 +213,7 @@ const wholesaleAdapterBuiltScanCounts = new Map();
 const webhookRegistrationCheckedShops = new Set();
 const awaitingPartsSyncPromises = new Map();
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
+const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
 const ORDER_WORKFLOW_STATUS_FIELDS = `
               displayFulfillmentStatus
               cancelledAt
@@ -245,6 +247,59 @@ function normalizeOrderTags(tags) {
 function hasAwaitingPartsTag(tags) {
   return normalizeOrderTags(tags)
     .some((tag) => String(tag || '').trim().toLowerCase() === 'awaiting_parts');
+}
+
+function shouldExcludeOrderFromAwaitingPartsQueue(order) {
+  if (!order) return false;
+  if (order.cancelledAt) return true;
+
+  const fulfillmentStatus = String(order.displayFulfillmentStatus || '').trim().toUpperCase();
+  return CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES.has(fulfillmentStatus);
+}
+
+function shouldReplaceAwaitingPartsTagWithPackaged(order) {
+  if (!order) return false;
+
+  const fulfillmentStatus = String(order.displayFulfillmentStatus || '').trim().toUpperCase();
+  return fulfillmentStatus === 'FULFILLED' && hasAwaitingPartsTag(order.tags);
+}
+
+async function replaceAwaitingPartsTagWithPackaged({ client, order }) {
+  if (!client || !order?.id || !shouldReplaceAwaitingPartsTagWithPackaged(order)) {
+    return false;
+  }
+
+  const mutation = `
+    mutation replaceAwaitingPartsTagWithPackaged($id: ID!, $tags: [String!]) {
+      orderUpdate(input: { id: $id, tags: $tags }) {
+        userErrors {
+          field
+          message
+        }
+      }
+    }
+  `;
+
+  try {
+    const response = await client.graphql(mutation, {
+      variables: {
+        id: order.id,
+        tags: ['packaged'],
+      },
+    });
+
+    const userErrors = response.data?.orderUpdate?.userErrors || [];
+    if (userErrors.length) {
+      const message = userErrors.map((error) => error.message).join('; ');
+      throw new Error(message || 'Unknown Shopify error');
+    }
+
+    order.tags = ['packaged'];
+    return true;
+  } catch (err) {
+    console.error(`Failed to replace awaiting_parts tag with packaged for order ${order.id}:`, err);
+    return false;
+  }
 }
 
 function resolveLatestWaitingQcStaff({ shop, normalizedBarcode, orderId, orderNote }) {
@@ -549,7 +604,15 @@ async function fetchOrderForTrackerById({ client, orderId }) {
     variables: { id: orderId },
   });
 
-  return response.data?.order || null;
+  const order = response.data?.order || null;
+  if (order) {
+    await replaceAwaitingPartsTagWithPackaged({
+      client,
+      order,
+    });
+  }
+
+  return order;
 }
 
 async function findOrCreateTrackerRecordByOrderId({ req, orderId }) {
@@ -818,11 +881,48 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
     const ordersConnection = response.data?.orders;
     const edges = Array.isArray(ordersConnection?.edges) ? ordersConnection.edges : [];
 
-    edges.forEach((edge) => {
+    for (const edge of edges) {
       const order = edge?.node;
-      if (!order?.id) return;
+      if (!order?.id) continue;
 
       stats.scannedOrderCount += 1;
+
+      await replaceAwaitingPartsTagWithPackaged({
+        client,
+        order,
+      });
+
+      const trackerStage = deriveTrackerStage({
+        explicitTag: '',
+        tags: order.tags,
+        cancelledAt: order.cancelledAt,
+        displayFulfillmentStatus: order.displayFulfillmentStatus,
+        orderNote: order.note,
+      });
+      sessionsStore.saveOrderTrackerSnapshot({
+        shop,
+        orderId: order.id,
+        barcode: normalizeScanBarcode(order.name || order.id),
+        orderNumber: order.name || order.id,
+        orderCreatedAt: null,
+        currentStage: trackerStage,
+        workflowStatus: order.cancelledAt ? 'CANCELLED' : (order.displayFulfillmentStatus || ''),
+        lineItems: [],
+        legacyEvents: extractTrackerEventsFromOrderNote(order.note || ''),
+        appendEventIfStageChanged: false,
+      });
+
+      if (shouldExcludeOrderFromAwaitingPartsQueue(order)) {
+        const resolvedCount = sessionsStore.resolveAwaitingPartsForOrder({
+          shop,
+          orderId: order.id,
+          resolvedAt: nowIso,
+        });
+        if (resolvedCount > 0) {
+          stats.resolvedOrderCount += 1;
+        }
+        continue;
+      }
 
       const isAwaitingPartsTagged = hasAwaitingPartsTag(order.tags);
       if (!isAwaitingPartsTagged) {
@@ -834,7 +934,7 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
         if (resolvedCount > 0) {
           stats.resolvedOrderCount += 1;
         }
-        return;
+        continue;
       }
 
       const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
@@ -848,7 +948,7 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
           stats.resolvedOrderCount += 1;
         }
         stats.skippedAwaitingPartsOrderCount += 1;
-        return;
+        continue;
       }
 
       const hasOpenAwaitingParts = Array.isArray(latestAwaitingPartsSnapshot.items)
@@ -874,7 +974,7 @@ async function syncAwaitingPartsFromOrderNotes({ client, shop }) {
 
       stats.upsertedOrderCount += 1;
       stats.awaitingPartsSkuCount += Number(upsertResult?.openItemCount || 0);
-    });
+    }
 
     hasNextPage = Boolean(ordersConnection?.pageInfo?.hasNextPage);
     after = hasNextPage ? ordersConnection?.pageInfo?.endCursor || null : null;
@@ -991,6 +1091,7 @@ async function persistOrderTrackerSnapshot({
   const legacyEvents = extractTrackerEventsFromOrderNote(order.note || '');
   const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
   const isAwaitingPartsTagged = hasAwaitingPartsTag(order.tags);
+  const shouldExcludeFromAwaitingPartsQueue = shouldExcludeOrderFromAwaitingPartsQueue(order);
 
   const trackerSnapshot = sessionsStore.saveOrderTrackerSnapshot({
     shop,
@@ -1011,7 +1112,7 @@ async function persistOrderTrackerSnapshot({
 
   const hasOpenAwaitingParts = Array.isArray(latestAwaitingPartsSnapshot?.items)
     && latestAwaitingPartsSnapshot.items.length > 0;
-  if (!isAwaitingPartsTagged || !hasOpenAwaitingParts) {
+  if (shouldExcludeFromAwaitingPartsQueue || !isAwaitingPartsTagged || !hasOpenAwaitingParts) {
     sessionsStore.resolveAwaitingPartsForOrder({
       shop,
       orderId: order.id,
@@ -1398,6 +1499,18 @@ router.post('/api/tag-order', async (req, res) => {
       console.error('Geckoboard event send failed:', geckoboardErr);
     }
 
+    if (tag == "racked_up") {
+      try {
+        sessionsStore.resolveAwaitingPartsForOrder({
+          shop,
+          orderId: order.id,
+          resolvedAt: new Date().toISOString(),
+        });
+      } catch (awaitingPartsResolveErr) {
+        console.error('Failed to clear awaiting_parts items for racked_up order:', awaitingPartsResolveErr);
+      }
+    }
+
     if (tag == "waiting_qc") {
       try {
         sessionsStore.recordWaitingQcEvent({
@@ -1496,6 +1609,8 @@ router.post('/api/awaiting-parts', async (req, res) => {
               name
               note
               tags
+              cancelledAt
+              displayFulfillmentStatus
             }
           }
         }
@@ -1530,12 +1645,9 @@ router.post('/api/awaiting-parts', async (req, res) => {
       sku: normalizeSku(item?.sku || item?.partSku),
       quantity: Math.max(1, Number(item?.quantity) || 1),
     })).filter((item) => item.sku);
-    const nextTags = normalizeOrderTags(order.tags)
-      .filter((tag) => tag.toLowerCase() !== 'awaiting_parts');
-
-    if (normalizedAwaitingPartsItems.length > 0) {
-      nextTags.push('awaiting_parts');
-    }
+    const nextTags = normalizedAwaitingPartsItems.length > 0
+      ? ['awaiting_parts']
+      : [];
 
     const awaitingPartsBlock = [
       '~',
@@ -1616,6 +1728,52 @@ router.post('/api/awaiting-parts', async (req, res) => {
       createdAt: new Date().toISOString(),
     });
 
+    const existingTrackerRecord = sessionsStore.getOrderTrackerByOrderId(order.id);
+    const fallbackTrackerStageKey = Array.isArray(existingTrackerRecord?.events)
+      ? [...existingTrackerRecord.events]
+          .reverse()
+          .find((event) => String(event?.stageKey || '').trim() && String(event?.stageKey || '').trim() !== 'awaiting_parts')
+          ?.stageKey
+      : '';
+    const fallbackTrackerStage = TRACKER_STAGES[fallbackTrackerStageKey] || TRACKER_STAGES.received;
+    const statusDerivedStage = deriveTrackerStage({
+      explicitTag: normalizedAwaitingPartsItems.length > 0 ? 'awaiting_parts' : '',
+      tags: normalizedAwaitingPartsItems.length > 0 ? nextTags : [],
+      cancelledAt: order.cancelledAt,
+      displayFulfillmentStatus: order.displayFulfillmentStatus,
+      orderNote: normalizedAwaitingPartsItems.length > 0 ? updatedNote : '',
+    });
+    const nextTrackerStage = normalizedAwaitingPartsItems.length > 0
+      ? statusDerivedStage
+      : (statusDerivedStage.key !== 'received' ? statusDerivedStage : fallbackTrackerStage);
+
+    sessionsStore.saveOrderTrackerSnapshot({
+      shop,
+      orderId: order.id,
+      barcode: normalizeScanBarcode(existingTrackerRecord?.barcode || order.name || order.id),
+      orderNumber: existingTrackerRecord?.orderNumber || order.name,
+      orderCreatedAt: existingTrackerRecord?.orderCreatedAt || null,
+      currentStage: nextTrackerStage,
+      workflowStatus: order.cancelledAt
+        ? 'CANCELLED'
+        : (order.displayFulfillmentStatus || existingTrackerRecord?.workflowStatus || null),
+      lineItems: Array.isArray(existingTrackerRecord?.lineItems) ? existingTrackerRecord.lineItems : [],
+      legacyEvents: nextTrackerStage.key === 'awaiting_parts'
+        ? extractTrackerEventsFromOrderNote(updatedNote)
+        : [],
+      appendEventIfStageChanged: false,
+      sourceTag: normalizedAwaitingPartsItems.length > 0 ? 'awaiting_parts' : 'awaiting_parts_cleared',
+      staff,
+    });
+
+    if (nextTrackerStage.key !== 'awaiting_parts') {
+      sessionsStore.resolveAwaitingPartsForOrder({
+        shop,
+        orderId: order.id,
+        resolvedAt: new Date().toISOString(),
+      });
+    }
+
     // --------------------------------------------------
     // 4️⃣ Notify Google Chat (non-blocking)
     // --------------------------------------------------
@@ -1656,6 +1814,111 @@ router.post('/api/awaiting-parts', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: 'Server error',
+    });
+  }
+});
+
+router.post('/api/awaiting-parts/mark-fulfilled', async (req, res) => {
+  try {
+    const { orderId, orderNumber } = req.body || {};
+    const normalizedOrderId = String(orderId || '').trim();
+    const normalizedOrderNumber = String(orderNumber || '').trim();
+
+    if (!normalizedOrderId || !normalizedOrderNumber) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing orderId or orderNumber',
+      });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const userId = req.cookies.userId;
+    if (!userId) {
+      return res.status(401).json({ success: false, error: 'Username needs to be set' });
+    }
+
+    const session = sessionsStore.get(shop);
+
+    const trackerRecord = sessionsStore.getOrderTrackerByOrderId(normalizedOrderId);
+    const trackerLineItems = Array.isArray(trackerRecord?.lineItems) ? trackerRecord.lineItems : [];
+    const trackerBarcode = normalizeScanBarcode(
+      trackerRecord?.barcode || normalizedOrderNumber || normalizedOrderId
+    );
+    let remoteTagUpdated = false;
+    let remoteTagError = null;
+
+    if (session?.accessToken) {
+      try {
+        const client = shopifyClient(session);
+        const updateTagMutation = `
+          mutation markAwaitingPartsOrderFulfilled($id: ID!, $tags: [String!]) {
+            orderUpdate(input: { id: $id, tags: $tags }) {
+              userErrors {
+                field
+                message
+              }
+            }
+          }
+        `;
+
+        const updateTagResponse = await client.graphql(updateTagMutation, {
+          variables: {
+            id: normalizedOrderId,
+            tags: ['packaged'],
+          },
+        });
+
+        const userErrors = updateTagResponse.data?.orderUpdate?.userErrors || [];
+        if (userErrors.length) {
+          const message = userErrors.map((error) => error.message).join('; ');
+          throw new Error(message || 'Failed to update Shopify tags');
+        }
+
+        remoteTagUpdated = true;
+      } catch (err) {
+        remoteTagError = err.message || 'Failed to update Shopify tags';
+        console.error(`Failed to mark order ${normalizedOrderId} as packaged in Shopify:`, err);
+      }
+    }
+
+    const resolvedItemCount = sessionsStore.resolveAwaitingPartsForOrder({
+      shop,
+      orderId: normalizedOrderId,
+      resolvedAt: new Date().toISOString(),
+    });
+
+    sessionsStore.saveOrderTrackerSnapshot({
+      shop,
+      orderId: normalizedOrderId,
+      barcode: trackerBarcode,
+      orderNumber: trackerRecord?.orderNumber || normalizedOrderNumber,
+      orderCreatedAt: trackerRecord?.orderCreatedAt || null,
+      currentStage: TRACKER_STAGES.fulfilled,
+      workflowStatus: 'FULFILLED',
+      lineItems: trackerLineItems,
+      legacyEvents: [],
+      appendEventIfStageChanged: true,
+      sourceTag: 'manual_fulfilled',
+      staff: userId,
+    });
+
+    return res.json({
+      success: true,
+      orderId: normalizedOrderId,
+      orderNumber: trackerRecord?.orderNumber || normalizedOrderNumber,
+      resolvedItemCount,
+      remoteTagUpdated,
+      remoteTagError,
+    });
+  } catch (err) {
+    console.error('Error in /api/awaiting-parts/mark-fulfilled:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
     });
   }
 });
@@ -1937,6 +2200,10 @@ router.post('/api/pick-list', async (req, res) => {
     }
 
     const order = orderEdge.node;
+    await replaceAwaitingPartsTagWithPackaged({
+      client,
+      order,
+    });
     const workflowBlock = getOrderWorkflowBlock(order);
     const orderLineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
 

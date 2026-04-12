@@ -784,6 +784,7 @@ button:hover { background: #0056b3; }
 .awaiting-parts-minimal-table td {
   color: #e6edf3;
   font-size: 13px;
+  vertical-align: top;
 }
 
 .awaiting-parts-minimal-sku {
@@ -805,17 +806,24 @@ button:hover { background: #0056b3; }
   min-width: 220px;
 }
 
+.awaiting-parts-minimal-actions-cell {
+  min-width: 150px;
+}
+
+.awaiting-parts-minimal-order-stack,
+.awaiting-parts-minimal-actions-stack {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 6px;
+}
+
 .awaiting-parts-minimal-order-link {
   display: block;
-  margin-bottom: 6px;
   color: #7cc8ff;
   font-size: 13px;
   font-weight: 700;
   text-decoration: none;
-}
-
-.awaiting-parts-minimal-order-link:last-child {
-  margin-bottom: 0;
 }
 
 .awaiting-parts-minimal-order-link:hover,
@@ -925,26 +933,79 @@ button:hover { background: #0056b3; }
 }
 
 .awaiting-parts-order {
-  display: block;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: start;
+  gap: 12px;
   padding: 12px 14px;
   border: 1px solid #293545;
   border-radius: 12px;
   background: #10161d;
+}
+
+.awaiting-parts-order__link {
+  display: block;
+  min-width: 0;
+  flex: 1 1 auto;
   color: inherit;
   text-decoration: none;
   transition: border-color 120ms ease, transform 120ms ease, background 120ms ease;
 }
 
 .awaiting-parts-order:hover,
-.awaiting-parts-order:focus-visible {
+.awaiting-parts-order:focus-within {
   border-color: #4d8ad5;
   background: #121c28;
   transform: translateY(-1px);
 }
 
-.awaiting-parts-order:focus-visible {
+.awaiting-parts-order__link:focus-visible {
   outline: 2px solid #7cc8ff;
   outline-offset: 2px;
+}
+
+.awaiting-parts-order__actions {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 8px;
+}
+
+.awaiting-parts-order__actions {
+  align-self: start;
+  justify-self: end;
+}
+
+.awaiting-parts-fulfill-btn {
+  flex: 0 0 auto;
+  border: 1px solid #685331;
+  border-radius: 10px;
+  background: #2f2411;
+  color: #f0cb8c;
+  padding: 8px 12px;
+  font-size: 12px;
+  font-weight: 800;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  align-self: flex-start;
+  white-space: nowrap;
+}
+
+.awaiting-parts-fulfill-btn:hover,
+.awaiting-parts-fulfill-btn:focus-visible {
+  border-color: #c29141;
+  background: #3a2c12;
+  color: #ffe0a6;
+}
+
+.awaiting-parts-fulfill-btn:focus-visible {
+  outline: 2px solid #ffd797;
+  outline-offset: 2px;
+}
+
+.awaiting-parts-fulfill-btn--minimal {
+  padding: 6px 10px;
+  font-size: 11px;
 }
 
 .awaiting-parts-order__head,
@@ -970,6 +1031,21 @@ button:hover { background: #0056b3; }
   margin-top: 6px;
   color: #8ea0b3;
   font-size: 12px;
+}
+
+@media (max-width: 900px) {
+  .awaiting-parts-order {
+    grid-template-columns: 1fr;
+    align-items: stretch;
+  }
+
+  .awaiting-parts-order__link {
+    width: 100%;
+  }
+
+  .awaiting-parts-fulfill-btn {
+    align-self: flex-start;
+  }
 }
 
 .pick-verify-item-btn:disabled {
@@ -2765,13 +2841,26 @@ html.theme-light .awaiting-parts-order {
 }
 
 html.theme-light .awaiting-parts-order:hover,
-html.theme-light .awaiting-parts-order:focus-visible {
+html.theme-light .awaiting-parts-order:focus-within {
   border-color: #7fa9d1;
   background: #ebf4fd;
 }
 
 html.theme-light .awaiting-parts-order__head span {
   color: #1f67ad;
+}
+
+html.theme-light .awaiting-parts-fulfill-btn {
+  border-color: #d3b272;
+  background: #fff3da;
+  color: #875500;
+}
+
+html.theme-light .awaiting-parts-fulfill-btn:hover,
+html.theme-light .awaiting-parts-fulfill-btn:focus-visible {
+  border-color: #b87d1c;
+  background: #ffe8bf;
+  color: #6b4300;
 }
 
 html.theme-light .awaiting-parts-minimal-table th,
