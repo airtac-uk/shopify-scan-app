@@ -58,6 +58,18 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE TABLE IF NOT EXISTS wholesale_build_events (
+    shop TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    orderId TEXT,
+    orderNumber TEXT,
+    staff TEXT,
+    createdAt TEXT NOT NULL,
+    PRIMARY KEY (shop, barcode)
+  )
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS order_trackers (
     shop TEXT NOT NULL,
     orderId TEXT NOT NULL,
@@ -278,6 +290,45 @@ module.exports = {
     });
 
     return progressByItemKey;
+  },
+
+  getWholesaleBuildEvent({ shop, barcode }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return null;
+
+    return db.prepare(`
+      SELECT shop, barcode, orderId, orderNumber, staff, createdAt
+      FROM wholesale_build_events
+      WHERE shop = ? AND barcode = ?
+      LIMIT 1
+    `).get(String(shop), normalizedBarcode) || null;
+  },
+
+  recordWholesaleBuildEvent({
+    shop,
+    barcode,
+    orderId = null,
+    orderNumber = null,
+    staff = null,
+    createdAt = null,
+  }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return false;
+
+    const result = db.prepare(`
+      INSERT OR IGNORE INTO wholesale_build_events
+      (shop, barcode, orderId, orderNumber, staff, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `).run(
+      String(shop),
+      normalizedBarcode,
+      orderId ? String(orderId) : null,
+      orderNumber ? String(orderNumber) : null,
+      staff ? String(staff) : null,
+      createdAt || new Date().toISOString()
+    );
+
+    return Number(result?.changes || 0) > 0;
   },
 
   setWholesaleBuildProgress({ shop, barcode, progressByItemKey }) {

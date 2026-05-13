@@ -9,50 +9,64 @@
 </head>
 <body data-enable-hid-scan="true" class="pick-list-page">
   <main class="pick-list-layout">
-    <header class="pick-list-topbar">
-      <div class="pick-list-link-row">
-        <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
-        <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
+    <header class="pick-list-floating-header">
+      <div class="pick-list-floating-header__top">
+        <nav class="pick-list-link-row" aria-label="Pick list navigation">
+          <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
+          <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
+        </nav>
+        <div class="pick-list-order-summary" aria-live="polite">
+          <p id="pickListOrderMeta" class="pick-list-order-meta">No order loaded</p>
+          <p id="pickListOrderStatus" class="pick-list-order-status">Awaiting scan</p>
+        </div>
       </div>
-      <h1>Order Viewer</h1>
-      <p>Scan or enter an order barcode to build required picks and desk-item list.</p>
-    </header>
 
-    <section class="pick-list-controls">
-      <label for="pickListBarcode">Order Barcode</label>
-      <div class="pick-list-input-row">
-        <input id="pickListBarcode" type="text" placeholder="AT..." autocomplete="off" autocapitalize="characters" />
-        <button id="pickListFetchBtn" type="button">Build Pick List</button>
+      <div class="pick-list-floating-header__body">
+        <section class="pick-list-controls" aria-label="Order lookup">
+          <div class="pick-list-input-row">
+            <input id="pickListBarcode" type="text" placeholder="AT..." autocomplete="off" autocapitalize="characters" aria-label="Order Barcode" />
+            <button id="pickListFetchBtn" type="button" title="Build Pick List">Build</button>
+          </div>
+          <div class="pick-list-toggle-group">
+            <div class="pick-list-toggle-row">
+              <label class="pick-list-toggle-label" for="pickerModeToggle">
+                <input id="pickerModeToggle" type="checkbox" />
+                Picker mode
+              </label>
+            </div>
+            <div class="pick-list-toggle-row">
+              <label class="pick-list-toggle-label" for="verifyModeToggle">
+                <input id="verifyModeToggle" type="checkbox" />
+                Verify Order
+              </label>
+            </div>
+            <div class="pick-list-toggle-row">
+              <label class="pick-list-toggle-label" for="wholesaleModeToggle">
+                <input id="wholesaleModeToggle" type="checkbox" />
+                Wholesale
+              </label>
+            </div>
+          </div>
+          <div class="pick-list-status-row">
+            <span id="pickListSpinner" class="loader" style="display:none;"></span>
+            <p id="pickListStatus" data-type="info">Ready to scan.</p>
+          </div>
+        </section>
+
+        <section class="pick-list-actions" aria-label="Order actions">
+          <div class="pick-list-action-grid">
+            <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false">Racked</button>
+            <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true">Awaiting Parts</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="waiting_qc" data-picker-visible="false" data-verify-visible="false">Waiting QC</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="wholesale_adapter_built" data-picker-visible="false" data-verify-visible="false">Wholesale Adapter</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="qc_passed" data-picker-visible="false" data-verify-visible="false">QC Passed</button>
+            <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="qc_fail" data-picker-visible="false" data-verify-visible="false">QC Fail</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="packaged" data-picker-visible="true" data-verify-visible="true">Packaged</button>
+            <button type="button" class="pick-list-action-btn pick-list-action-btn--hold" data-order-action="on_hold" data-picker-visible="false" data-verify-visible="false">On Hold</button>
+          </div>
+        </section>
       </div>
-      <div class="pick-list-toggle-row">
-        <label class="pick-list-toggle-label" for="pickerModeToggle">
-          <input id="pickerModeToggle" type="checkbox" />
-          Picker mode (hide desk items)
-        </label>
-      </div>
-      <div class="pick-list-toggle-row">
-        <label class="pick-list-toggle-label" for="verifyModeToggle">
-          <input id="verifyModeToggle" type="checkbox" />
-          Verify Order mode
-        </label>
-      </div>
-      <div class="pick-list-toggle-row">
-        <label class="pick-list-toggle-label" for="wholesaleModeToggle">
-          <input id="wholesaleModeToggle" type="checkbox" />
-          Wholesale mode (shared build progress)
-        </label>
-      </div>
-      <div class="pick-list-status-row">
-        <span id="pickListSpinner" class="loader" style="display:none;"></span>
-        <p id="pickListStatus" data-type="info">Ready to scan.</p>
-      </div>
-      <p id="pickListOrderMeta" class="pick-list-order-meta"></p>
-      <div id="pickListTrackerLink" class="pick-list-tracker-link" hidden>
-        <span class="pick-list-tracker-link__label">Tracker test:</span>
-        <a id="pickListTrackerAnchor" href="#" target="_blank" rel="noopener noreferrer">open customer page</a>
-        <button id="pickListTrackerCopyBtn" type="button">copy</button>
-      </div>
-    </section>
+    </header>
 
     <section id="pickListWorkflowAlert" class="pick-list-workflow-alert" hidden>
       <p class="pick-list-workflow-alert__eyebrow">Workflow Warning</p>
@@ -62,21 +76,6 @@
       </div>
       <p id="pickListWorkflowAlertMessage" class="pick-list-workflow-alert__message"></p>
       <p class="pick-list-workflow-alert__foot">View only. Order actions and verify/build scanning are disabled.</p>
-    </section>
-
-    <section class="pick-list-actions">
-      <h2 class="pick-list-section-title">Order Actions</h2>
-      <p class="pick-list-action-note">Use the `Await` buttons beside SKU rows to mark individual sub-SKUs without opening the bulk editor.</p>
-      <div class="pick-list-action-grid">
-        <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false">Racked</button>
-        <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true">Awaiting Parts</button>
-        <button type="button" class="pick-list-action-btn" data-order-action="waiting_qc" data-picker-visible="false" data-verify-visible="false">Waiting QC</button>
-        <button type="button" class="pick-list-action-btn" data-order-action="wholesale_adapter_built" data-picker-visible="false" data-verify-visible="false">Wholesale Adapter</button>
-        <button type="button" class="pick-list-action-btn" data-order-action="qc_passed" data-picker-visible="false" data-verify-visible="false">QC Passed</button>
-        <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="qc_fail" data-picker-visible="false" data-verify-visible="false">QC Fail</button>
-        <button type="button" class="pick-list-action-btn" data-order-action="packaged" data-picker-visible="true" data-verify-visible="true">Packaged</button>
-        <button type="button" class="pick-list-action-btn pick-list-action-btn--hold" data-order-action="on_hold" data-picker-visible="false" data-verify-visible="false">On Hold</button>
-      </div>
     </section>
 
     <section>
@@ -89,7 +88,6 @@
         <div id="pickListTimelineCard"></div>
       </div>
     </section>
-
   </main>
 
   <div id="awaitingPartsModal" class="pick-modal" aria-hidden="true">

@@ -14,9 +14,12 @@ let currentOrderNumber = '';
 let currentOrderNote = '';
 let currentOrderTimeline = [];
 let currentWorkflowBlock = null;
-let currentTrackerUrl = '';
+let currentOrderTags = [];
+let currentOrderStatus = '';
+let currentOrderStageLabel = '';
 let currentAwaitingPartsSkuMap = new Map();
 let currentAwaitingPartsCatalog = new Map();
+let currentPickedRowKeys = new Set();
 let lastActionTag = '';
 let lastActionBarcode = '';
 let actionButtons = [];
@@ -191,28 +194,13 @@ function setStatus(message, type = 'info') {
   el.dataset.type = type;
 }
 
-function renderTrackerLink() {
-  const container = document.getElementById('pickListTrackerLink');
-  const anchor = document.getElementById('pickListTrackerAnchor');
-  if (!container || !anchor) return;
-
-  if (!currentTrackerUrl) {
-    container.hidden = true;
-    anchor.href = '#';
-    return;
-  }
-
-  anchor.href = currentTrackerUrl;
-  container.hidden = false;
-}
-
 function formatWorkflowStatusLabel(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
 
   return raw
     .toLowerCase()
-    .split('_')
+    .split(/[_-]+/)
     .filter(Boolean)
     .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
     .join(' ');
@@ -271,18 +259,20 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentOrderNote = '';
   currentOrderTimeline = [];
   currentWorkflowBlock = null;
-  currentTrackerUrl = '';
+  currentOrderTags = [];
+  currentOrderStatus = '';
+  currentOrderStageLabel = '';
   currentAwaitingPartsSkuMap = new Map();
   currentAwaitingPartsCatalog = new Map();
+  currentPickedRowKeys = new Set();
   verifyItems = [];
   verifyCodeIndex = new Map();
 
-  const orderMeta = document.getElementById('pickListOrderMeta');
   const lineItems = document.getElementById('pickListLineItems');
   const timelineSection = document.getElementById('pickListTimelineSection');
   const timelineCard = document.getElementById('pickListTimelineCard');
 
-  if (orderMeta) orderMeta.textContent = '';
+  renderOrderHeaderMeta();
   if (lineItems) lineItems.innerHTML = '';
   if (timelineSection) timelineSection.hidden = true;
   if (timelineCard) timelineCard.innerHTML = '';
@@ -291,7 +281,6 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   }
 
   renderWorkflowAlert();
-  renderTrackerLink();
   setActionButtonsEnabled(false);
 }
 
@@ -510,6 +499,64 @@ function formatActionLabel(tag) {
   }
 }
 
+function normalizeOrderTagsForDisplay(tags) {
+  const rawTags = Array.isArray(tags)
+    ? tags
+    : String(tags || '').split(',');
+
+  return rawTags
+    .map((tag) => String(tag || '').trim())
+    .filter(Boolean);
+}
+
+function formatOrderTagLabel(tag) {
+  const raw = String(tag || '').trim();
+  if (!raw) return '';
+
+  const actionLabel = formatActionLabel(raw);
+  return actionLabel === raw ? formatWorkflowStatusLabel(raw) : actionLabel;
+}
+
+function applyOrderHeaderData(data, { fallbackTag = '' } = {}) {
+  currentOrderTags = normalizeOrderTagsForDisplay(
+    Array.isArray(data?.orderTags) ? data.orderTags : data?.tags
+  );
+  if (!currentOrderTags.length && fallbackTag) {
+    currentOrderTags = [fallbackTag];
+  }
+
+  currentOrderStatus = String(data?.orderStatus || data?.workflowStatus || '').trim();
+  currentOrderStageLabel = String(data?.currentStage?.label || '').trim();
+  renderOrderHeaderMeta();
+}
+
+function renderOrderHeaderMeta() {
+  const orderMeta = document.getElementById('pickListOrderMeta');
+  const orderStatus = document.getElementById('pickListOrderStatus');
+  if (!orderMeta || !orderStatus) return;
+
+  if (!currentOrderNumber && !currentOrderBarcode) {
+    orderMeta.textContent = 'No order loaded';
+    orderStatus.textContent = 'Awaiting scan';
+    return;
+  }
+
+  const orderLabel = currentOrderNumber || currentOrderBarcode;
+  const barcodeLabel = currentOrderBarcode && currentOrderBarcode !== orderLabel
+    ? ` (${currentOrderBarcode})`
+    : '';
+  const primaryTag = currentOrderTags[0] || '';
+  const tagLabel = formatOrderTagLabel(primaryTag);
+  const statusLabel = currentOrderStageLabel || formatWorkflowStatusLabel(currentOrderStatus);
+  const statusParts = [
+    tagLabel ? `Tag: ${tagLabel}` : '',
+    statusLabel ? `Status: ${statusLabel}` : '',
+  ].filter(Boolean);
+
+  orderMeta.textContent = `${orderLabel}${barcodeLabel}`;
+  orderStatus.textContent = statusParts.length ? statusParts.join(' / ') : 'No tag or status';
+}
+
 function isAnyDialogOpen() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
   const qcFailModal = document.getElementById('qcFailModal');
@@ -552,6 +599,9 @@ async function saveAwaitingPartsSelection({ orderId, items, closeDialog = false 
     }
 
     setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsSelection) ? data.awaitingPartsSelection : normalizedItems);
+    applyOrderHeaderData(data, {
+      fallbackTag: normalizedItems.length > 0 ? 'awaiting_parts' : '',
+    });
     if (hasRenderedPickList) {
       renderCurrentOrderSection();
     }
@@ -622,7 +672,154 @@ function createAwaitingToggleButton(sku) {
   return button;
 }
 
-function renderRows(container, rows, emptyText) {
+function parsePickLocation(value) {
+  const raw = String(value || '').trim();
+  if (!raw) {
+    return {
+      raw: '',
+      bay: '',
+      tray: '',
+      trayAlpha: '',
+      trayNumber: '',
+    };
+  }
+
+  const [bayPart, ...trayParts] = raw.split('-').map((part) => part.trim());
+  const tray = trayParts.filter(Boolean).join('-');
+  const [trayAlpha = '', trayNumber = ''] = tray.split('-');
+
+  return {
+    raw,
+    bay: bayPart || raw,
+    tray,
+    trayAlpha,
+    trayNumber,
+  };
+}
+
+function comparePickLocation(left, right) {
+  const leftLocation = parsePickLocation(left?.location);
+  const rightLocation = parsePickLocation(right?.location);
+
+  if (!leftLocation.raw && rightLocation.raw) return 1;
+  if (leftLocation.raw && !rightLocation.raw) return -1;
+
+  const bayDiff = leftLocation.bay.localeCompare(rightLocation.bay, undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+  if (bayDiff !== 0) return bayDiff;
+
+  const trayAlphaDiff = leftLocation.trayAlpha.localeCompare(rightLocation.trayAlpha, undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+  if (trayAlphaDiff !== 0) return trayAlphaDiff;
+
+  const trayNumberDiff = leftLocation.trayNumber.localeCompare(rightLocation.trayNumber, undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+  if (trayNumberDiff !== 0) return trayNumberDiff;
+
+  const rawDiff = leftLocation.raw.localeCompare(rightLocation.raw, undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+  if (rawDiff !== 0) return rawDiff;
+
+  return normalizeDisplaySku(left?.sku).localeCompare(normalizeDisplaySku(right?.sku), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+}
+
+function createLocationPart(value, modifier) {
+  const part = document.createElement('span');
+  part.className = `pick-location-part pick-location-part--${modifier}`;
+
+  const valueEl = document.createElement('span');
+  valueEl.className = 'pick-location-value';
+  valueEl.textContent = value;
+
+  part.appendChild(valueEl);
+  return part;
+}
+
+function renderLocationCell(rowLocation) {
+  const location = document.createElement('div');
+  location.className = 'pick-list-cell pick-list-col-location pick-list-item-location';
+
+  const parsedLocation = parsePickLocation(rowLocation);
+  if (!parsedLocation.raw) {
+    location.textContent = '-';
+    return location;
+  }
+
+  location.title = parsedLocation.raw;
+  location.setAttribute('aria-label', parsedLocation.tray
+    ? `Bay ${parsedLocation.bay}, tray ${parsedLocation.tray}`
+    : `Location ${parsedLocation.raw}`);
+
+  if (parsedLocation.bay && parsedLocation.tray) {
+    location.appendChild(createLocationPart(parsedLocation.bay, 'bay'));
+    location.appendChild(createLocationPart(parsedLocation.tray, 'tray'));
+  } else {
+    location.appendChild(createLocationPart(parsedLocation.raw, 'full'));
+  }
+
+  return location;
+}
+
+function getPickRowKey(row, sectionTitle, rowIndex) {
+  return [
+    currentOrderBarcode,
+    sectionTitle,
+    rowIndex,
+    normalizeDisplaySku(row?.sku),
+    String(row?.location || '').trim(),
+    String(row?.note || '').trim(),
+    Math.max(1, Number(row?.quantity) || 1),
+  ].join('|');
+}
+
+function setPickedRowState(rowKey, item, checkbox, isPicked) {
+  if (isPicked) {
+    currentPickedRowKeys.add(rowKey);
+    item.classList.add('pick-list-item--picked');
+  } else {
+    currentPickedRowKeys.delete(rowKey);
+    item.classList.remove('pick-list-item--picked');
+  }
+
+  if (checkbox) {
+    checkbox.checked = isPicked;
+  }
+}
+
+function togglePickedRowState(rowKey, item, checkbox) {
+  setPickedRowState(rowKey, item, checkbox, !currentPickedRowKeys.has(rowKey));
+}
+
+function createPickedCheckbox(rowKey, sku, item) {
+  const label = document.createElement('label');
+  label.className = 'pick-list-picked-toggle';
+  label.title = `Mark ${normalizeDisplaySku(sku)} as picked`;
+
+  const checkbox = document.createElement('input');
+  checkbox.type = 'checkbox';
+  checkbox.checked = currentPickedRowKeys.has(rowKey);
+  checkbox.setAttribute('aria-label', `Mark ${normalizeDisplaySku(sku)} as picked`);
+  checkbox.addEventListener('click', (event) => {
+    event.stopPropagation();
+    setPickedRowState(rowKey, item, checkbox, checkbox.checked);
+  });
+
+  label.appendChild(checkbox);
+  return { label, checkbox };
+}
+
+function renderRows(container, rows, emptyText, sectionTitle = '') {
   container.innerHTML = '';
 
   if (!rows || rows.length === 0) {
@@ -645,7 +842,7 @@ function renderRows(container, rows, emptyText) {
 
   const locationHeader = document.createElement('div');
   locationHeader.className = 'pick-list-cell pick-list-col-location';
-  locationHeader.textContent = 'Location';
+  locationHeader.textContent = 'Bay / Tray';
 
   const noteHeader = document.createElement('div');
   noteHeader.className = 'pick-list-cell pick-list-col-note';
@@ -661,17 +858,30 @@ function renderRows(container, rows, emptyText) {
   headerItem.appendChild(actionHeader);
   list.appendChild(headerItem);
 
-  rows.forEach((row) => {
+  const sortedRows = [...rows].sort(comparePickLocation);
+
+  sortedRows.forEach((row, rowIndex) => {
     const item = document.createElement('li');
     item.className = 'pick-list-item';
+    const rowKey = getPickRowKey(row, sectionTitle, rowIndex);
     const isAwaitingParts = isAwaitingPartsSku(row.sku);
     const awaitingPartsQty = getAwaitingPartsQty(row.sku);
     if (isAwaitingParts) {
       item.classList.add('pick-list-item--awaiting-parts');
     }
+    if (pickerModeEnabled && currentPickedRowKeys.has(rowKey)) {
+      item.classList.add('pick-list-item--picked');
+    }
 
+    let pickedCheckbox = null;
     const main = document.createElement('div');
     main.className = 'pick-list-cell pick-list-col-sku pick-list-item-main';
+    if (pickerModeEnabled) {
+      item.classList.add('pick-list-item--pickable');
+      const pickedControl = createPickedCheckbox(rowKey, row.sku, item);
+      pickedCheckbox = pickedControl.checkbox;
+      main.appendChild(pickedControl.label);
+    }
     const skuText = document.createElement('span');
     skuText.textContent = Number(row.quantity) > 1 ? `${row.sku} x${row.quantity}` : `${row.sku}`;
     main.appendChild(skuText);
@@ -682,9 +892,7 @@ function renderRows(container, rows, emptyText) {
       main.appendChild(badge);
     }
 
-    const location = document.createElement('div');
-    location.className = 'pick-list-cell pick-list-col-location pick-list-item-location';
-    location.textContent = row.location ? row.location : '-';
+    const location = renderLocationCell(row.location);
 
     const note = document.createElement('div');
     note.className = 'pick-list-cell pick-list-col-note pick-list-item-note';
@@ -698,6 +906,15 @@ function renderRows(container, rows, emptyText) {
     item.appendChild(location);
     item.appendChild(note);
     item.appendChild(action);
+
+    if (pickerModeEnabled) {
+      item.addEventListener('click', (event) => {
+        if (event.target.closest('.pick-list-item-action, .pick-list-picked-toggle')) {
+          return;
+        }
+        togglePickedRowState(rowKey, item, pickedCheckbox);
+      });
+    }
 
     list.appendChild(item);
   });
@@ -716,7 +933,7 @@ function createSection(title, rows, emptyText) {
   const content = document.createElement('div');
   section.appendChild(content);
 
-  renderRows(content, rows, emptyText);
+  renderRows(content, rows, emptyText, title);
   return section;
 }
 
@@ -1778,6 +1995,7 @@ async function runOrderAction(tag) {
 
     lastActionTag = tag;
     lastActionBarcode = normalizedBarcode;
+    applyOrderHeaderData(data, { fallbackTag: tag });
 
     if (tag === 'wholesale_adapter_built') {
       setStatus(
@@ -1832,6 +2050,9 @@ async function fetchPickList(barcodeInput) {
       if (data.workflowBlocked) {
         setOrderLookupInUrl(barcode);
         clearLoadedOrderState({ preserveOrderLookup: true });
+        currentOrderBarcode = barcode;
+        currentOrderNumber = data.orderNumber || barcode;
+        applyOrderHeaderData(data);
         playVerifyErrorSound();
         setStatus(data.error || 'This order cannot be picked or built.', 'error');
         return;
@@ -1844,11 +2065,14 @@ async function fetchPickList(barcodeInput) {
       throw new Error(data.error || 'Failed to load pick list');
     }
 
+    if (normalizeDisplaySku(data.barcode) !== normalizeDisplaySku(currentOrderBarcode)) {
+      currentPickedRowKeys = new Set();
+    }
+
     currentOrderBarcode = data.barcode;
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
     currentOrderTimeline = Array.isArray(data.orderTimeline) ? data.orderTimeline : [];
-    currentTrackerUrl = String(data.trackerUrl || '').trim();
     setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsItems) ? data.awaitingPartsItems : []);
     setOrderLookupInUrl(data.barcode || barcode);
     currentWorkflowBlock = data.workflowBlocked
@@ -1861,10 +2085,8 @@ async function fetchPickList(barcodeInput) {
       : null;
     setActionButtonsEnabled(true);
 
-    const orderMeta = document.getElementById('pickListOrderMeta');
-    orderMeta.textContent = `${data.orderNumber} (${data.barcode})`;
+    applyOrderHeaderData(data);
     renderWorkflowAlert();
-    renderTrackerLink();
 
     lastRenderedLineItems = Array.isArray(data.lineItems) ? data.lineItems : [];
     lastOrderItems = Array.isArray(data.orderItems) ? data.orderItems : [];
@@ -2025,7 +2247,6 @@ document.addEventListener('DOMContentLoaded', () => {
   const pickerModeToggle = document.getElementById('pickerModeToggle');
   const verifyModeToggle = document.getElementById('verifyModeToggle');
   const wholesaleModeToggle = document.getElementById('wholesaleModeToggle');
-  const trackerCopyButton = document.getElementById('pickListTrackerCopyBtn');
 
   actionButtons = Array.from(document.querySelectorAll('.pick-list-action-btn'));
   setActionButtonsEnabled(false);
@@ -2041,19 +2262,6 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (button) {
     button.addEventListener('click', () => fetchPickList(input?.value || ''));
-  }
-
-  if (trackerCopyButton) {
-    trackerCopyButton.addEventListener('click', async () => {
-      if (!currentTrackerUrl) return;
-
-      try {
-        await navigator.clipboard.writeText(currentTrackerUrl);
-        setStatus('Customer tracker link copied.', 'success');
-      } catch (err) {
-        setStatus('Could not copy the tracker link.', 'error');
-      }
-    });
   }
 
   if (input) {

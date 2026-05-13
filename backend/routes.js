@@ -249,6 +249,10 @@ function hasAwaitingPartsTag(tags) {
     .some((tag) => String(tag || '').trim().toLowerCase() === 'awaiting_parts');
 }
 
+function hasWholesaleAdapterBuiltNote(orderNote) {
+  return /(^|\n)\s*WHOLESALE ADAPTER BUILT\b/i.test(String(orderNote || ''));
+}
+
 function shouldExcludeOrderFromAwaitingPartsQueue(order) {
   if (!order) return false;
   if (order.cancelledAt) return true;
@@ -1536,6 +1540,13 @@ router.post('/api/tag-order', async (req, res) => {
       appendEventIfStageChanged: true,
       staff: attributedStaff,
     });
+    const updatedTrackerStage = deriveTrackerStage({
+      explicitTag: tag,
+      tags: [tag],
+      cancelledAt: order.cancelledAt,
+      displayFulfillmentStatus: order.displayFulfillmentStatus,
+      orderNote: order.note,
+    });
 
     let wholesaleAdapterBuiltCount = null;
     if (tag == "wholesale_adapter_built") {
@@ -1547,6 +1558,12 @@ router.post('/api/tag-order', async (req, res) => {
     return res.json({
       success: true,
       orderNumber: order.name,
+      orderTags: [tag],
+      orderStatus: order.cancelledAt ? 'CANCELLED' : (order.displayFulfillmentStatus || ''),
+      currentStage: {
+        key: updatedTrackerStage.key,
+        label: updatedTrackerStage.label,
+      },
       lineItems: lineItemArray,
       staff: attributedStaff,
       wholesaleAdapterBuiltCount,
@@ -1801,6 +1818,14 @@ router.post('/api/awaiting-parts', async (req, res) => {
     return res.json({
       success: true,
       orderNumber: order.name,
+      orderTags: nextTags,
+      orderStatus: order.cancelledAt
+        ? 'CANCELLED'
+        : (order.displayFulfillmentStatus || existingTrackerRecord?.workflowStatus || ''),
+      currentStage: {
+        key: nextTrackerStage.key,
+        label: nextTrackerStage.label,
+      },
       skus: normalizedAwaitingPartsItems.map((item) => item.sku),
       awaitingPartsSelection: normalizedAwaitingPartsItems,
       awaitingPartsItems: typedAwaitingPartsItems,
@@ -2138,11 +2163,112 @@ router.post('/api/wholesale-progress', async (req, res) => {
       return res.status(401).json({ success: false, error: 'No session found' });
     }
 
+    const totalProgressCount = Object.values(progressByItemKey || {}).reduce((sum, value) => (
+      sum + Math.max(0, Number(value) || 0)
+    ), 0);
+
     sessionsStore.setWholesaleBuildProgress({
       shop,
       barcode: normalizedBarcode,
       progressByItemKey,
     });
+
+    if (totalProgressCount > 0 && !sessionsStore.getWholesaleBuildEvent({ shop, barcode: normalizedBarcode })) {
+      try {
+        const staff = String(req.cookies.userId || '').trim() || 'Unknown';
+        const client = shopifyClient(session);
+        const queryVariables = {
+          query: `${normalizedBarcode} status:any`,
+        };
+
+        let bundleMetadataSupported = true;
+        let orderResponse;
+
+        try {
+          orderResponse = await client.graphql(getPickListOrderQuery({ includeBundleGroup: true }), {
+            variables: queryVariables,
+          });
+        } catch (err) {
+          if (!includesMissingBundleFieldError(err)) {
+            throw err;
+          }
+
+          bundleMetadataSupported = false;
+          orderResponse = await client.graphql(getPickListOrderQuery({ includeBundleGroup: false }), {
+            variables: queryVariables,
+          });
+        }
+
+        const orderEdge = orderResponse.data?.orders?.edges?.[0];
+        const order = orderEdge?.node || null;
+
+        if (order?.id) {
+          const existingOrderEventRecorded = hasWholesaleAdapterBuiltNote(order.note || '');
+          if (existingOrderEventRecorded) {
+            sessionsStore.recordWholesaleBuildEvent({
+              shop,
+              barcode: normalizedBarcode,
+              orderId: order.id,
+              orderNumber: order.name,
+              staff,
+            });
+          } else {
+            const timestamp = new Date()
+              .toISOString()
+              .replace('T', ' ')
+              .slice(0, 16);
+            const orderNoteBlock = [
+              '~',
+              `WHOLESALE ADAPTER BUILT — ${timestamp}`,
+              `Team Member: ${staff}`,
+              '',
+            ].join('\n');
+
+            await appendOrderNote(client, order.id, orderNoteBlock);
+            order.note = `${order.note || ''}${orderNoteBlock}`;
+
+            const lineItemArray = buildCurrentOrderLineItems(order.lineItems?.edges || []);
+            await persistOrderTrackerSnapshot({
+              req,
+              client,
+              shop,
+              order,
+              barcode: normalizedBarcode,
+              lineItems: lineItemArray,
+              explicitTag: 'wholesale_adapter_built',
+              appendEventIfStageChanged: true,
+              staff,
+            });
+
+            try {
+              await sendGeckoboardEvent({
+                timestamp: new Date().toISOString(),
+                order_number: order.name,
+                order_id: order.id,
+                barcode: normalizedBarcode,
+                tag: 'wholesale_adapter_built',
+                staff,
+              });
+            } catch (geckoboardErr) {
+              console.error('Geckoboard event send failed:', geckoboardErr);
+            }
+
+            const nextCount = (wholesaleAdapterBuiltScanCounts.get(normalizedBarcode) || 0) + 1;
+            wholesaleAdapterBuiltScanCounts.set(normalizedBarcode, nextCount);
+
+            sessionsStore.recordWholesaleBuildEvent({
+              shop,
+              barcode: normalizedBarcode,
+              orderId: order.id,
+              orderNumber: order.name,
+              staff,
+            });
+          }
+        }
+      } catch (eventErr) {
+        console.error('Failed to record wholesale_adapter_built event from wholesale progress:', eventErr);
+      }
+    }
 
     return res.json({ success: true });
   } catch (err) {
@@ -2206,6 +2332,13 @@ router.post('/api/pick-list', async (req, res) => {
     });
     const workflowBlock = getOrderWorkflowBlock(order);
     const orderLineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
+    const currentTrackerStage = deriveTrackerStage({
+      explicitTag: '',
+      tags: order.tags,
+      cancelledAt: order.cancelledAt,
+      displayFulfillmentStatus: order.displayFulfillmentStatus,
+      orderNote: order.note,
+    });
 
     const pickListSheet = await fetchPickListSheet();
     const pickListResult = buildPickListForOrder({
@@ -2217,15 +2350,7 @@ router.post('/api/pick-list', async (req, res) => {
       orderId: order.id,
     });
     if (!awaitingPartsItems.length) {
-      const trackerStage = deriveTrackerStage({
-        explicitTag: '',
-        tags: order.tags,
-        cancelledAt: order.cancelledAt,
-        displayFulfillmentStatus: order.displayFulfillmentStatus,
-        orderNote: order.note,
-      });
-
-      if (trackerStage.key === 'awaiting_parts') {
+      if (currentTrackerStage.key === 'awaiting_parts') {
         const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
         awaitingPartsItems = Array.isArray(latestAwaitingPartsSnapshot?.items)
           ? latestAwaitingPartsSnapshot.items.map((item) => ({
@@ -2260,6 +2385,12 @@ router.post('/api/pick-list', async (req, res) => {
       success: true,
       barcode: normalizedBarcode,
       orderNumber: order.name,
+      orderTags: normalizeOrderTags(order.tags),
+      orderStatus: order.cancelledAt ? 'CANCELLED' : (order.displayFulfillmentStatus || ''),
+      currentStage: {
+        key: currentTrackerStage.key,
+        label: currentTrackerStage.label,
+      },
       orderNote: order.note || '',
       orderTimeline,
       sheetFetchedAt: pickListSheet.fetchedAt,
