@@ -549,9 +549,47 @@ function buildPickListForOrder({ skuMap, lineItems }) {
   };
 }
 
+function buildPutAwaySkuLookup({ skuMap, sku }) {
+  const normalizedSku = normalizeSku(sku);
+  if (!normalizedSku) return null;
+
+  const row = skuMap.get(normalizedSku);
+  if (!row) return null;
+
+  const meta = classifyComponent(skuMap, normalizedSku);
+  const serializeComponent = (componentSku) => {
+    const normalizedComponentSku = normalizeSku(componentSku);
+    const componentRow = skuMap.get(normalizedComponentSku);
+    const componentMeta = classifyComponent(skuMap, normalizedComponentSku);
+
+    return {
+      sku: normalizedComponentSku,
+      found: Boolean(componentRow),
+      pickType: componentRow?.pickType || componentMeta.type || 'UNKNOWN',
+      type: componentRow?.type || '',
+      location: componentRow?.location || componentMeta.location || '',
+      note: componentRow?.note || componentMeta.note || '',
+      classification: componentMeta.classification,
+      componentCount: Array.isArray(componentRow?.components) ? componentRow.components.length : 0,
+    };
+  };
+
+  return {
+    sku: normalizedSku,
+    pickType: row.pickType || meta.type || 'UNKNOWN',
+    type: row.type || '',
+    location: row.location || meta.location || '',
+    note: row.note || meta.note || '',
+    classification: meta.classification,
+    hideOwnPickRow: Boolean(row.hideOwnPickRow),
+    components: Array.isArray(row.components) ? row.components.map(serializeComponent) : [],
+  };
+}
+
 module.exports = {
   fetchPickListSheet,
   buildPickListForOrder,
+  buildPutAwaySkuLookup,
   normalizeSku,
   normalizePickType,
   getWaitingPartsTypeGroup,

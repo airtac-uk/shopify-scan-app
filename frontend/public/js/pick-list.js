@@ -22,6 +22,8 @@ let currentAwaitingPartsCatalog = new Map();
 let currentPickedRowCounts = new Map();
 let lastActionTag = '';
 let lastActionBarcode = '';
+let pendingActionReminderTarget = null;
+let suppressNextActionReminderUnload = false;
 let actionButtons = [];
 let actionButtonsUnlocked = false;
 let verifyItems = [];
@@ -265,6 +267,8 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentAwaitingPartsSkuMap = new Map();
   currentAwaitingPartsCatalog = new Map();
   currentPickedRowCounts = new Map();
+  pendingActionReminderTarget = null;
+  suppressNextActionReminderUnload = false;
   verifyItems = [];
   verifyCodeIndex = new Map();
 
@@ -557,6 +561,203 @@ function renderOrderHeaderMeta() {
   orderStatus.textContent = statusParts.length ? statusParts.join(' / ') : 'No tag or status';
 }
 
+function isCurrentOrderLookup(value) {
+  const normalizedValue = normalizeDisplaySku(value);
+  if (!normalizedValue) return false;
+
+  return [currentOrderBarcode, currentOrderNumber]
+    .map((item) => normalizeDisplaySku(item))
+    .filter(Boolean)
+    .includes(normalizedValue);
+}
+
+function hasActionForCurrentOrder() {
+  const orderId = normalizeDisplaySku(currentOrderBarcode);
+  return Boolean(
+    orderId &&
+    lastActionTag &&
+    normalizeDisplaySku(lastActionBarcode) === orderId
+  );
+}
+
+function hasPickerPickProgress() {
+  if (!pickerModeEnabled) return false;
+  return Array.from(currentPickedRowCounts.values()).some((count) => Number(count) > 0);
+}
+
+function hasVerifyPickProgress() {
+  if (!verifyModeEnabled) return false;
+  return verifyItems.some((row) => Number(row?.scannedQty) > 0);
+}
+
+function shouldShowOrderActionReminder({ nextLookup = '' } = {}) {
+  if (!hasRenderedPickList || !currentOrderBarcode || isCurrentOrderWorkflowBlocked()) {
+    return false;
+  }
+  if (!pickerModeEnabled && !verifyModeEnabled) {
+    return false;
+  }
+  if (nextLookup && isCurrentOrderLookup(nextLookup)) {
+    return false;
+  }
+  if (hasActionForCurrentOrder()) {
+    return false;
+  }
+
+  return hasPickerPickProgress() || hasVerifyPickProgress();
+}
+
+function getOrderActionReminderSummary() {
+  if (pickerModeEnabled) {
+    const pickedRows = Array.from(currentPickedRowCounts.values())
+      .filter((count) => Number(count) > 0);
+    const pickedCount = pickedRows.reduce((sum, count) => sum + Number(count), 0);
+    const rowLabel = pickedRows.length === 1 ? 'row' : 'rows';
+    const tapLabel = pickedCount === 1 ? 'tap' : 'taps';
+    return `${pickedRows.length} picked ${rowLabel}, ${pickedCount} ${tapLabel} recorded`;
+  }
+
+  if (verifyModeEnabled) {
+    const totals = getVerifyTotals();
+    return `${totals.scanned}/${totals.required} verified`;
+  }
+
+  return 'pick progress recorded';
+}
+
+function isActionRelevantForCurrentMode(button) {
+  if (!button) return false;
+
+  const tag = button.dataset.orderAction || '';
+  if (!tag) return false;
+
+  if (wholesaleModeEnabled || verifyModeEnabled) {
+    return button.dataset.verifyVisible === 'true';
+  }
+
+  if (pickerModeEnabled) {
+    return button.dataset.pickerVisible === 'true';
+  }
+
+  return false;
+}
+
+function getOrderActionReminderOptions() {
+  return actionButtons
+    .filter(isActionRelevantForCurrentMode)
+    .map((button) => {
+      const tag = button.dataset.orderAction || '';
+      const disabled = tag === 'packaged' && isPackagedActionLocked();
+      return {
+        tag,
+        label: formatActionLabel(tag),
+        className: button.className,
+        disabled,
+        title: disabled ? 'Complete Verify Order before marking this order as Packaged.' : '',
+      };
+    });
+}
+
+function closeOrderActionReminderDialog({ clearPending = true } = {}) {
+  const modal = document.getElementById('orderActionReminderModal');
+  const actions = document.getElementById('orderActionReminderActions');
+
+  if (modal) modal.classList.remove('is-open');
+  if (actions) actions.innerHTML = '';
+  if (clearPending) {
+    pendingActionReminderTarget = null;
+  }
+}
+
+function continueActionReminderTarget(target = pendingActionReminderTarget) {
+  if (!target) return;
+
+  pendingActionReminderTarget = null;
+  if (target.lookup) {
+    fetchPickList(target.lookup, { skipActionReminder: true });
+    return;
+  }
+
+  if (target.href) {
+    suppressNextActionReminderUnload = true;
+    window.location.href = target.href;
+  }
+}
+
+async function runOrderActionFromReminder(tag) {
+  const pendingTarget = pendingActionReminderTarget;
+  closeOrderActionReminderDialog({ clearPending: false });
+
+  const result = await runOrderAction(tag);
+  if (result === true && pendingTarget && hasActionForCurrentOrder()) {
+    continueActionReminderTarget(pendingTarget);
+    return;
+  }
+
+  if (result === 'dialog') {
+    pendingActionReminderTarget = pendingTarget;
+    return;
+  }
+
+  pendingActionReminderTarget = null;
+}
+
+function openOrderActionReminderDialog(target = {}) {
+  const modal = document.getElementById('orderActionReminderModal');
+  const message = document.getElementById('orderActionReminderMessage');
+  const actions = document.getElementById('orderActionReminderActions');
+  if (!modal || !message || !actions) return false;
+
+  pendingActionReminderTarget = {
+    lookup: String(target.lookup || '').trim(),
+    href: String(target.href || '').trim(),
+  };
+
+  const orderLabel = currentOrderNumber || currentOrderBarcode;
+  message.textContent = `${orderLabel} has ${getOrderActionReminderSummary()}, but no order action has been applied. Choose an action before continuing.`;
+  actions.innerHTML = '';
+
+  getOrderActionReminderOptions().forEach((option) => {
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = `${option.className} pick-action-reminder__action`;
+    button.textContent = option.label;
+    button.disabled = option.disabled;
+    if (option.title) {
+      button.title = option.title;
+    }
+    button.addEventListener('click', () => {
+      runOrderActionFromReminder(option.tag);
+    });
+    actions.appendChild(button);
+  });
+
+  modal.classList.add('is-open');
+  return true;
+}
+
+function isOrderActionReminderDialogOpen() {
+  const modal = document.getElementById('orderActionReminderModal');
+  return Boolean(modal?.classList.contains('is-open'));
+}
+
+function isOrderLookupCode(value) {
+  const normalized = normalizeVerifyCode(value);
+  return normalized.startsWith('AT') || normalized.startsWith('#');
+}
+
+function handleOrderActionReminderScan(scannedCode) {
+  const normalized = String(scannedCode || '').trim().toUpperCase();
+  if (!normalized || !isOrderLookupCode(normalized)) {
+    return false;
+  }
+
+  closeOrderActionReminderDialog({ clearPending: false });
+  pendingActionReminderTarget = null;
+  fetchPickList(normalized, { skipActionReminder: true });
+  return true;
+}
+
 function isAnyDialogOpen() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
   const qcFailModal = document.getElementById('qcFailModal');
@@ -565,7 +766,8 @@ function isAnyDialogOpen() {
   return Boolean(
     awaitingPartsModal?.classList.contains('is-open') ||
     qcFailModal?.classList.contains('is-open') ||
-    onHoldModal?.classList.contains('is-open')
+    onHoldModal?.classList.contains('is-open') ||
+    isOrderActionReminderDialogOpen()
   );
 }
 
@@ -599,6 +801,10 @@ async function saveAwaitingPartsSelection({ orderId, items, closeDialog = false 
     }
 
     setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsSelection) ? data.awaitingPartsSelection : normalizedItems);
+    if (normalizedItems.length > 0) {
+      lastActionTag = 'awaiting_parts';
+      lastActionBarcode = normalizedOrderId;
+    }
     applyOrderHeaderData(data, {
       fallbackTag: normalizedItems.length > 0 ? 'awaiting_parts' : '',
     });
@@ -1662,7 +1868,7 @@ function getVerifyDisplayLabel(row) {
   return row.productName || 'Item';
 }
 
-function processVerifyManual(key) {
+async function processVerifyManual(key) {
   if (!isVerificationStyleModeEnabled()) return;
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
@@ -1673,6 +1879,13 @@ function processVerifyManual(key) {
   if (!row) {
     setStatus('Error: Verification item not found.', 'error');
     return;
+  }
+
+  if (wholesaleModeEnabled && row.isWholesaleBundle) {
+    const actionResult = await runOrderAction('wholesale_adapter_built');
+    if (actionResult !== true) {
+      return;
+    }
   }
 
   const result = incrementVerifyRow(row);
@@ -1879,7 +2092,7 @@ function openAwaitingPartsDialog(orderId, lineItems = lastRenderedLineItems) {
   modal.classList.add('is-open');
 }
 
-function closeAwaitingPartsDialog() {
+function closeAwaitingPartsDialog({ clearPendingReminder = false } = {}) {
   const modal = document.getElementById('awaitingPartsModal');
   const form = document.getElementById('awaitingPartsForm');
 
@@ -1888,6 +2101,13 @@ function closeAwaitingPartsDialog() {
     form.innerHTML = '';
     form.dataset.orderId = '';
   }
+  if (clearPendingReminder) {
+    pendingActionReminderTarget = null;
+  }
+}
+
+function cancelAwaitingPartsDialog() {
+  closeAwaitingPartsDialog({ clearPendingReminder: true });
 }
 
 async function submitAwaitingParts() {
@@ -1909,11 +2129,19 @@ async function submitAwaitingParts() {
     return;
   }
 
-  await saveAwaitingPartsSelection({
+  const saved = await saveAwaitingPartsSelection({
     orderId,
     items,
     closeDialog: true,
   });
+
+  if (saved && pendingActionReminderTarget) {
+    if (hasActionForCurrentOrder()) {
+      continueActionReminderTarget();
+    } else {
+      pendingActionReminderTarget = null;
+    }
+  }
 }
 
 function openQcFailDialog(orderId, lineItems) {
@@ -2088,20 +2316,20 @@ async function runOrderAction(tag) {
   if (!normalizedBarcode) {
     setStatus('Scan an order first to enable actions.', 'error');
     focusBarcodeInput({ selectAll: true });
-    return;
+    return false;
   }
 
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
-    return;
+    return false;
   }
 
   if (tag === 'packaged' && isPackagedActionLocked()) {
     setStatus('Complete Verify Order before marking this order as Packaged.', 'error');
-    return;
+    return false;
   }
 
-  if (loading || isAnyDialogOpen()) return;
+  if (loading || isAnyDialogOpen()) return false;
 
   const isDuplicate =
     lastActionTag === tag &&
@@ -2110,17 +2338,17 @@ async function runOrderAction(tag) {
 
   if (isDuplicate) {
     setStatus(`Skipped duplicate action: ${formatActionLabel(tag)}.`, 'info');
-    return;
+    return true;
   }
 
   if (tag === 'awaiting_parts') {
     openAwaitingPartsDialog(normalizedBarcode, lastRenderedLineItems);
-    return;
+    return 'dialog';
   }
 
   if (tag === 'on_hold') {
     openOnHoldDialog(normalizedBarcode);
-    return;
+    return 'dialog';
   }
 
   setLoading(true);
@@ -2159,14 +2387,16 @@ async function runOrderAction(tag) {
       setCurrentAwaitingPartsItems([]);
       renderCurrentOrderSection();
     }
+    return true;
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
+    return false;
   } finally {
     setLoading(false);
   }
 }
 
-async function fetchPickList(barcodeInput) {
+async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) {
   const barcode = String(barcodeInput || '').trim().toUpperCase();
   if (!barcode) {
     setStatus('Enter or scan an order barcode.', 'error');
@@ -2179,6 +2409,11 @@ async function fetchPickList(barcodeInput) {
   }
 
   if (loading || isAnyDialogOpen()) return;
+
+  if (!skipActionReminder && shouldShowOrderActionReminder({ nextLookup: barcode })) {
+    openOrderActionReminderDialog({ lookup: barcode });
+    return;
+  }
 
   setLoading(true);
   setStatus('Loading order and building pick list...', 'info');
@@ -2289,7 +2524,10 @@ function setupHidScan() {
   const MIN_SCAN_LENGTH = 3;
 
   document.addEventListener('keydown', (event) => {
-    if (loading || isAnyDialogOpen()) return;
+    if (loading) return;
+
+    const actionReminderOpen = isOrderActionReminderDialogOpen();
+    if (isAnyDialogOpen() && !actionReminderOpen) return;
 
     const target = event.target;
     const tagName = target?.tagName?.toLowerCase();
@@ -2311,6 +2549,13 @@ function setupHidScan() {
         const input = document.getElementById('pickListBarcode');
         const normalized = normalizeVerifyCode(scannedCode);
         const isOrderCode = normalized.startsWith('AT');
+
+        if (actionReminderOpen) {
+          if (!handleOrderActionReminderScan(scannedCode)) {
+            setStatus('Scan the order label again to continue without action.', 'info');
+          }
+          return;
+        }
 
         if (isVerificationStyleModeEnabled() && hasRenderedPickList && !isOrderCode) {
           processVerifyScan(scannedCode);
@@ -2336,10 +2581,42 @@ function setupHidScan() {
   });
 }
 
+function registerOrderActionReminderNavigationGuards() {
+  window.addEventListener('beforeunload', (event) => {
+    if (suppressNextActionReminderUnload) return;
+    if (!shouldShowOrderActionReminder()) return;
+
+    event.preventDefault();
+    event.returnValue = '';
+  });
+
+  document.querySelectorAll('a[href]').forEach((link) => {
+    link.addEventListener('click', (event) => {
+      if (
+        event.defaultPrevented ||
+        event.button !== 0 ||
+        event.metaKey ||
+        event.ctrlKey ||
+        event.shiftKey ||
+        event.altKey ||
+        (link.target && link.target !== '_self')
+      ) {
+        return;
+      }
+
+      if (!shouldShowOrderActionReminder()) return;
+
+      event.preventDefault();
+      openOrderActionReminderDialog({ href: link.href });
+    });
+  });
+}
+
 function registerModalHandlers() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
   const qcFailModal = document.getElementById('qcFailModal');
   const onHoldModal = document.getElementById('onHoldModal');
+  const orderActionReminderModal = document.getElementById('orderActionReminderModal');
 
   const awaitingCancel = document.getElementById('awaitingPartsCancelBtn');
   const awaitingConfirm = document.getElementById('awaitingPartsConfirmBtn');
@@ -2347,18 +2624,28 @@ function registerModalHandlers() {
   const qcConfirm = document.getElementById('qcFailConfirmBtn');
   const onHoldCancel = document.getElementById('onHoldCancelBtn');
   const onHoldConfirm = document.getElementById('onHoldConfirmBtn');
+  const reminderCancel = document.getElementById('orderActionReminderCancelBtn');
+  const reminderContinue = document.getElementById('orderActionReminderContinueBtn');
 
-  if (awaitingCancel) awaitingCancel.addEventListener('click', closeAwaitingPartsDialog);
+  if (awaitingCancel) awaitingCancel.addEventListener('click', cancelAwaitingPartsDialog);
   if (awaitingConfirm) awaitingConfirm.addEventListener('click', submitAwaitingParts);
   if (qcCancel) qcCancel.addEventListener('click', closeQcFailDialog);
   if (qcConfirm) qcConfirm.addEventListener('click', submitQcFail);
   if (onHoldCancel) onHoldCancel.addEventListener('click', closeOnHoldDialog);
   if (onHoldConfirm) onHoldConfirm.addEventListener('click', submitOnHold);
+  if (reminderCancel) reminderCancel.addEventListener('click', () => closeOrderActionReminderDialog());
+  if (reminderContinue) {
+    reminderContinue.addEventListener('click', () => {
+      const pendingTarget = pendingActionReminderTarget;
+      closeOrderActionReminderDialog({ clearPending: false });
+      continueActionReminderTarget(pendingTarget);
+    });
+  }
 
   if (awaitingPartsModal) {
     awaitingPartsModal.addEventListener('click', (event) => {
       if (event.target === event.currentTarget) {
-        closeAwaitingPartsDialog();
+        cancelAwaitingPartsDialog();
       }
     });
   }
@@ -2375,6 +2662,14 @@ function registerModalHandlers() {
     onHoldModal.addEventListener('click', (event) => {
       if (event.target === event.currentTarget) {
         closeOnHoldDialog();
+      }
+    });
+  }
+
+  if (orderActionReminderModal) {
+    orderActionReminderModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeOrderActionReminderDialog();
       }
     });
   }
@@ -2418,6 +2713,15 @@ document.addEventListener('DOMContentLoaded', () => {
         const rawValue = input.value;
         const normalized = normalizeVerifyCode(rawValue);
         const isOrderCode = normalized.startsWith('AT');
+
+        if (isOrderActionReminderDialogOpen()) {
+          if (!handleOrderActionReminderScan(rawValue)) {
+            setStatus('Scan the order label again to continue without action.', 'info');
+          }
+          input.value = '';
+          focusBarcodeInput();
+          return;
+        }
 
         if (isVerificationStyleModeEnabled() && hasRenderedPickList && !isOrderCode) {
           processVerifyScan(rawValue);
@@ -2516,6 +2820,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
   registerModalHandlers();
   setupHidScan();
+  registerOrderActionReminderNavigationGuards();
 
   const initialOrderLookup = getInitialOrderLookupValue();
   if (initialOrderLookup && input) {

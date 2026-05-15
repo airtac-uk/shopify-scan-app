@@ -10,6 +10,7 @@ const fetch = require('node-fetch'); // for OAuth token exchange
 const {
   fetchPickListSheet,
   buildPickListForOrder,
+  buildPutAwaySkuLookup,
   normalizeSku,
   normalizePickType,
   getWaitingPartsTypeGroup,
@@ -1553,6 +1554,17 @@ router.post('/api/tag-order', async (req, res) => {
       const nextCount = (wholesaleAdapterBuiltScanCounts.get(normalizedBarcode) || 0) + 1;
       wholesaleAdapterBuiltScanCounts.set(normalizedBarcode, nextCount);
       wholesaleAdapterBuiltCount = nextCount;
+      try {
+        sessionsStore.recordWholesaleBuildEvent({
+          shop,
+          barcode: normalizedBarcode,
+          orderId: order.id,
+          orderNumber: order.name,
+          staff,
+        });
+      } catch (wholesaleEventStoreErr) {
+        console.error('Failed to store wholesale_adapter_built event marker:', wholesaleEventStoreErr);
+      }
     }
 
     return res.json({
@@ -2414,6 +2426,56 @@ router.post('/api/pick-list', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /api/pick-list:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/put-away-sku', async (req, res) => {
+  try {
+    const { sku } = req.body || {};
+    const normalizedSku = normalizeSku(sku);
+
+    if (!normalizedSku) {
+      return res.status(400).json({ success: false, error: 'Missing SKU' });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const pickListSheet = await fetchPickListSheet();
+    const item = buildPutAwaySkuLookup({
+      skuMap: pickListSheet.skuMap,
+      sku: normalizedSku,
+    });
+
+    if (!item) {
+      return res.status(404).json({
+        success: false,
+        error: `SKU ${normalizedSku} not found in pick list sheet`,
+        sku: normalizedSku,
+        sheetFetchedAt: pickListSheet.fetchedAt,
+        sheetSkuCount: pickListSheet.sourceRowCount,
+      });
+    }
+
+    return res.json({
+      success: true,
+      item,
+      sheetFetchedAt: pickListSheet.fetchedAt,
+      sheetSkuCount: pickListSheet.sourceRowCount,
+      notesEnabled: pickListSheet.notesEnabled || false,
+      notesLoaded: pickListSheet.notesLoaded || false,
+      notesError: pickListSheet.notesError || null,
+    });
+  } catch (err) {
+    console.error('Error in /api/put-away-sku:', err);
     return res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
 });
