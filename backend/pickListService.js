@@ -188,6 +188,7 @@ function buildRowsFromTable(table) {
   const pickIdx = headers.findIndex((h) => h === 'PICK');
   const typeIdx = headers.findIndex((h) => h === 'TYPE');
   const locationIdx = headers.findIndex((h) => h === 'LOCATION');
+  const showPickIdx = headers.findIndex((h) => h === 'SHOWPICK');
   const plIndexes = headers
     .map((h, idx) => ({ h, idx }))
     .filter((item) => /^PL\d+$/.test(item.h))
@@ -208,6 +209,7 @@ function buildRowsFromTable(table) {
     const pickType = pickIdx >= 0 ? String(getCellValue(rowCells[pickIdx] || '')).trim().toUpperCase() : '';
     const type = typeIdx >= 0 ? String(getCellValue(rowCells[typeIdx] || '')).trim().toUpperCase() : '';
     const location = locationIdx >= 0 ? String(getCellValue(rowCells[locationIdx] || '')).trim() : '';
+    const showPick = showPickIdx >= 0 ? String(getCellValue(rowCells[showPickIdx] || '')).trim() : '';
     const components = plIndexes
       .map((idx) => normalizeSku(getCellValue(rowCells[idx] || '')))
       .filter(Boolean);
@@ -217,6 +219,7 @@ function buildRowsFromTable(table) {
       pickType,
       type,
       location,
+      hideOwnPickRow: showPick.toUpperCase() === 'NO',
       components,
       note: '',
     });
@@ -382,13 +385,15 @@ function classifyComponent(skuMap, sku) {
 function expandSkuRecursively({ skuMap, sku, quantity, outCounts, stackSet }) {
   if (!sku || quantity <= 0) return;
 
-  outCounts.set(sku, (outCounts.get(sku) || 0) + quantity);
+  const row = skuMap.get(sku);
+  if (!row?.hideOwnPickRow) {
+    outCounts.set(sku, (outCounts.get(sku) || 0) + quantity);
+  }
 
   if (stackSet.has(sku)) {
     return;
   }
 
-  const row = skuMap.get(sku);
   if (!row || !Array.isArray(row.components) || row.components.length === 0) {
     return;
   }

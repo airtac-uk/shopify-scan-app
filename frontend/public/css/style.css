@@ -552,6 +552,24 @@ button:hover { background: #0056b3; }
   color: #a6b7c8;
 }
 
+.pick-verify-bundle-parts {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0;
+  padding: 0;
+  list-style: none;
+}
+
+.pick-verify-bundle-parts li {
+  padding: 4px 6px;
+  border-left: 3px solid #49647e;
+  border-radius: 5px;
+  background: rgba(124, 200, 255, 0.08);
+  color: #c8d8e6;
+  font-size: 12px;
+  line-height: 1.25;
+}
+
 .pick-verify-item-progress {
   margin: 0;
   font-weight: 700;
@@ -1185,6 +1203,14 @@ button:hover { background: #0056b3; }
   padding-right: 8px;
 }
 
+.pick-list-item--picked-partial {
+  background: rgba(217, 185, 110, 0.15);
+  border-radius: 10px;
+  box-shadow: inset 3px 0 0 rgba(217, 185, 110, 0.72);
+  padding-left: 8px;
+  padding-right: 8px;
+}
+
 .pick-list-item--pickable {
   cursor: pointer;
 }
@@ -1195,6 +1221,10 @@ button:hover { background: #0056b3; }
 
 .pick-list-item--pickable.pick-list-item--picked:hover {
   background: rgba(38, 138, 92, 0.28);
+}
+
+.pick-list-item--pickable.pick-list-item--picked-partial:hover {
+  background: rgba(217, 185, 110, 0.22);
 }
 
 .pick-list-awaiting-parts-badge {
@@ -1209,6 +1239,68 @@ button:hover { background: #0056b3; }
   font-weight: 800;
   letter-spacing: 0.06em;
   text-transform: uppercase;
+}
+
+.pick-list-pick-progress {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 88px;
+  overflow: hidden;
+  border-radius: 6px;
+  background: rgba(67, 57, 35, 0.54);
+  border: 1px solid rgba(217, 185, 110, 0.36);
+  box-shadow: inset 0 0 0 1px rgba(255, 232, 176, 0.05);
+  color: #f0d596;
+  font-size: 24px;
+  font-weight: 800;
+  line-height: 1.1;
+  font-variant-numeric: tabular-nums;
+}
+
+.pick-list-pick-progress-current,
+.pick-list-pick-progress-target {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 34px;
+  padding: 5px 8px;
+}
+
+.pick-list-pick-progress-current {
+  background: rgba(217, 185, 110, 0.16);
+  color: #ffe3a8;
+}
+
+.pick-list-pick-progress-divider {
+  display: inline-flex;
+  align-items: center;
+  align-self: stretch;
+  color: rgba(240, 213, 150, 0.62);
+  font-size: 18px;
+}
+
+.pick-list-pick-progress-target {
+  color: #dbe9f7;
+}
+
+.pick-list-item--picked .pick-list-pick-progress {
+  background: rgba(27, 82, 56, 0.62);
+  border-color: rgba(71, 209, 140, 0.42);
+  color: #b7f5cf;
+}
+
+.pick-list-item--picked .pick-list-pick-progress-current {
+  background: rgba(71, 209, 140, 0.18);
+  color: #9af0bf;
+}
+
+.pick-list-item--picked .pick-list-pick-progress-divider {
+  color: rgba(183, 245, 207, 0.62);
+}
+
+.pick-list-item--picked .pick-list-pick-progress-target {
+  color: #d8f9e5;
 }
 
 .pick-list-awaiting-toggle {
@@ -1313,6 +1405,14 @@ button:hover { background: #0056b3; }
   word-break: break-word;
   border-left: 3px solid #b89a54;
   padding-left: 8px;
+}
+
+.pick-list-item-note--pick-progress {
+  display: flex;
+  align-items: center;
+  border-left: 0;
+  padding-left: 0;
+  white-space: normal;
 }
 
 .pick-list-item-action {
@@ -2792,12 +2892,21 @@ html.theme-light .pick-list-item--picked {
   box-shadow: inset 3px 0 0 rgba(34, 150, 94, 0.78);
 }
 
+html.theme-light .pick-list-item--picked-partial {
+  background: rgba(255, 232, 184, 0.72);
+  box-shadow: inset 3px 0 0 rgba(196, 154, 78, 0.82);
+}
+
 html.theme-light .pick-list-item--pickable:hover {
   background: rgba(190, 239, 214, 0.38);
 }
 
 html.theme-light .pick-list-item--pickable.pick-list-item--picked:hover {
   background: rgba(190, 239, 214, 0.78);
+}
+
+html.theme-light .pick-list-item--pickable.pick-list-item--picked-partial:hover {
+  background: rgba(255, 232, 184, 0.86);
 }
 
 html.theme-light .pick-list-action-note {
@@ -2844,6 +2953,45 @@ html.theme-light .pick-list-awaiting-parts-badge {
   background: rgba(196, 154, 78, 0.16);
   border-color: rgba(196, 154, 78, 0.34);
   color: #855a15;
+}
+
+html.theme-light .pick-list-pick-progress {
+  background: #fff6e5;
+  border-color: rgba(196, 154, 78, 0.34);
+  box-shadow: inset 0 0 0 1px rgba(255, 255, 255, 0.44);
+  color: #7c5514;
+}
+
+html.theme-light .pick-list-pick-progress-current {
+  background: rgba(196, 154, 78, 0.14);
+  color: #7c5514;
+}
+
+html.theme-light .pick-list-pick-progress-divider {
+  color: rgba(124, 85, 20, 0.5);
+}
+
+html.theme-light .pick-list-pick-progress-target {
+  color: #1b2f43;
+}
+
+html.theme-light .pick-list-item--picked .pick-list-pick-progress {
+  background: rgba(190, 239, 214, 0.44);
+  border-color: rgba(34, 150, 94, 0.36);
+  color: #17653e;
+}
+
+html.theme-light .pick-list-item--picked .pick-list-pick-progress-current {
+  background: rgba(34, 150, 94, 0.14);
+  color: #17653e;
+}
+
+html.theme-light .pick-list-item--picked .pick-list-pick-progress-divider {
+  color: rgba(23, 101, 62, 0.5);
+}
+
+html.theme-light .pick-list-item--picked .pick-list-pick-progress-target {
+  color: #123d28;
 }
 
 html.theme-light .pick-list-awaiting-toggle {
@@ -2896,6 +3044,12 @@ html.theme-light .pick-verify-item.is-complete {
 
 html.theme-light .pick-verify-item-progress {
   color: #1f476d;
+}
+
+html.theme-light .pick-verify-bundle-parts li {
+  background: #eef6ff;
+  border-left-color: #8bb5dc;
+  color: #24445f;
 }
 
 html.theme-light .pick-modal-item {

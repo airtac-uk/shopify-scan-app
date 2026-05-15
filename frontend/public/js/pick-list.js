@@ -19,7 +19,7 @@ let currentOrderStatus = '';
 let currentOrderStageLabel = '';
 let currentAwaitingPartsSkuMap = new Map();
 let currentAwaitingPartsCatalog = new Map();
-let currentPickedRowKeys = new Set();
+let currentPickedRowCounts = new Map();
 let lastActionTag = '';
 let lastActionBarcode = '';
 let actionButtons = [];
@@ -264,7 +264,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentOrderStageLabel = '';
   currentAwaitingPartsSkuMap = new Map();
   currentAwaitingPartsCatalog = new Map();
-  currentPickedRowKeys = new Set();
+  currentPickedRowCounts = new Map();
   verifyItems = [];
   verifyCodeIndex = new Map();
 
@@ -783,36 +783,113 @@ function getPickRowKey(row, sectionTitle, rowIndex) {
   ].join('|');
 }
 
-function setPickedRowState(rowKey, item, checkbox, isPicked) {
-  if (isPicked) {
-    currentPickedRowKeys.add(rowKey);
-    item.classList.add('pick-list-item--picked');
-  } else {
-    currentPickedRowKeys.delete(rowKey);
-    item.classList.remove('pick-list-item--picked');
-  }
+function getNoteQuantityMultiplier(noteText) {
+  const note = String(noteText || '').trim().toUpperCase();
+  if (!note) return 1;
+
+  const quantities = [];
+  const patterns = [
+    /\b(\d{1,3})\s*(?:PCS?|PIECES?)\b/g,
+    /\b(?:QTY|QUANTITY)\s*[:=\-]?\s*(\d{1,3})\b/g,
+    /(?:^|[^A-Z0-9])X\s*(\d{1,3})(?=$|[^A-Z0-9])/g,
+    /(?:^|[^A-Z0-9])(\d{1,3})\s*X(?=$|[^A-Z0-9])/g,
+  ];
+
+  patterns.forEach((pattern) => {
+    let match = pattern.exec(note);
+    while (match) {
+      const quantity = Number(match[1]);
+      if (Number.isFinite(quantity) && quantity > 1) {
+        quantities.push(quantity);
+      }
+      match = pattern.exec(note);
+    }
+  });
+
+  return quantities.length ? Math.max(...quantities) : 1;
+}
+
+function getPickRowRequiredCount(row) {
+  const orderedQuantity = Math.max(1, Number(row?.quantity) || 1);
+  const noteMultiplier = getNoteQuantityMultiplier(row?.note);
+  return Math.max(1, orderedQuantity * noteMultiplier);
+}
+
+function getPickedRowCount(rowKey) {
+  return Math.max(0, Number(currentPickedRowCounts.get(rowKey)) || 0);
+}
+
+function isPickedRowComplete(rowKey, requiredCount) {
+  return getPickedRowCount(rowKey) >= requiredCount;
+}
+
+function setPickProgressValue(progress, pickedCount, requiredCount) {
+  if (!progress) return;
+
+  progress.innerHTML = '';
+
+  const current = document.createElement('span');
+  current.className = 'pick-list-pick-progress-current';
+  current.textContent = String(pickedCount);
+
+  const divider = document.createElement('span');
+  divider.className = 'pick-list-pick-progress-divider';
+  divider.textContent = '/';
+
+  const target = document.createElement('span');
+  target.className = 'pick-list-pick-progress-target';
+  target.textContent = String(requiredCount);
+
+  progress.appendChild(current);
+  progress.appendChild(divider);
+  progress.appendChild(target);
+  progress.title = `Picked ${pickedCount} of ${requiredCount}`;
+}
+
+function syncPickedRowState(rowKey, item, checkbox, progress, requiredCount) {
+  const pickedCount = Math.min(getPickedRowCount(rowKey), requiredCount);
+  const isComplete = pickedCount >= requiredCount;
+
+  item.classList.toggle('pick-list-item--picked', isComplete);
+  item.classList.toggle('pick-list-item--picked-partial', pickedCount > 0 && !isComplete);
 
   if (checkbox) {
-    checkbox.checked = isPicked;
+    checkbox.checked = isComplete;
   }
+
+  setPickProgressValue(progress, pickedCount, requiredCount);
 }
 
-function togglePickedRowState(rowKey, item, checkbox) {
-  setPickedRowState(rowKey, item, checkbox, !currentPickedRowKeys.has(rowKey));
+function setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, nextCount) {
+  const normalizedCount = Math.max(0, Math.min(requiredCount, Number(nextCount) || 0));
+
+  if (normalizedCount > 0) {
+    currentPickedRowCounts.set(rowKey, normalizedCount);
+  } else {
+    currentPickedRowCounts.delete(rowKey);
+  }
+
+  syncPickedRowState(rowKey, item, checkbox, progress, requiredCount);
 }
 
-function createPickedCheckbox(rowKey, sku, item) {
+function togglePickedRowState(rowKey, item, checkbox, progress, requiredCount) {
+  const currentCount = getPickedRowCount(rowKey);
+  const nextCount = currentCount >= requiredCount ? 0 : currentCount + 1;
+  setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, nextCount);
+}
+
+function createPickedCheckbox(rowKey, sku, item, progress, requiredCount) {
   const label = document.createElement('label');
   label.className = 'pick-list-picked-toggle';
   label.title = `Mark ${normalizeDisplaySku(sku)} as picked`;
 
   const checkbox = document.createElement('input');
   checkbox.type = 'checkbox';
-  checkbox.checked = currentPickedRowKeys.has(rowKey);
+  checkbox.checked = isPickedRowComplete(rowKey, requiredCount);
   checkbox.setAttribute('aria-label', `Mark ${normalizeDisplaySku(sku)} as picked`);
   checkbox.addEventListener('click', (event) => {
     event.stopPropagation();
-    setPickedRowState(rowKey, item, checkbox, checkbox.checked);
+    setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, checkbox.checked ? requiredCount : 0);
   });
 
   label.appendChild(checkbox);
@@ -864,27 +941,36 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
     const item = document.createElement('li');
     item.className = 'pick-list-item';
     const rowKey = getPickRowKey(row, sectionTitle, rowIndex);
+    const requiredPickCount = getPickRowRequiredCount(row);
+    const noteText = String(row.note || '').trim();
+    const noteIndicatesQuantity = getNoteQuantityMultiplier(noteText) > 1;
+    const shouldReplaceNoteWithProgress = pickerModeEnabled && noteIndicatesQuantity && requiredPickCount > 1;
     const isAwaitingParts = isAwaitingPartsSku(row.sku);
     const awaitingPartsQty = getAwaitingPartsQty(row.sku);
     if (isAwaitingParts) {
       item.classList.add('pick-list-item--awaiting-parts');
     }
-    if (pickerModeEnabled && currentPickedRowKeys.has(rowKey)) {
-      item.classList.add('pick-list-item--picked');
-    }
 
     let pickedCheckbox = null;
+    let pickProgress = null;
     const main = document.createElement('div');
     main.className = 'pick-list-cell pick-list-col-sku pick-list-item-main';
     if (pickerModeEnabled) {
       item.classList.add('pick-list-item--pickable');
-      const pickedControl = createPickedCheckbox(rowKey, row.sku, item);
+      if (requiredPickCount > 1) {
+        pickProgress = document.createElement('span');
+        pickProgress.className = 'pick-list-pick-progress';
+      }
+      const pickedControl = createPickedCheckbox(rowKey, row.sku, item, pickProgress, requiredPickCount);
       pickedCheckbox = pickedControl.checkbox;
       main.appendChild(pickedControl.label);
     }
     const skuText = document.createElement('span');
     skuText.textContent = Number(row.quantity) > 1 ? `${row.sku} x${row.quantity}` : `${row.sku}`;
     main.appendChild(skuText);
+    if (pickProgress && !shouldReplaceNoteWithProgress) {
+      main.appendChild(pickProgress);
+    }
     if (isAwaitingParts) {
       const badge = document.createElement('span');
       badge.className = 'pick-list-awaiting-parts-badge';
@@ -896,7 +982,12 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
 
     const note = document.createElement('div');
     note.className = 'pick-list-cell pick-list-col-note pick-list-item-note';
-    note.textContent = String(row.note || '').trim();
+    if (shouldReplaceNoteWithProgress) {
+      note.classList.add('pick-list-item-note--pick-progress');
+      note.appendChild(pickProgress);
+    } else {
+      note.textContent = noteText;
+    }
 
     const action = document.createElement('div');
     action.className = 'pick-list-cell pick-list-col-action pick-list-item-action';
@@ -908,11 +999,12 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
     item.appendChild(action);
 
     if (pickerModeEnabled) {
+      syncPickedRowState(rowKey, item, pickedCheckbox, pickProgress, requiredPickCount);
       item.addEventListener('click', (event) => {
         if (event.target.closest('.pick-list-item-action, .pick-list-picked-toggle')) {
           return;
         }
-        togglePickedRowState(rowKey, item, pickedCheckbox);
+        togglePickedRowState(rowKey, item, pickedCheckbox, pickProgress, requiredPickCount);
       });
     }
 
@@ -1190,10 +1282,13 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const normalizedSku = normalizeVerifyCode(sku);
     const normalizedUpc = normalizeVerifyCode(upc);
     const lineStableId = String(item?.id || '').trim() || `ORDER_ITEM_${index + 1}`;
+    const isWholesaleBundle = wholesaleModeEnabled && Boolean(bundleGroupId);
     // Keep no-SKU rows separate even if UPC matches, so duplicate UPC items
     // are verified one item at a time.
     const rowBaseKey = normalizedSku ? `SKU:${normalizedSku}` : `LINE:${lineStableId}`;
-    const key = `${bundleGroupId ? `bundle:${bundleGroupId}` : 'ungrouped'}::${rowBaseKey}`;
+    const key = isWholesaleBundle
+      ? `bundle:${bundleGroupId}`
+      : `${bundleGroupId ? `bundle:${bundleGroupId}` : 'ungrouped'}::${rowBaseKey}`;
 
     if (bundleGroupId && !bundleOrder.has(bundleGroupId)) {
       bundleOrder.set(bundleGroupId, index);
@@ -1202,12 +1297,17 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     if (!grouped.has(key)) {
       grouped.set(key, {
         key,
-        sku: sku || '(No SKU)',
-        upc,
-        productName: productName || sku || upc || `Item ${index + 1}`,
+        sku: isWholesaleBundle ? 'Bundle' : (sku || '(No SKU)'),
+        upc: isWholesaleBundle ? '' : upc,
+        productName: isWholesaleBundle
+          ? (bundleGroupTitle ? `Bundle: ${bundleGroupTitle}` : 'Bundle adapter')
+          : (productName || sku || upc || `Item ${index + 1}`),
         bundleGroupId,
         bundleGroupTitle,
         bundleGroupQuantity,
+        isWholesaleBundle,
+        bundleItemCount: 0,
+        bundleParts: [],
         sortIndex: index,
         requiredQty: 0,
         scannedQty: 0,
@@ -1217,6 +1317,20 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
 
     const row = grouped.get(key);
     row.sortIndex = Math.min(row.sortIndex, index);
+    if (isWholesaleBundle) {
+      row.bundleItemCount += 1;
+      row.bundleParts.push({
+        sku: sku || '(No SKU)',
+        productName: productName || sku || upc || `Item ${index + 1}`,
+        quantity: qty,
+      });
+      row.requiredQty = Math.max(
+        row.requiredQty,
+        Math.max(1, Number(bundleGroupQuantity) || 1)
+      );
+      return;
+    }
+
     row.requiredQty += qty;
     expandVerifyCodeVariants(normalizedSku).forEach((code) => row.codes.add(code));
     expandVerifyCodeVariants(normalizedUpc).forEach((code) => row.codes.add(code));
@@ -1290,10 +1404,13 @@ function getVerificationIncrementLabel(row, complete) {
   if (complete) {
     return wholesaleModeEnabled ? 'Built' : 'Complete';
   }
+  if (wholesaleModeEnabled) {
+    return 'Build +1';
+  }
   if (!row?.codes || row.codes.size <= 0) {
     return 'Mark +1';
   }
-  return wholesaleModeEnabled ? 'Build +1' : 'Scan +1';
+  return 'Scan +1';
 }
 
 function renderVerifyOrderCards() {
@@ -1324,6 +1441,7 @@ function renderVerifyOrderCards() {
   const list = document.createElement('div');
   list.className = 'pick-verify-list';
 
+  const shouldRenderBundleMarkers = !wholesaleModeEnabled;
   let previousBundleGroupId = '';
   verifyItems.forEach((row, index) => {
     const bundleGroupId = String(row.bundleGroupId || '').trim();
@@ -1331,7 +1449,7 @@ function renderVerifyOrderCards() {
     const bundleGroupQty = Number(row.bundleGroupQuantity) || null;
     const hasFollowingItem = index < verifyItems.length - 1;
     const nextBundleGroupId = String(verifyItems[index + 1]?.bundleGroupId || '').trim();
-    if (bundleGroupId && bundleGroupId !== previousBundleGroupId) {
+    if (shouldRenderBundleMarkers && bundleGroupId && bundleGroupId !== previousBundleGroupId) {
       const bundleMarker = document.createElement('div');
       bundleMarker.className = 'pick-verify-bundle-marker';
       const bundleLabel = bundleGroupTitle ? `Bundle: ${bundleGroupTitle}` : 'Bundle';
@@ -1342,6 +1460,9 @@ function renderVerifyOrderCards() {
     const complete = row.scannedQty >= row.requiredQty;
     const item = document.createElement('div');
     item.className = `pick-verify-item${complete ? ' is-complete' : ''}`;
+    if (row.isWholesaleBundle) {
+      item.classList.add('pick-verify-item--bundle-build');
+    }
     item.dataset.verifyKey = row.key;
 
     const info = document.createElement('div');
@@ -1351,7 +1472,13 @@ function renderVerifyOrderCards() {
     title.textContent = row.productName;
 
     const meta = document.createElement('p');
-    if (row.codes.size > 0) {
+    if (row.isWholesaleBundle) {
+      const bundleParts = [
+        row.requiredQty > 1 ? `${row.requiredQty} bundle adapters` : '1 bundle adapter',
+        row.bundleItemCount > 1 ? `${row.bundleItemCount} SKU lines` : '',
+      ].filter(Boolean);
+      meta.textContent = bundleParts.join(' | ');
+    } else if (row.codes.size > 0) {
       const labels = [];
       if (row.sku && row.sku !== '(No SKU)') labels.push(`SKU: ${row.sku}`);
       if (row.upc) labels.push(`UPC: ${row.upc}`);
@@ -1364,6 +1491,24 @@ function renderVerifyOrderCards() {
 
     info.appendChild(title);
     info.appendChild(meta);
+    if (row.isWholesaleBundle && Array.isArray(row.bundleParts) && row.bundleParts.length > 0) {
+      const partsList = document.createElement('ul');
+      partsList.className = 'pick-verify-bundle-parts';
+
+      row.bundleParts.forEach((part) => {
+        const partItem = document.createElement('li');
+        const partSku = String(part?.sku || '').trim();
+        const partName = String(part?.productName || '').trim();
+        const partQty = Math.max(1, Number(part?.quantity) || 1);
+        const label = [partSku, partName && partName !== partSku ? partName : '']
+          .filter(Boolean)
+          .join(' - ');
+        partItem.textContent = partQty > 1 ? `${label} x${partQty}` : label;
+        partsList.appendChild(partItem);
+      });
+
+      info.appendChild(partsList);
+    }
 
     const progress = document.createElement('p');
     progress.className = 'pick-verify-item-progress';
@@ -1402,7 +1547,7 @@ function renderVerifyOrderCards() {
     item.appendChild(actions);
     list.appendChild(item);
 
-    if (bundleGroupId && bundleGroupId !== nextBundleGroupId && hasFollowingItem) {
+    if (shouldRenderBundleMarkers && bundleGroupId && bundleGroupId !== nextBundleGroupId && hasFollowingItem) {
       const bundleEndDivider = document.createElement('div');
       bundleEndDivider.className = 'pick-verify-bundle-end-divider';
       bundleEndDivider.textContent = 'End Bundle';
@@ -2066,7 +2211,7 @@ async function fetchPickList(barcodeInput) {
     }
 
     if (normalizeDisplaySku(data.barcode) !== normalizeDisplaySku(currentOrderBarcode)) {
-      currentPickedRowKeys = new Set();
+      currentPickedRowCounts = new Map();
     }
 
     currentOrderBarcode = data.barcode;
