@@ -2377,6 +2377,10 @@ router.post('/api/pick-list', async (req, res) => {
       shop,
       barcode: normalizedBarcode,
     });
+    const pickedRowCounts = sessionsStore.getPickListPickedProgress({
+      shop,
+      barcode: normalizedBarcode,
+    });
     const trackerInfo = await persistOrderTrackerSnapshot({
       req,
       client,
@@ -2420,12 +2424,49 @@ router.post('/api/pick-list', async (req, res) => {
       trackerToken: trackerInfo.trackerToken,
       trackerUrl: trackerInfo.trackerUrl,
       wholesaleProgressByItemKey,
+      pickedRowCounts,
       orderItems: orderLineItems,
       lineItems: pickListResult.lineItems,
       totals: pickListResult.totals,
     });
   } catch (err) {
     console.error('Error in /api/pick-list:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/pick-list-picked-progress', async (req, res) => {
+  try {
+    const { barcode, pickedRowCounts } = req.body || {};
+    const normalizedBarcode = normalizeScanBarcode(barcode);
+
+    if (!normalizedBarcode) {
+      return res.status(400).json({ success: false, error: 'Missing barcode' });
+    }
+
+    if (!pickedRowCounts || typeof pickedRowCounts !== 'object' || Array.isArray(pickedRowCounts)) {
+      return res.status(400).json({ success: false, error: 'Missing pickedRowCounts object' });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    sessionsStore.setPickListPickedProgress({
+      shop,
+      barcode: normalizedBarcode,
+      pickedRowCounts,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /api/pick-list-picked-progress:', err);
     return res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
 });

@@ -58,6 +58,22 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE TABLE IF NOT EXISTS pick_list_picked_progress (
+    shop TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    rowKey TEXT NOT NULL,
+    pickedCount INTEGER NOT NULL,
+    updatedAt TEXT NOT NULL,
+    PRIMARY KEY (shop, barcode, rowKey)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_pick_list_picked_progress_shop_barcode
+  ON pick_list_picked_progress (shop, barcode)
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS wholesale_build_events (
     shop TEXT NOT NULL,
     barcode TEXT NOT NULL,
@@ -329,6 +345,59 @@ module.exports = {
     );
 
     return Number(result?.changes || 0) > 0;
+  },
+
+  getPickListPickedProgress({ shop, barcode }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return {};
+
+    const rows = db.prepare(`
+      SELECT rowKey, pickedCount
+      FROM pick_list_picked_progress
+      WHERE shop = ? AND barcode = ?
+    `).all(String(shop), normalizedBarcode);
+
+    const pickedRowCounts = {};
+    rows.forEach((row) => {
+      if (!row?.rowKey) return;
+      const pickedCount = Math.max(0, Number(row.pickedCount) || 0);
+      if (pickedCount <= 0) return;
+      pickedRowCounts[String(row.rowKey)] = pickedCount;
+    });
+
+    return pickedRowCounts;
+  },
+
+  setPickListPickedProgress({ shop, barcode, pickedRowCounts }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return;
+
+    const entries = Object.entries(pickedRowCounts || {})
+      .map(([rowKey, pickedCount]) => ({
+        rowKey: String(rowKey || '').trim(),
+        pickedCount: Math.max(0, Math.floor(Number(pickedCount) || 0)),
+      }))
+      .filter((entry) => entry.rowKey && entry.pickedCount > 0);
+
+    const nowIso = new Date().toISOString();
+    const deleteStmt = db.prepare(`
+      DELETE FROM pick_list_picked_progress
+      WHERE shop = ? AND barcode = ?
+    `);
+    const insertStmt = db.prepare(`
+      INSERT OR REPLACE INTO pick_list_picked_progress
+      (shop, barcode, rowKey, pickedCount, updatedAt)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    const tx = db.transaction(() => {
+      deleteStmt.run(String(shop), normalizedBarcode);
+      entries.forEach((entry) => {
+        insertStmt.run(String(shop), normalizedBarcode, entry.rowKey, entry.pickedCount, nowIso);
+      });
+    });
+
+    tx();
   },
 
   setWholesaleBuildProgress({ shop, barcode, progressByItemKey }) {

@@ -32,6 +32,9 @@ let verifyAudioContext = null;
 let wholesaleSaveTimeoutId = null;
 let wholesaleSaveInFlight = false;
 let wholesaleSaveQueued = false;
+let pickedRowsSaveTimeoutId = null;
+let pickedRowsSaveInFlight = false;
+let pickedRowsSaveQueued = false;
 
 const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
@@ -267,6 +270,12 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentAwaitingPartsSkuMap = new Map();
   currentAwaitingPartsCatalog = new Map();
   currentPickedRowCounts = new Map();
+  if (pickedRowsSaveTimeoutId) {
+    clearTimeout(pickedRowsSaveTimeoutId);
+    pickedRowsSaveTimeoutId = null;
+  }
+  pickedRowsSaveInFlight = false;
+  pickedRowsSaveQueued = false;
   pendingActionReminderTarget = null;
   suppressNextActionReminderUnload = false;
   verifyItems = [];
@@ -1021,6 +1030,100 @@ function getPickRowRequiredCount(row) {
   return Math.max(1, orderedQuantity * noteMultiplier);
 }
 
+function getPickedRowCountsSnapshot() {
+  const snapshot = {};
+  currentPickedRowCounts.forEach((count, rowKey) => {
+    const pickedCount = Math.max(0, Math.floor(Number(count) || 0));
+    if (!rowKey || pickedCount <= 0) return;
+    snapshot[rowKey] = pickedCount;
+  });
+  return snapshot;
+}
+
+function setPickedRowCountsFromPayload(pickedRowCounts) {
+  currentPickedRowCounts = new Map();
+  if (!pickedRowCounts || typeof pickedRowCounts !== 'object' || Array.isArray(pickedRowCounts)) {
+    return;
+  }
+
+  Object.entries(pickedRowCounts).forEach(([rowKey, count]) => {
+    const normalizedKey = String(rowKey || '').trim();
+    const pickedCount = Math.max(0, Math.floor(Number(count) || 0));
+    if (!normalizedKey || pickedCount <= 0) return;
+    currentPickedRowCounts.set(normalizedKey, pickedCount);
+  });
+}
+
+async function flushPickedRowCountsSave({ force = false } = {}) {
+  if (!hasRenderedPickList || !currentOrderBarcode) return;
+  if (!force && !pickerModeEnabled) return;
+
+  if (pickedRowsSaveInFlight) {
+    pickedRowsSaveQueued = true;
+    return;
+  }
+
+  pickedRowsSaveInFlight = true;
+  pickedRowsSaveQueued = false;
+
+  try {
+    const response = await fetch('/api/pick-list-picked-progress', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        barcode: currentOrderBarcode,
+        pickedRowCounts: getPickedRowCountsSnapshot(),
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to save picked rows');
+    }
+  } catch (err) {
+    console.error('Error saving picked rows:', err);
+  } finally {
+    pickedRowsSaveInFlight = false;
+    if (pickedRowsSaveQueued) {
+      pickedRowsSaveQueued = false;
+      flushPickedRowCountsSave({ force });
+    }
+  }
+}
+
+function schedulePickedRowCountsSave() {
+  if (!hasRenderedPickList || !currentOrderBarcode || !pickerModeEnabled) return;
+
+  if (pickedRowsSaveTimeoutId) {
+    clearTimeout(pickedRowsSaveTimeoutId);
+  }
+
+  pickedRowsSaveTimeoutId = setTimeout(() => {
+    pickedRowsSaveTimeoutId = null;
+    flushPickedRowCountsSave();
+  }, 150);
+}
+
+async function flushPendingPickedRowCountsSave() {
+  if (!pickedRowsSaveTimeoutId) return;
+
+  clearTimeout(pickedRowsSaveTimeoutId);
+  pickedRowsSaveTimeoutId = null;
+  await flushPickedRowCountsSave({ force: true });
+}
+
+function sendPickedRowCountsBeacon() {
+  if (!hasRenderedPickList || !currentOrderBarcode) return;
+  if (!navigator.sendBeacon) return;
+
+  const payload = JSON.stringify({
+    barcode: currentOrderBarcode,
+    pickedRowCounts: getPickedRowCountsSnapshot(),
+  });
+  const blob = new Blob([payload], { type: 'application/json' });
+  navigator.sendBeacon('/api/pick-list-picked-progress', blob);
+}
+
 function getPickedRowCount(rowKey) {
   return Math.max(0, Number(currentPickedRowCounts.get(rowKey)) || 0);
 }
@@ -1076,6 +1179,7 @@ function setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, next
   }
 
   syncPickedRowState(rowKey, item, checkbox, progress, requiredCount);
+  schedulePickedRowCountsSave();
 }
 
 function togglePickedRowState(rowKey, item, checkbox, progress, requiredCount) {
@@ -1325,6 +1429,41 @@ function renderLineCards(lineItems) {
       previousBundleGroupId = '';
     }
   });
+}
+
+function getRenderedPickerRowKeySet(lineItems = lastRenderedLineItems) {
+  const rowKeys = new Set();
+
+  (lineItems || []).forEach((line) => {
+    [
+      ['Must Pick', line?.mustPick],
+      ['Needs Review', line?.reviewItems],
+    ].forEach(([sectionTitle, rows]) => {
+      if (!Array.isArray(rows) || rows.length === 0) return;
+      [...rows].sort(comparePickLocation).forEach((row, rowIndex) => {
+        rowKeys.add(getPickRowKey(row, sectionTitle, rowIndex));
+      });
+    });
+  });
+
+  return rowKeys;
+}
+
+function prunePickedRowCountsToRenderedRows() {
+  if (!pickerModeEnabled || !hasRenderedPickList || !currentOrderBarcode) return;
+
+  const renderedKeys = getRenderedPickerRowKeySet();
+  let changed = false;
+
+  Array.from(currentPickedRowCounts.keys()).forEach((rowKey) => {
+    if (renderedKeys.has(rowKey)) return;
+    currentPickedRowCounts.delete(rowKey);
+    changed = true;
+  });
+
+  if (changed) {
+    schedulePickedRowCountsSave();
+  }
 }
 
 function normalizeVerifyCode(value) {
@@ -1776,6 +1915,7 @@ function renderCurrentOrderSection() {
     renderVerifyOrderCards();
     return;
   }
+  prunePickedRowCountsToRenderedRows();
   renderLineCards(lastRenderedLineItems);
 }
 
@@ -2415,6 +2555,8 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     return;
   }
 
+  await flushPendingPickedRowCountsSave();
+
   setLoading(true);
   setStatus('Loading order and building pick list...', 'info');
 
@@ -2445,10 +2587,6 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
       throw new Error(data.error || 'Failed to load pick list');
     }
 
-    if (normalizeDisplaySku(data.barcode) !== normalizeDisplaySku(currentOrderBarcode)) {
-      currentPickedRowCounts = new Map();
-    }
-
     currentOrderBarcode = data.barcode;
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
@@ -2475,8 +2613,10 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
       data.wholesaleProgressByItemKey && typeof data.wholesaleProgressByItemKey === 'object'
         ? data.wholesaleProgressByItemKey
         : {};
+    setPickedRowCountsFromPayload(data.pickedRowCounts);
     buildVerifyState(lastOrderItems, wholesaleModeEnabled ? lastWholesaleProgressByItemKey : null);
     hasRenderedPickList = true;
+    prunePickedRowCountsToRenderedRows();
     renderCurrentOrderSection();
     renderOrderTimeline();
 
@@ -2583,6 +2723,7 @@ function setupHidScan() {
 
 function registerOrderActionReminderNavigationGuards() {
   window.addEventListener('beforeunload', (event) => {
+    sendPickedRowCountsBeacon();
     if (suppressNextActionReminderUnload) return;
     if (!shouldShowOrderActionReminder()) return;
 
