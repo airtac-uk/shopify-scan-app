@@ -64,6 +64,14 @@ function focusBarcodeInput({ selectAll = false } = {}) {
   }
 }
 
+function scrollPickListToTop() {
+  window.scrollTo({
+    top: 0,
+    left: 0,
+    behavior: 'smooth',
+  });
+}
+
 function getInitialOrderLookupValue() {
   const params = new URLSearchParams(window.location.search);
   return String(params.get('order') || params.get('barcode') || '').trim().toUpperCase();
@@ -2644,6 +2652,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
   }
 
   await flushPendingPickedRowCountsSave();
+  scrollPickListToTop();
 
   setLoading(true);
   setStatus('Loading order and building pick list...', 'info');

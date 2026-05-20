@@ -1,6 +1,8 @@
 const PRINT_QUEUE_POLL_MS = 30000;
 const PRINT_CATALOG_RESULT_LIMIT = 80;
 const PRINT_CATALOG_FEEDBACK_MS = 3500;
+const STL_PREVIEW_CACHE_LIMIT = 24;
+const PREFORM_DOWNLOAD_ACTIONS_STORAGE_KEY = 'printQueue.latestPreformDownloadActions';
 
 let printQueueStages = [
   { key: 'needs_printed', label: 'Needs Printed' },
@@ -15,6 +17,36 @@ let printCatalogAddedFeedback = new Map();
 let printQueueLoading = false;
 let printQueuePollId = null;
 let draggedPrintItemId = '';
+let pendingPrintDeleteItemId = '';
+let expandedPrintChildItemIds = new Set();
+let activePutAwayItemId = '';
+let stlPreviewModelCache = new Map();
+let activeStlPreviewRenderers = [];
+let stlPreviewLibraryPromise = null;
+let stlPreviewRenderSession = 0;
+let latestPreformBuildDownloadActions = loadLatestPreformBuildDownloadActions();
+
+function loadLatestPreformBuildDownloadActions() {
+  try {
+    const raw = window.localStorage?.getItem(PREFORM_DOWNLOAD_ACTIONS_STORAGE_KEY);
+    const parsed = raw ? JSON.parse(raw) : [];
+    return Array.isArray(parsed) ? parsed : [];
+  } catch (err) {
+    return [];
+  }
+}
+
+function saveLatestPreformBuildDownloadActions(actions) {
+  latestPreformBuildDownloadActions = Array.isArray(actions) ? actions : [];
+  try {
+    window.localStorage?.setItem(
+      PREFORM_DOWNLOAD_ACTIONS_STORAGE_KEY,
+      JSON.stringify(latestPreformBuildDownloadActions)
+    );
+  } catch (err) {
+    // The links still stay visible for this page session if localStorage is unavailable.
+  }
+}
 
 function escapeHtml(value) {
   return String(value || '')
@@ -43,11 +75,99 @@ function formatTimestamp(value) {
   }).format(date);
 }
 
-function setStatus(message, type = 'info') {
+function renderStatusAction(action) {
+  const href = String(action?.href || '').trim();
+  const label = String(action?.label || '').trim();
+  if (!href || !label) return '';
+
+  return `
+    <a
+      class="print-queue-status-action"
+      href="${escapeHtmlAttribute(href)}"
+      target="_blank"
+      rel="noopener"
+    >
+      ${escapeHtml(label)}
+    </a>
+  `;
+}
+
+function mergeStatusActions(actions = []) {
+  const merged = [];
+  const seen = new Set();
+  [...actions, ...latestPreformBuildDownloadActions].forEach((action) => {
+    const href = String(action?.href || '').trim();
+    const label = String(action?.label || '').trim();
+    if (!href || !label) return;
+
+    const key = `${href}|${label}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push({ href, label });
+  });
+  return merged;
+}
+
+function setStatus(message, type = 'info', actions = []) {
   const el = document.getElementById('printQueueStatus');
-  if (!el) return;
-  el.textContent = message || '';
-  el.dataset.type = type;
+  if (el) {
+    el.textContent = message || '';
+    el.dataset.type = type;
+  }
+
+  const actionsEl = document.getElementById('printQueueStatusActions');
+  if (actionsEl) {
+    const normalizedActions = mergeStatusActions(Array.isArray(actions) ? actions : []);
+    actionsEl.innerHTML = normalizedActions.map(renderStatusAction).filter(Boolean).join('');
+  }
+}
+
+function patchWebGlPrecisionFormat(context) {
+  if (!context || typeof context.getShaderPrecisionFormat !== 'function') return context;
+
+  const originalGetShaderPrecisionFormat = context.getShaderPrecisionFormat.bind(context);
+  const patchedGetShaderPrecisionFormat = (shaderType, precisionType) => (
+    originalGetShaderPrecisionFormat(shaderType, precisionType) || {
+      rangeMin: 127,
+      rangeMax: 127,
+      precision: 23,
+    }
+  );
+  try {
+    context.getShaderPrecisionFormat = patchedGetShaderPrecisionFormat;
+    if (!context.getShaderPrecisionFormat(context.VERTEX_SHADER, context.HIGH_FLOAT)) {
+      Object.defineProperty(context, 'getShaderPrecisionFormat', {
+        value: patchedGetShaderPrecisionFormat,
+      });
+    }
+  } catch (err) {
+    return context;
+  }
+
+  return context;
+}
+
+function createSafeWebGlRenderer(THREE, canvas, options = {}) {
+  const contextAttributes = {
+    antialias: Boolean(options.antialias),
+    alpha: Boolean(options.alpha),
+    powerPreference: options.powerPreference || 'high-performance',
+  };
+  const context = patchWebGlPrecisionFormat(
+    canvas.getContext('webgl2', contextAttributes)
+      || canvas.getContext('webgl', contextAttributes)
+      || canvas.getContext('experimental-webgl', contextAttributes)
+  );
+  if (!context) {
+    throw new Error('WebGL is not available in this browser.');
+  }
+
+  return new THREE.WebGLRenderer({
+    ...options,
+    canvas,
+    context,
+    precision: options.precision || 'mediump',
+  });
 }
 
 function setLoading(isLoading) {
@@ -103,6 +223,38 @@ function getCatalogLocationForSku(sku) {
 
   const catalogItem = printCatalogItems.find((item) => normalizeSearchText(item?.sku) === normalizedSku);
   return String(catalogItem?.location || '').trim();
+}
+
+function renderStlDownloadLink(sku, label = 'STL') {
+  const normalizedSku = String(sku || '').trim().toUpperCase();
+  if (!normalizedSku) return '';
+
+  return `
+    <a
+      class="print-queue-stl-link"
+      href="/api/print-queue/stl/${encodeURIComponent(normalizedSku)}/download"
+      target="_blank"
+      rel="noopener"
+      draggable="false"
+      title="Download ${escapeHtmlAttribute(normalizedSku)} STL/3MF from Google Drive"
+    >${escapeHtml(label)}</a>
+  `;
+}
+
+function renderQcPdfLink(sku, label = 'QC PDF') {
+  const normalizedSku = String(sku || '').trim().toUpperCase();
+  if (!normalizedSku) return '';
+
+  return `
+    <a
+      class="print-queue-qc-link"
+      href="/api/print-queue/qc/${encodeURIComponent(normalizedSku)}/pdf"
+      target="_blank"
+      rel="noopener"
+      draggable="false"
+      title="Open ${escapeHtmlAttribute(normalizedSku)} QC PDF from Google Drive"
+    >${escapeHtml(label)}</a>
+  `;
 }
 
 function normalizeSearchText(value) {
@@ -364,10 +516,380 @@ async function readJsonResponse(response, fallbackMessage) {
   }
 
   if (!response.ok || !data?.success) {
-    throw new Error(data?.error || fallbackMessage);
+    const error = new Error(data?.error || fallbackMessage);
+    error.data = data;
+    throw error;
   }
 
   return data;
+}
+
+function getPrintPartLocation(sku, explicitLocation) {
+  return String(explicitLocation || getCatalogLocationForSku(sku)).trim();
+}
+
+function getPutAwayPartsForItem(item) {
+  const isCustom = item?.sourceType === 'custom';
+  const childItems = Array.isArray(item?.childItems) ? item.childItems : [];
+
+  if (isCustom) {
+    return [{
+      key: `${item.id}:custom`,
+      role: 'Custom',
+      sku: '',
+      title: String(item.customFileName || item.title || 'Custom print file').trim(),
+      typeRaw: 'CUSTOM',
+      quantity: Math.max(1, Number(item.quantity) || 1),
+      location: String(item.location || '').trim(),
+      customFileUrl: String(item.customFileUrl || '').trim(),
+    }];
+  }
+
+  const parts = [];
+  const parentSku = String(item?.sku || '').trim();
+  if (parentSku) {
+    parts.push({
+      key: `${item.id}:parent`,
+      role: 'Parent',
+      sku: parentSku,
+      title: String(item.title || parentSku).trim(),
+      typeRaw: String(item.typeRaw || 'UNKNOWN').trim().toUpperCase(),
+      quantity: Math.max(1, Number(item.quantity) || 1),
+      location: getPrintPartLocation(parentSku, item.location),
+      customFileUrl: '',
+    });
+  }
+
+  childItems.forEach((childItem, index) => {
+    const childSku = String(childItem?.sku || '').trim();
+    if (!childSku) return;
+    parts.push({
+      key: `${item.id}:child:${index}`,
+      role: 'Sub SKU',
+      sku: childSku,
+      title: String(childItem.title || childSku).trim(),
+      typeRaw: String(childItem.typeRaw || 'UNKNOWN').trim().toUpperCase(),
+      quantity: Math.max(1, Number(childItem.quantity) || 1),
+      location: getPrintPartLocation(childSku, childItem.location),
+      customFileUrl: '',
+    });
+  });
+
+  return parts;
+}
+
+function renderPutAwayPart(part, index) {
+  const locationLabel = part.location || 'No location';
+  const skuLabel = part.sku || part.title;
+  const preview = part.sku
+    ? `
+        <div class="print-stl-preview" data-stl-preview-sku="${escapeHtmlAttribute(part.sku)}">
+          <canvas class="print-stl-preview__canvas" aria-label="STL preview for ${escapeHtmlAttribute(part.sku)}"></canvas>
+          <p class="print-stl-preview__status">Loading STL preview...</p>
+        </div>
+      `
+    : `
+        <div class="print-stl-preview print-stl-preview--empty">
+          <p class="print-stl-preview__status">No STL preview for custom files.</p>
+        </div>
+      `;
+  const fileLink = part.customFileUrl
+    ? `<a class="print-queue-file-link" href="${escapeHtmlAttribute(part.customFileUrl)}" target="_blank" rel="noopener">Open File</a>`
+    : '';
+  const stlLink = part.sku ? renderStlDownloadLink(part.sku, 'Download STL') : '';
+
+  return `
+    <article class="print-put-away-part">
+      <div class="print-put-away-part__body">
+        <div class="print-put-away-part__details">
+          <p class="print-put-away-part__index">${escapeHtml(index + 1)}</p>
+          <div>
+            <h4>${escapeHtml(skuLabel)}</h4>
+            ${part.title && part.title !== skuLabel ? `<p>${escapeHtml(part.title)}</p>` : ''}
+            <div class="print-put-away-part__meta">
+              <span>${escapeHtml(part.role)}</span>
+              <span>${escapeHtml(part.typeRaw || 'UNKNOWN')}</span>
+              <span>x${escapeHtml(part.quantity)}</span>
+            </div>
+          </div>
+        </div>
+        <div class="print-put-away-part__location">
+          <span>Location</span>
+          <strong>${escapeHtml(locationLabel)}</strong>
+        </div>
+        <div class="print-put-away-part__links">
+          ${fileLink}
+          ${stlLink}
+        </div>
+      </div>
+      ${preview}
+    </article>
+  `;
+}
+
+function destroyActiveStlPreviewRenderers() {
+  stlPreviewRenderSession += 1;
+  activeStlPreviewRenderers.forEach((renderer) => {
+    if (renderer && typeof renderer.destroy === 'function') {
+      renderer.destroy();
+    }
+  });
+  activeStlPreviewRenderers = [];
+}
+
+function isZipLikeBuffer(buffer) {
+  if (!buffer || buffer.byteLength < 4) return false;
+  const view = new Uint8Array(buffer, 0, 4);
+  return view[0] === 0x50 && view[1] === 0x4b;
+}
+
+function trimStlPreviewModelCache() {
+  while (stlPreviewModelCache.size > STL_PREVIEW_CACHE_LIMIT) {
+    const oldestKey = stlPreviewModelCache.keys().next().value;
+    if (!oldestKey) break;
+    Promise.resolve(stlPreviewModelCache.get(oldestKey))
+      .then((geometry) => {
+        if (geometry && typeof geometry.dispose === 'function') {
+          geometry.dispose();
+        }
+      })
+      .catch(() => {});
+    stlPreviewModelCache.delete(oldestKey);
+  }
+}
+
+async function loadStlPreviewLibrary() {
+  if (!stlPreviewLibraryPromise) {
+    stlPreviewLibraryPromise = Promise.all([
+      import('three'),
+      import('three/addons/loaders/STLLoader.js'),
+      import('three/addons/controls/OrbitControls.js'),
+    ]).then(([THREE, loaderModule, controlsModule]) => ({
+      THREE,
+      STLLoader: loaderModule.STLLoader,
+      OrbitControls: controlsModule.OrbitControls,
+    })).catch((err) => {
+      stlPreviewLibraryPromise = null;
+      throw new Error(`STL viewer failed to load: ${err.message || err}`);
+    });
+  }
+
+  return stlPreviewLibraryPromise;
+}
+
+async function loadStlPreviewModel(sku) {
+  const normalizedSku = String(sku || '').trim().toUpperCase();
+  if (!normalizedSku) {
+    throw new Error('Missing SKU');
+  }
+
+  if (!stlPreviewModelCache.has(normalizedSku)) {
+    const modelPromise = fetch(`/api/print-queue/stl/${encodeURIComponent(normalizedSku)}/download`, {
+      headers: { Accept: 'application/octet-stream' },
+    })
+      .then(async (response) => {
+        if (!response.ok) {
+          let message = `No STL preview found for ${normalizedSku}`;
+          try {
+            const errorData = await response.clone().json();
+            if (errorData?.error) message = errorData.error;
+          } catch (err) {
+            message = response.statusText || message;
+          }
+          throw new Error(message);
+        }
+        return response.arrayBuffer();
+      })
+      .then(async (buffer) => {
+        if (isZipLikeBuffer(buffer)) {
+          throw new Error('Preview unavailable for 3MF files.');
+        }
+        const { STLLoader } = await loadStlPreviewLibrary();
+        const geometry = new STLLoader().parse(buffer);
+        geometry.computeVertexNormals();
+        geometry.computeBoundingBox();
+        geometry.computeBoundingSphere();
+        return geometry;
+      })
+      .catch((err) => {
+        stlPreviewModelCache.delete(normalizedSku);
+        throw err;
+      });
+    stlPreviewModelCache.set(normalizedSku, modelPromise);
+    trimStlPreviewModelCache();
+  }
+
+  return stlPreviewModelCache.get(normalizedSku);
+}
+
+async function createStlPreviewRenderer(canvas, sourceGeometry) {
+  const { THREE, OrbitControls } = await loadStlPreviewLibrary();
+  const renderer = createSafeWebGlRenderer(THREE, canvas, {
+    antialias: true,
+    alpha: false,
+    powerPreference: 'high-performance',
+  });
+  renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+  renderer.setClearColor(0x09111a, 1);
+
+  const scene = new THREE.Scene();
+  const camera = new THREE.PerspectiveCamera(35, 1, 0.1, 10000);
+  const controls = new OrbitControls(camera, renderer.domElement);
+  controls.enableDamping = true;
+  controls.dampingFactor = 0.08;
+
+  const geometry = sourceGeometry.clone();
+  geometry.center();
+  geometry.computeVertexNormals();
+  geometry.computeBoundingSphere();
+
+  const material = new THREE.MeshStandardMaterial({
+    color: 0xd9e6ef,
+    roughness: 0.52,
+    metalness: 0.04,
+    flatShading: false,
+    side: THREE.DoubleSide,
+    transparent: false,
+    opacity: 1,
+  });
+  const mesh = new THREE.Mesh(geometry, material);
+  scene.add(mesh);
+
+  scene.add(new THREE.HemisphereLight(0xffffff, 0x263140, 1.85));
+  const keyLight = new THREE.DirectionalLight(0xffffff, 2.35);
+  keyLight.position.set(3.5, 4.5, 6);
+  scene.add(keyLight);
+  const fillLight = new THREE.DirectionalLight(0x9fd1ff, 0.92);
+  fillLight.position.set(-4, -2, 3);
+  scene.add(fillLight);
+
+  const radius = Math.max(geometry.boundingSphere?.radius || 1, 1);
+  camera.position.set(radius * 1.2, radius * 0.88, radius * 2.25);
+  camera.near = Math.max(radius / 100, 0.01);
+  camera.far = radius * 18;
+  camera.updateProjectionMatrix();
+  controls.target.set(0, 0, 0);
+  controls.update();
+
+  const resize = () => {
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(1, Math.floor(rect.width));
+    const height = Math.max(1, Math.floor(rect.height));
+    renderer.setSize(width, height, false);
+    camera.aspect = width / height;
+    camera.updateProjectionMatrix();
+  };
+  const resizeObserver = new ResizeObserver(resize);
+  resizeObserver.observe(canvas);
+  resize();
+
+  let animationFrameId = 0;
+  const renderFrame = () => {
+    animationFrameId = window.requestAnimationFrame(renderFrame);
+    controls.update();
+    renderer.render(scene, camera);
+  };
+  renderFrame();
+
+  return {
+    destroy() {
+      window.cancelAnimationFrame(animationFrameId);
+      resizeObserver.disconnect();
+      controls.dispose();
+      geometry.dispose();
+      material.dispose();
+      renderer.dispose();
+      renderer.forceContextLoss();
+    },
+  };
+}
+
+async function initStlPreviewElement(previewEl, sessionId) {
+  const sku = String(previewEl?.dataset?.stlPreviewSku || '').trim().toUpperCase();
+  const canvas = previewEl?.querySelector('canvas');
+  const statusEl = previewEl?.querySelector('.print-stl-preview__status');
+  if (!sku || !canvas) return;
+
+  try {
+    const model = await loadStlPreviewModel(sku);
+    if (!previewEl.isConnected || sessionId !== stlPreviewRenderSession) return;
+    canvas.hidden = false;
+    const renderer = await createStlPreviewRenderer(canvas, model);
+    if (sessionId !== stlPreviewRenderSession) {
+      if (renderer && typeof renderer.destroy === 'function') renderer.destroy();
+      return;
+    }
+    if (renderer) activeStlPreviewRenderers.push(renderer);
+    if (statusEl) {
+      statusEl.textContent = 'Solid STL preview. Drag to rotate, scroll to zoom.';
+    }
+  } catch (err) {
+    if (statusEl) {
+      statusEl.textContent = err.message || 'Preview unavailable.';
+      statusEl.dataset.type = 'error';
+    }
+    canvas.hidden = true;
+  }
+}
+
+function initPutAwayStlPreviews() {
+  destroyActiveStlPreviewRenderers();
+  const sessionId = stlPreviewRenderSession;
+  document.querySelectorAll('[data-stl-preview-sku]').forEach((previewEl) => {
+    initStlPreviewElement(previewEl, sessionId);
+  });
+}
+
+function openPutAwayReview(itemId) {
+  const normalizedId = Number(itemId);
+  const item = printQueueItems.find((queueItem) => Number(queueItem.id) === normalizedId);
+  if (!item) {
+    setStatus('Print job not found.', 'error');
+    return;
+  }
+
+  if (item.stageKey !== 'complete') {
+    setStatus('Only complete print jobs can be put away.', 'error');
+    return;
+  }
+
+  const parts = getPutAwayPartsForItem(item);
+  const modal = document.getElementById('printPutAwayModal');
+  const title = document.getElementById('printPutAwayTitle');
+  const summary = document.getElementById('printPutAwaySummary');
+  const partList = document.getElementById('printPutAwayParts');
+  if (!modal || !title || !summary || !partList) {
+    putAwayPrintItem(item.id);
+    return;
+  }
+
+  activePutAwayItemId = String(item.id);
+  title.textContent = `Put away ${getItemLabel(item)}`;
+  summary.textContent = `${parts.length} ${parts.length === 1 ? 'part' : 'parts'} to check before clearing this card.`;
+  partList.innerHTML = parts.length
+    ? parts.map(renderPutAwayPart).join('')
+    : '<p class="print-queue-empty">No parts found for this card.</p>';
+
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+  initPutAwayStlPreviews();
+}
+
+function closePutAwayReview() {
+  const modal = document.getElementById('printPutAwayModal');
+  if (modal) {
+    modal.classList.remove('is-open');
+    modal.setAttribute('aria-hidden', 'true');
+  }
+  activePutAwayItemId = '';
+  destroyActiveStlPreviewRenderers();
+}
+
+function confirmPutAwayReview() {
+  const itemId = activePutAwayItemId;
+  if (!itemId) return;
+  closePutAwayReview();
+  putAwayPrintItem(itemId);
 }
 
 function renderOverview() {
@@ -483,15 +1005,18 @@ function renderCatalog() {
                   <h3>${escapeHtml(item.sku)}</h3>
                   ${item.title ? `<p>${escapeHtml(item.title)}</p>` : ''}
                 </div>
-                <button
-                  type="button"
-                  class="print-catalog-add-btn${isRecentlyAdded ? ' is-added' : ''}"
-                  data-print-add-sku="${escapeHtmlAttribute(item.sku)}"
-                  title="${escapeHtmlAttribute(addTitle)}"
-                  ${isRecentlyAdded || printQueueLoading ? 'disabled' : ''}
-                >
-                  ${escapeHtml(addLabel)}
-                </button>
+                <div class="print-catalog-result__actions">
+                  ${renderStlDownloadLink(item.sku)}
+                  <button
+                    type="button"
+                    class="print-catalog-add-btn${isRecentlyAdded ? ' is-added' : ''}"
+                    data-print-add-sku="${escapeHtmlAttribute(item.sku)}"
+                    title="${escapeHtmlAttribute(addTitle)}"
+                    ${isRecentlyAdded || printQueueLoading ? 'disabled' : ''}
+                  >
+                    ${escapeHtml(addLabel)}
+                  </button>
+                </div>
               </div>
               <div class="print-catalog-result__meta">
                 <span>${escapeHtml(item.typeRaw || 'UNKNOWN')}</span>
@@ -512,6 +1037,11 @@ function renderCatalog() {
 function renderQueueCard(item) {
   const isCustom = item.sourceType === 'custom';
   const isComplete = item.stageKey === 'complete';
+  const isNeedsPrinted = item.stageKey === 'needs_printed';
+  const isPostDye = item.stageKey === 'post_dye';
+  const isDeletePending = String(pendingPrintDeleteItemId) === String(item.id);
+  const itemId = String(item.id);
+  const isChildrenExpanded = expandedPrintChildItemIds.has(itemId);
   const rootSku = String(item.rootSku || '').trim();
   const sku = String(item.sku || '').trim();
   const childItems = Array.isArray(item.childItems) ? item.childItems : [];
@@ -532,6 +1062,12 @@ function renderQueueCard(item) {
   const fileLink = isCustom && item.customFileUrl
     ? `<a class="print-queue-file-link" href="${escapeHtmlAttribute(item.customFileUrl)}" target="_blank" rel="noopener">Open File</a>`
     : '';
+  const stlLink = isNeedsPrinted && !isCustom && sku
+    ? renderStlDownloadLink(sku, childItems.length > 0 ? 'Parent STL' : 'Download STL')
+    : '';
+  const qcPdfLink = isPostDye && !isCustom && sku
+    ? renderQcPdfLink(sku)
+    : '';
   const putAwayButton = isComplete
     ? `
         <button
@@ -543,14 +1079,60 @@ function renderQueueCard(item) {
         </button>
       `
     : '';
+  const deleteButton = `
+    <button
+      type="button"
+      class="print-queue-delete-btn"
+      data-print-delete-id="${escapeHtmlAttribute(item.id)}"
+      draggable="false"
+      title="Remove this print card"
+      aria-label="Remove ${escapeHtmlAttribute(getItemLabel(item))}"
+    >
+      &times;
+    </button>
+  `;
+  const deleteConfirm = isDeletePending
+    ? `
+        <div class="print-queue-card__remove-confirm">
+          <button
+            type="button"
+            class="print-queue-remove-confirm-btn"
+            data-print-delete-confirm-id="${escapeHtmlAttribute(item.id)}"
+            draggable="false"
+          >
+            Delete
+          </button>
+          <button
+            type="button"
+            class="print-queue-remove-cancel-btn"
+            data-print-delete-cancel-id="${escapeHtmlAttribute(item.id)}"
+            draggable="false"
+          >
+            Cancel
+          </button>
+        </div>
+      `
+    : '';
   const childRows = childItems.length > 0
     ? `
-        <div class="print-queue-card__children">
-          <div class="print-queue-card__children-head">
-            <span>Build Parts</span>
-            <strong>${escapeHtml(childItems.length + 1)}</strong>
-          </div>
-          <div class="print-queue-card__child-list">
+        <div class="print-queue-card__children${isChildrenExpanded ? ' is-expanded' : ''}">
+          <button
+            type="button"
+            class="print-queue-card__children-toggle"
+            data-print-children-toggle-id="${escapeHtmlAttribute(item.id)}"
+            aria-expanded="${isChildrenExpanded ? 'true' : 'false'}"
+            aria-controls="printQueueChildren-${escapeHtmlAttribute(item.id)}"
+            draggable="false"
+          >
+            <span class="print-queue-card__children-arrow" aria-hidden="true">&gt;</span>
+            <span>Sub SKUs</span>
+            <strong>${escapeHtml(childItems.length)}</strong>
+          </button>
+          <div
+            id="printQueueChildren-${escapeHtmlAttribute(item.id)}"
+            class="print-queue-card__child-list"
+            ${isChildrenExpanded ? '' : 'hidden'}
+          >
             ${childItems.map((childItem) => {
               const childLocation = String(childItem.location || getCatalogLocationForSku(childItem.sku)).trim();
               const childRightLabel = isComplete
@@ -564,6 +1146,7 @@ function renderQueueCard(item) {
                   <span class="print-queue-card__child-sku">${escapeHtml(childItem.sku)}</span>
                   <span class="print-queue-card__child-type">${escapeHtml(childItem.typeRaw || 'UNKNOWN')}</span>
                   <span class="${childRightClass}" title="${escapeHtmlAttribute(childRightLabel)}">${escapeHtml(childRightLabel)}</span>
+                  ${isNeedsPrinted ? renderStlDownloadLink(childItem.sku) : ''}
                 </div>
               `;
             }).join('')}
@@ -584,7 +1167,10 @@ function renderQueueCard(item) {
           <h3>${escapeHtml(getItemLabel(item))}</h3>
           ${isCustom && item.customFileName ? `<p>${escapeHtml(item.customFileName)}</p>` : ''}
         </div>
-        <span class="${quantityBadgeClass}" title="${escapeHtmlAttribute(quantityBadgeLabel)}">${escapeHtml(quantityBadgeLabel)}</span>
+        <div class="print-queue-card__head-actions">
+          <span class="${quantityBadgeClass}" title="${escapeHtmlAttribute(quantityBadgeLabel)}">${escapeHtml(quantityBadgeLabel)}</span>
+          ${deleteButton}
+        </div>
       </div>
       <div class="print-queue-card__meta">
         <span>${escapeHtml(typeLabel)}</span>
@@ -595,9 +1181,12 @@ function renderQueueCard(item) {
       </div>
       ${childRows}
       ${item.notes ? `<p class="print-queue-card__notes">${escapeHtml(item.notes)}</p>` : ''}
+      ${deleteConfirm}
       <div class="print-queue-card__foot">
         <span>${escapeHtml(formatTimestamp(item.updatedAt || item.createdAt))}</span>
         ${fileLink}
+        ${stlLink}
+        ${qcPdfLink}
         ${putAwayButton}
       </div>
     </article>
@@ -666,6 +1255,22 @@ async function fetchPrintQueue({ silent = false, includeCatalog = false } = {}) 
       ? queueData.stages
       : printQueueStages;
     printQueueItems = Array.isArray(queueData.items) ? queueData.items : [];
+    const queueItemIdSet = new Set(printQueueItems.map((item) => String(item.id)));
+    expandedPrintChildItemIds = new Set(
+      Array.from(expandedPrintChildItemIds).filter((itemId) => queueItemIdSet.has(String(itemId)))
+    );
+    if (
+      pendingPrintDeleteItemId
+      && !queueItemIdSet.has(String(pendingPrintDeleteItemId))
+    ) {
+      pendingPrintDeleteItemId = '';
+    }
+    if (
+      activePutAwayItemId
+      && !queueItemIdSet.has(String(activePutAwayItemId))
+    ) {
+      closePutAwayReview();
+    }
 
     if (includeCatalog) {
       await fetchPrintCatalog();
@@ -675,7 +1280,9 @@ async function fetchPrintQueue({ silent = false, includeCatalog = false } = {}) 
     renderBoard();
     renderCatalog();
     updateLastUpdatedLabel();
-    setStatus(`Loaded ${printQueueItems.length} print jobs.`, 'success');
+    if (!silent) {
+      setStatus(`Loaded ${printQueueItems.length} print jobs.`, 'success');
+    }
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
     renderOverview();
@@ -717,6 +1324,19 @@ async function addCatalogSkuToQueue(sku) {
       'success'
     );
   } catch (err) {
+    if (err?.data?.code === 'PRINT_ORIENTATION_REQUIRED') {
+      const requirements = Array.isArray(err.data.orientationRequired)
+        ? err.data.orientationRequired
+        : [];
+      setStatus(
+        formatOrientationRequiredSummary(requirements),
+        'error',
+        getOrientationRequiredActions(requirements)
+      );
+      setLoading(false);
+      return;
+    }
+
     setStatus(`Error: ${err.message}`, 'error');
     setLoading(false);
   }
@@ -829,6 +1449,32 @@ async function putAwayPrintItem(itemId) {
   }
 }
 
+async function removePrintItem(itemId) {
+  const normalizedId = Number(itemId);
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0 || printQueueLoading) {
+    return;
+  }
+
+  setLoading(true);
+  setStatus('Removing print job...', 'info');
+
+  try {
+    const response = await fetch(`/api/print-queue/${encodeURIComponent(normalizedId)}`, {
+      method: 'DELETE',
+      headers: { Accept: 'application/json' },
+    });
+    await readJsonResponse(response, 'Failed to remove print job');
+
+    pendingPrintDeleteItemId = '';
+    setLoading(false);
+    await fetchPrintQueue({ silent: true, includeCatalog: false });
+    setStatus('Print job removed from the queue.', 'success');
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, 'error');
+    setLoading(false);
+  }
+}
+
 function formatPutAwayResultMessage(data) {
   const matches = Array.isArray(data?.awaitingPartsMatches) ? data.awaitingPartsMatches : [];
   if (matches.length === 0) {
@@ -859,6 +1505,124 @@ function formatPutAwayResultMessage(data) {
   ].filter(Boolean).join(' ');
 }
 
+function formatPreformMissingFile(file) {
+  const sku = String(file?.sku || '').trim();
+  const title = String(file?.title || '').trim();
+  const label = sku || title || 'Unnamed part';
+  const quantity = Math.max(1, Number(file?.quantity) || 1);
+  const fileLabel = `${label}.stl/.3mf`;
+
+  return quantity > 1 ? `${fileLabel} (x${quantity})` : fileLabel;
+}
+
+function formatPreformCustomIssue(item) {
+  const title = String(item?.title || '').trim() || 'Unnamed custom job';
+  const quantity = Math.max(1, Number(item?.quantity) || 1);
+  return quantity > 1 ? `${title} (x${quantity})` : title;
+}
+
+function formatPreformIssueInstructions(missingFiles, skippedCustomItems) {
+  const messages = [];
+  const missingList = missingFiles.map(formatPreformMissingFile).filter(Boolean);
+  const customList = skippedCustomItems.map(formatPreformCustomIssue).filter(Boolean);
+
+  if (missingList.length > 0) {
+    messages.push(`Missing or misnamed model files: ${missingList.join(', ')}. Upload these as STL/3MF files, or correct the filenames in Google Drive.`);
+  }
+  if (customList.length > 0) {
+    messages.push(`Custom jobs missing a Drive file link: ${customList.join(', ')}.`);
+  }
+
+  return messages;
+}
+
+function formatOrientationRequirement(requirement) {
+  const sku = String(requirement?.sku || '').trim();
+  const status = String(requirement?.status || '').trim();
+  const fileName = String(requirement?.driveFile?.name || '').trim();
+  const reason = status === 'stale'
+    ? 'Drive file changed'
+    : 'not oriented';
+  return [sku, fileName ? `(${fileName})` : '', reason].filter(Boolean).join(' ');
+}
+
+function formatOrientationRequiredSummary(requirements) {
+  const items = Array.isArray(requirements) ? requirements : [];
+  const labels = items.map(formatOrientationRequirement).filter(Boolean);
+  const labelSummary = labels.join(', ');
+
+  return [
+    'Build blocked: every parent and sub SKU STL must be manually oriented first.',
+    labelSummary ? `Orient these files: ${labelSummary}.` : '',
+    'Start with the first one, click the downward face, save it, then continue through the list.',
+  ].filter(Boolean).join(' ');
+}
+
+function getOrientationRequiredActions(requirements) {
+  const items = Array.isArray(requirements) ? requirements : [];
+  const firstSku = String(items[0]?.sku || '').trim();
+  const actions = [];
+
+  if (firstSku) {
+    actions.push({
+      href: `/print_config.html?orient=${encodeURIComponent(firstSku)}`,
+      label: `Orient ${firstSku}`,
+    });
+  }
+  actions.push({
+    href: '/print_config.html',
+    label: 'Open Orientation Library',
+  });
+
+  return actions;
+}
+
+function getPreformBuildDownloadActions(data) {
+  const downloads = data?.downloads && typeof data.downloads === 'object' ? data.downloads : {};
+  const actions = [];
+  const buildCount = Array.isArray(data?.preform?.builds) ? data.preform.builds.length : 0;
+
+  if (downloads.zip) {
+    actions.push({
+      href: downloads.zip,
+      label: data?.partialBuild
+        ? 'Download Partial Build Zip'
+        : (buildCount > 1 ? 'Download Builds Zip' : 'Download Build Zip'),
+    });
+  } else if (downloads.form) {
+    actions.push({
+      href: downloads.form,
+      label: data?.partialBuild ? 'Download Partial Build' : 'Download Build',
+    });
+  }
+
+  if (downloads.manifest) {
+    actions.push({
+      href: downloads.manifest,
+      label: 'Download Manifest',
+    });
+  }
+
+  return actions;
+}
+
+function formatPreformDensity(value) {
+  const density = Number(value);
+  return Number.isFinite(density) && density > 0 ? `${Math.round(density * 100)}%` : '-';
+}
+
+function formatPreformBuildDensitySummary(preform) {
+  const builds = Array.isArray(preform?.builds) ? preform.builds : [];
+  if (builds.length <= 1) return '';
+
+  const densityLabels = builds.map((build, index) => {
+    const layerCount = Number(build.layerCount || 0);
+    const layerLabel = layerCount > 0 ? `, ${layerCount} layers` : '';
+    return `Build ${index + 1}: ${formatPreformDensity(build.buildDensity)}${layerLabel}`;
+  });
+  return `Densities: ${densityLabels.join(', ')}.`;
+}
+
 function formatPreformBuildSummary(data) {
   const manifest = data?.manifest || {};
   const preform = data?.preform || null;
@@ -868,11 +1632,25 @@ function formatPreformBuildSummary(data) {
   const issueCount = missingFiles.length + skippedCustomItems.length;
   const resolvedPartCount = Number(manifest.resolvedPartCount || 0);
   const modelInstanceCount = Number(manifest.modelInstanceCount || 0);
+  const issueInstructions = formatPreformIssueInstructions(missingFiles, skippedCustomItems);
+  const buildCount = Array.isArray(preform?.builds) ? preform.builds.length : 0;
+  const buildLabel = buildCount > 1 ? `${buildCount} PreForm builds` : 'PreForm build';
+  const densitySummary = formatPreformBuildDensitySummary(preform);
 
   if (preform?.formFilePath) {
+    if (issueCount > 0) {
+      return [
+        `Created partial ${buildLabel} with ${modelInstanceCount} model ${modelInstanceCount === 1 ? 'instance' : 'instances'}, but it is missing parts.`,
+        densitySummary,
+        'Do not treat this as a complete build until the missing files are fixed.',
+        ...issueInstructions,
+        'Cards were left in Needs Printed.',
+      ].filter(Boolean).join(' ');
+    }
+
     return [
-      `Created PreForm build with ${modelInstanceCount} model ${modelInstanceCount === 1 ? 'instance' : 'instances'}.`,
-      `File: ${preform.formFilePath}.`,
+      `Created ${buildLabel} with ${modelInstanceCount} model ${modelInstanceCount === 1 ? 'instance' : 'instances'}.`,
+      densitySummary,
       movedCount > 0 ? `Moved ${movedCount} queue ${movedCount === 1 ? 'card' : 'cards'} to In Build.` : '',
     ].filter(Boolean).join(' ');
   }
@@ -887,6 +1665,7 @@ function formatPreformBuildSummary(data) {
     return [
       `Prepared a manifest with ${resolvedPartCount} resolved ${resolvedPartCount === 1 ? 'part' : 'parts'}.`,
       [missingLabel, customLabel].filter(Boolean).join('; '),
+      ...issueInstructions,
       `Manifest: ${data.manifestPath || manifest.buildDir || '-'}.`,
     ].filter(Boolean).join(' ');
   }
@@ -919,8 +1698,29 @@ async function preparePreformBuild() {
     await fetchPrintQueue({ silent: true, includeCatalog: false });
     const issueCount = Number(data?.manifest?.missingFiles?.length || 0)
       + Number(data?.manifest?.skippedCustomItems?.length || 0);
-    setStatus(formatPreformBuildSummary(data), issueCount > 0 ? 'error' : 'success');
+    const downloadActions = getPreformBuildDownloadActions(data);
+    if (downloadActions.length > 0) {
+      saveLatestPreformBuildDownloadActions(downloadActions);
+    }
+    setStatus(
+      formatPreformBuildSummary(data),
+      issueCount > 0 ? 'error' : 'success',
+      downloadActions
+    );
   } catch (err) {
+    if (err?.data?.code === 'PRINT_ORIENTATION_REQUIRED') {
+      const requirements = Array.isArray(err.data.orientationRequired)
+        ? err.data.orientationRequired
+        : [];
+      setStatus(
+        formatOrientationRequiredSummary(requirements),
+        'error',
+        getOrientationRequiredActions(requirements)
+      );
+      setLoading(false);
+      return;
+    }
+
     setStatus(`Error: ${err.message}`, 'error');
     setLoading(false);
   }
@@ -928,16 +1728,70 @@ async function preparePreformBuild() {
 
 function bindBoardEvents(board) {
   board.addEventListener('click', (event) => {
-    const button = event.target instanceof Element
-      ? event.target.closest('[data-print-put-away-id]')
+    const target = event.target instanceof Element ? event.target : null;
+    const childrenToggle = target
+      ? target.closest('[data-print-children-toggle-id]')
+      : null;
+    if (childrenToggle) {
+      event.preventDefault();
+      event.stopPropagation();
+      const itemId = String(childrenToggle.getAttribute('data-print-children-toggle-id') || '');
+      if (expandedPrintChildItemIds.has(itemId)) {
+        expandedPrintChildItemIds.delete(itemId);
+      } else if (itemId) {
+        expandedPrintChildItemIds.add(itemId);
+      }
+      renderBoard();
+      return;
+    }
+
+    const confirmButton = target
+      ? target.closest('[data-print-delete-confirm-id]')
+      : null;
+    if (confirmButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      removePrintItem(confirmButton.getAttribute('data-print-delete-confirm-id'));
+      return;
+    }
+
+    const cancelButton = target
+      ? target.closest('[data-print-delete-cancel-id]')
+      : null;
+    if (cancelButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      pendingPrintDeleteItemId = '';
+      renderBoard();
+      return;
+    }
+
+    const deleteButton = target
+      ? target.closest('[data-print-delete-id]')
+      : null;
+    if (deleteButton) {
+      event.preventDefault();
+      event.stopPropagation();
+      pendingPrintDeleteItemId = String(deleteButton.getAttribute('data-print-delete-id') || '');
+      renderBoard();
+      return;
+    }
+
+    const button = target
+      ? target.closest('[data-print-put-away-id]')
       : null;
     if (!button) return;
 
     event.preventDefault();
-    putAwayPrintItem(button.getAttribute('data-print-put-away-id'));
+    openPutAwayReview(button.getAttribute('data-print-put-away-id'));
   });
 
   board.addEventListener('dragstart', (event) => {
+    if (event.target instanceof Element && event.target.closest('button, a')) {
+      event.preventDefault();
+      return;
+    }
+
     const card = event.target instanceof Element
       ? event.target.closest('.print-queue-card')
       : null;
@@ -1009,6 +1863,9 @@ document.addEventListener('DOMContentLoaded', () => {
   const catalogList = document.getElementById('printCatalogList');
   const customForm = document.getElementById('printCustomForm');
   const board = document.getElementById('printQueueBoard');
+  const putAwayModal = document.getElementById('printPutAwayModal');
+  const putAwayCancelBtn = document.getElementById('printPutAwayCancelBtn');
+  const putAwayConfirmBtn = document.getElementById('printPutAwayConfirmBtn');
 
   if (refreshBtn) {
     refreshBtn.addEventListener('click', () => {
@@ -1043,6 +1900,28 @@ document.addEventListener('DOMContentLoaded', () => {
   if (board) {
     bindBoardEvents(board);
   }
+
+  if (putAwayCancelBtn) {
+    putAwayCancelBtn.addEventListener('click', closePutAwayReview);
+  }
+
+  if (putAwayConfirmBtn) {
+    putAwayConfirmBtn.addEventListener('click', confirmPutAwayReview);
+  }
+
+  if (putAwayModal) {
+    putAwayModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closePutAwayReview();
+      }
+    });
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && putAwayModal?.classList.contains('is-open')) {
+      closePutAwayReview();
+    }
+  });
 
   fetchPrintQueue({ includeCatalog: true });
 

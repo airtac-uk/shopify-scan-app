@@ -1,0 +1,95 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Print Config</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+      }
+    }
+  </script>
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body class="pick-list-page print-queue-page">
+  <main class="pick-list-layout print-queue-layout">
+    <header class="pick-list-topbar">
+      <nav class="pick-list-link-row" aria-label="Print configuration navigation">
+        <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
+        <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
+        <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
+        <a href="/putting_away.html" class="pick-list-link">Putting Away</a>
+      </nav>
+      <h1>Print Config</h1>
+      <p>Configure where print queue tools find SKU-named STL and 3MF files.</p>
+    </header>
+
+    <section class="print-queue-controls">
+      <div>
+        <p class="print-queue-eyebrow">STL Source</p>
+        <p id="printSettingsStatus" class="print-queue-muted">Loading print settings...</p>
+      </div>
+      <div class="print-queue-actions">
+        <span id="printSettingsSpinner" class="loader" style="display:none;"></span>
+      </div>
+      <p id="printSettingsMessage" class="print-queue-status" data-type="info">Ready.</p>
+    </section>
+
+    <section class="print-queue-panel print-config-panel">
+      <div class="print-queue-panel__head">
+        <div>
+          <h2 class="pick-list-section-title">Google Drive STL Folder</h2>
+          <p>Paste the Drive folder URL or ID. Files should be named exactly like the SKU, for example ABC-123.stl.</p>
+        </div>
+      </div>
+      <form id="printSettingsForm" class="print-settings-form">
+        <label>
+          <span>Google Drive folder URL or ID</span>
+          <input id="printDriveFolder" type="text" autocomplete="off" placeholder="https://drive.google.com/drive/folders/..." />
+        </label>
+        <label>
+          <span>File types</span>
+          <input id="printStlExtensions" type="text" autocomplete="off" value="stl,3mf" />
+        </label>
+        <button type="submit">Save STL Source</button>
+      </form>
+    </section>
+
+    <section class="print-queue-panel print-config-panel print-orientation-panel">
+      <div class="print-queue-panel__head">
+        <div>
+          <h2 class="pick-list-section-title">Part Orientation Library</h2>
+          <p>Select the face that should point down. The saved orientation is reused when PreForm builds are prepared.</p>
+        </div>
+      </div>
+      <form id="printOrientationLookupForm" class="print-settings-form print-orientation-form">
+        <label>
+          <span>SKU</span>
+          <input id="printOrientationSku" type="text" autocomplete="off" autocapitalize="characters" placeholder="ABC-123" />
+        </label>
+        <button type="submit">Load STL</button>
+      </form>
+      <div id="printOrientationWorkspace" class="print-orientation-workspace" hidden>
+        <div class="print-orientation-viewer">
+          <canvas id="printOrientationCanvas"></canvas>
+          <p id="printOrientationViewerStatus" class="print-stl-preview__status">Load a SKU to begin.</p>
+        </div>
+        <div class="print-orientation-side">
+          <p id="printOrientationMeta" class="print-queue-muted">No model loaded.</p>
+          <div class="print-orientation-actions">
+            <button id="printOrientationResetBtn" type="button">Reset View</button>
+            <button id="printOrientationSaveBtn" type="button" disabled>Save Orientation</button>
+          </div>
+          <div id="printOrientationSavedList" class="print-orientation-list"></div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <script src="js/print-config.js"></script>
+</body>
+</html>

@@ -5,6 +5,14 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Print Queue</title>
   <link rel="stylesheet" href="css/style.css" />
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "https://cdn.jsdelivr.net/npm/three@0.164.1/build/three.module.js",
+        "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.164.1/examples/jsm/"
+      }
+    }
+  </script>
   <script src="/js/theme-secret.js" defer></script>
 </head>
 <body class="pick-list-page print-queue-page">
@@ -14,6 +22,7 @@
         <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
         <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
         <a href="/putting_away.html" class="pick-list-link">Putting Away</a>
+        <a href="/print_config.html" class="pick-list-link">Print Config</a>
         <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
       </nav>
       <h1>Print Queue</h1>
@@ -31,6 +40,7 @@
         <button id="printQueueRefreshBtn" type="button">Refresh</button>
       </div>
       <p id="printQueueStatus" class="print-queue-status" data-type="info">Ready.</p>
+      <div id="printQueueStatusActions" class="print-queue-status-actions" aria-live="polite"></div>
     </section>
 
     <section id="printQueueOverview" class="print-queue-overview"></section>
@@ -80,6 +90,23 @@
       <div id="printQueueBoard" class="print-queue-board"></div>
     </section>
   </main>
+
+  <div id="printPutAwayModal" class="pick-modal print-put-away-modal" aria-hidden="true">
+    <div class="pick-modal__panel print-put-away-modal__panel" role="dialog" aria-modal="true" aria-labelledby="printPutAwayTitle">
+      <div class="print-put-away-modal__head">
+        <div>
+          <p class="print-queue-eyebrow">Put Away Review</p>
+          <h3 id="printPutAwayTitle">Put away print job</h3>
+          <p id="printPutAwaySummary">Check every printed part and location before clearing this card.</p>
+        </div>
+      </div>
+      <div id="printPutAwayParts" class="print-put-away-parts"></div>
+      <div class="pick-modal-actions print-put-away-actions">
+        <button id="printPutAwayCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
+        <button id="printPutAwayConfirmBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">Put Away</button>
+      </div>
+    </div>
+  </div>
 
   <script src="js/print-queue.js"></script>
 </body>

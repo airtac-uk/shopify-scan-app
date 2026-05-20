@@ -8,6 +8,7 @@
   },
   "dependencies": {
     "@shopify/shopify-api": "^12.2.0",
+    "archiver": "^8.0.0",
     "axios": "^1.4.0",
     "better-sqlite3": "^8.3.0",
     "body-parser": "^1.20.2",

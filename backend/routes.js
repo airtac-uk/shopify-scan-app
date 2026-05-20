@@ -1,9 +1,11 @@
 // routes.js
 const express = require('express');
 const router = express.Router();
+const fs = require('fs');
 const path = require('path');
 const cookieParser = require('cookie-parser');
 const crypto = require('crypto');
+const { ZipArchive } = require('archiver');
 const sessionsStore = require('./sessionsStore'); // your SQLite session store
 const { shopifyClient } = require('./shopifyClient');
 const fetch = require('node-fetch'); // for OAuth token exchange
@@ -36,6 +38,12 @@ const {
 } = require('./printQueueService');
 const {
   preparePreformBuildFromQueueItems,
+  getDriveModelFileForSku,
+  openDriveModelFileStreamForSku,
+  openDriveQcPdfStreamForSku,
+  readPreformBuildManifest,
+  resolvePreformBuildArtifact,
+  transformStlBufferOrientation,
 } = require('./preformBuildService');
 
 router.use(cookieParser());
@@ -601,6 +609,137 @@ function collectPrintQueueSkus(item) {
   });
 
   return skus;
+}
+
+function extractGoogleDriveFolderId(value) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+
+  const patterns = [
+    /\/folders\/([^/?#]+)/i,
+    /[?&]id=([^&#]+)/i,
+  ];
+
+  for (const pattern of patterns) {
+    const match = text.match(pattern);
+    if (match?.[1]) return decodeURIComponent(match[1]);
+  }
+
+  return text;
+}
+
+function normalizeGoogleDriveFolderIds(value) {
+  const values = Array.isArray(value)
+    ? value
+    : String(value || '').split(',');
+
+  return Array.from(new Set(values
+    .map(extractGoogleDriveFolderId)
+    .map((folderId) => folderId.trim())
+    .filter(Boolean)));
+}
+
+function getPreformBuildDownloadUrl(buildId, artifact) {
+  const normalizedBuildId = String(buildId || '').trim();
+  const normalizedArtifact = String(artifact || '').trim();
+  if (!normalizedBuildId || !normalizedArtifact) return '';
+
+  return `/api/print-queue/preform-builds/${encodeURIComponent(normalizedBuildId)}/${encodeURIComponent(normalizedArtifact)}/download`;
+}
+
+function getPreformBuildDownloads(buildResult) {
+  const buildId = String(buildResult?.manifest?.buildId || '').trim();
+  if (!buildId) return {};
+
+  const downloads = {
+    manifest: getPreformBuildDownloadUrl(buildId, 'manifest'),
+  };
+
+  const buildCount = Array.isArray(buildResult?.preform?.builds)
+    ? buildResult.preform.builds.length
+    : 0;
+  if (buildCount > 0 || buildResult?.preform?.formFilePath) {
+    downloads.zip = getPreformBuildDownloadUrl(buildId, 'zip');
+  }
+
+  return downloads;
+}
+
+function getOrientationFileStatus(orientation, driveFile) {
+  if (!orientation) return 'missing';
+  if (!driveFile?.id) return 'file_missing';
+  if (orientation.driveFileId && orientation.driveFileId !== String(driveFile.id || '').trim()) return 'stale';
+  if (
+    orientation.driveModifiedTime
+    && orientation.driveModifiedTime !== String(driveFile.modifiedTime || '').trim()
+  ) {
+    return 'stale';
+  }
+  return 'current';
+}
+
+async function findPrintQueueOrientationRequirements({ shop, items, settings }) {
+  const skus = Array.from(new Set((Array.isArray(items) ? items : [])
+    .flatMap(collectPrintQueueSkus)
+    .filter(Boolean)));
+  const requirements = [];
+
+  for (const sku of skus) {
+    const driveFile = await getDriveModelFileForSku(sku, settings);
+    if (!driveFile) continue;
+
+    const orientation = sessionsStore.getPrintPartOrientation({ shop, sku });
+    const status = getOrientationFileStatus(orientation, driveFile);
+    if (status === 'current') continue;
+
+    requirements.push({
+      sku,
+      status,
+      driveFile: {
+        id: driveFile.id,
+        name: driveFile.name,
+        modifiedTime: driveFile.modifiedTime || '',
+        size: driveFile.size || '',
+        webViewLink: driveFile.webViewLink || '',
+      },
+      orientation,
+    });
+  }
+
+  return requirements;
+}
+
+function getExistingPreformBuildArtifacts(buildId) {
+  const artifacts = [];
+  const manifestInfo = resolvePreformBuildArtifact(buildId, 'manifest');
+  if (manifestInfo?.filePath && fs.existsSync(manifestInfo.filePath)) {
+    artifacts.push(manifestInfo);
+  }
+
+  const manifest = readPreformBuildManifest(buildId);
+  const preformBuilds = Array.isArray(manifest?.preformBuilds)
+    ? manifest.preformBuilds
+    : [];
+  preformBuilds.forEach((build, index) => {
+    const filePath = String(build?.formFilePath || '').trim();
+    if (!filePath || !fs.existsSync(filePath)) return;
+    artifacts.push({
+      buildId: String(build?.buildId || `${buildId}-${String(index + 1).padStart(2, '0')}`),
+      artifact: 'form',
+      filePath,
+      filename: `${String(build?.buildId || `${buildId}-${String(index + 1).padStart(2, '0')}`)}.form`,
+      contentType: 'application/octet-stream',
+    });
+  });
+
+  if (preformBuilds.length === 0) {
+    const formInfo = resolvePreformBuildArtifact(buildId, 'form');
+    if (formInfo?.filePath && fs.existsSync(formInfo.filePath)) {
+      artifacts.push(formInfo);
+    }
+  }
+
+  return artifacts;
 }
 
 function summarizeAwaitingPartsMatches(rows) {
@@ -2395,6 +2534,362 @@ router.post('/api/print-queue/custom', async (req, res) => {
   }
 });
 
+router.get('/api/print-queue/settings', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    return res.json({
+      success: true,
+      settings: sessionsStore.getPrintQueueSettings({ shop: auth.shop }),
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/settings:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/print-queue/settings', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const driveFolderIds = normalizeGoogleDriveFolderIds(
+      req.body?.driveFolderIds || req.body?.driveFolderValue || req.body?.driveFolderId
+    );
+    const stlExtensions = String(req.body?.stlExtensions || 'stl,3mf').trim();
+
+    const settings = sessionsStore.updatePrintQueueSettings({
+      shop: auth.shop,
+      driveFolderIds,
+      stlExtensions,
+      updatedBy: auth.userId,
+    });
+
+    return res.json({
+      success: true,
+      settings,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/settings:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/print-queue/orientations', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    return res.json({
+      success: true,
+      orientations: sessionsStore.listPrintPartOrientations({ shop: auth.shop, limit: 100 }),
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/orientations:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/print-queue/orientations/:sku', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const sku = normalizeSku(req.params.sku);
+    if (!sku) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing SKU',
+      });
+    }
+
+    const printQueueSettings = sessionsStore.getPrintQueueSettings({ shop: auth.shop });
+    const driveFile = await getDriveModelFileForSku(sku, printQueueSettings);
+    const orientation = sessionsStore.getPrintPartOrientation({ shop: auth.shop, sku });
+
+    return res.json({
+      success: true,
+      sku,
+      driveFile: driveFile ? {
+        id: driveFile.id,
+        name: driveFile.name,
+        modifiedTime: driveFile.modifiedTime || '',
+        size: driveFile.size || '',
+        webViewLink: driveFile.webViewLink || '',
+      } : null,
+      orientation,
+      status: getOrientationFileStatus(orientation, driveFile),
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/orientations/:sku:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/print-queue/orientations/:sku', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const sku = normalizeSku(req.params.sku);
+    if (!sku) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing SKU',
+      });
+    }
+
+    const printQueueSettings = sessionsStore.getPrintQueueSettings({ shop: auth.shop });
+    const driveFile = await getDriveModelFileForSku(sku, printQueueSettings);
+    if (!driveFile) {
+      return res.status(404).json({
+        success: false,
+        error: `No STL/3MF file found for ${sku}`,
+      });
+    }
+
+    const orientation = sessionsStore.savePrintPartOrientation({
+      shop: auth.shop,
+      sku,
+      driveFile,
+      orientation: req.body?.orientation || {},
+      lockMode: 'LOCKED_XY_ROTATION_FREE_TRANSLATION',
+      updatedBy: auth.userId,
+    });
+
+    return res.json({
+      success: true,
+      sku,
+      driveFile: {
+        id: driveFile.id,
+        name: driveFile.name,
+        modifiedTime: driveFile.modifiedTime || '',
+        size: driveFile.size || '',
+        webViewLink: driveFile.webViewLink || '',
+      },
+      orientation,
+      status: getOrientationFileStatus(orientation, driveFile),
+    });
+  } catch (err) {
+    console.error('Error in POST /api/print-queue/orientations/:sku:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/print-queue/stl/:sku/download', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const sku = normalizeSku(req.params.sku);
+    if (!sku) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing SKU',
+      });
+    }
+
+    const printQueueSettings = sessionsStore.getPrintQueueSettings({ shop: auth.shop });
+    const download = await openDriveModelFileStreamForSku(sku, printQueueSettings);
+    if (!download) {
+      return res.status(404).json({
+        success: false,
+        error: `No STL/3MF file found for ${sku}`,
+      });
+    }
+
+    const filename = String(download.file?.name || `${sku}.stl`).replace(/[\r\n"]/g, '_');
+    const fileExtension = path.extname(filename).replace(/^\./, '').toLowerCase();
+    const rawRequested = ['1', 'true', 'source', 'raw'].includes(
+      String(req.query?.raw || req.query?.orientation || '').trim().toLowerCase()
+    );
+    const savedOrientation = sessionsStore.getPrintPartOrientation({ shop: auth.shop, sku });
+    const orientationStatus = getOrientationFileStatus(savedOrientation, download.file);
+    const contentType = download.response.headers.get('content-type') || 'application/octet-stream';
+    const contentLength = download.response.headers.get('content-length') || download.file?.size || '';
+
+    if (!rawRequested && fileExtension === 'stl' && orientationStatus === 'current') {
+      const sourceBuffer = await download.response.buffer();
+      const orientedBuffer = transformStlBufferOrientation(sourceBuffer, savedOrientation.orientation);
+
+      res.setHeader('Content-Type', contentType);
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+      res.setHeader('Content-Length', orientedBuffer.length);
+      res.setHeader('X-Drive-File-Id', String(download.file?.id || ''));
+      res.setHeader('X-Print-Orientation-Applied', 'true');
+      return res.send(orientedBuffer);
+    }
+
+    res.setHeader('Content-Type', contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('X-Drive-File-Id', String(download.file?.id || ''));
+    res.setHeader('X-Print-Orientation-Applied', 'false');
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+
+    download.response.body.on('error', (streamErr) => {
+      console.error(`Google Drive STL stream failed for ${sku}:`, streamErr);
+      if (!res.headersSent) {
+        res.status(500).end('Failed to stream STL file');
+      } else {
+        res.destroy(streamErr);
+      }
+    });
+    return download.response.body.pipe(res);
+  } catch (err) {
+    console.error('Error in /api/print-queue/stl/:sku/download:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/print-queue/qc/:sku/pdf', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const sku = normalizeSku(req.params.sku);
+    if (!sku) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing SKU',
+      });
+    }
+
+    const printQueueSettings = sessionsStore.getPrintQueueSettings({ shop: auth.shop });
+    const download = await openDriveQcPdfStreamForSku(sku, printQueueSettings);
+    if (!download) {
+      return res.status(404).json({
+        success: false,
+        error: `No QC PDF found for ${sku}`,
+      });
+    }
+
+    const filename = String(download.file?.name || `${sku}.pdf`).replace(/[\r\n"]/g, '_');
+    const contentLength = download.response.headers.get('content-length') || download.file?.size || '';
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${filename}"`);
+    res.setHeader('X-Drive-File-Id', String(download.file?.id || ''));
+    if (contentLength) {
+      res.setHeader('Content-Length', contentLength);
+    }
+
+    download.response.body.on('error', (streamErr) => {
+      console.error(`Google Drive QC PDF stream failed for ${sku}:`, streamErr);
+      if (!res.headersSent) {
+        res.status(500).end('Failed to stream QC PDF');
+      } else {
+        res.destroy(streamErr);
+      }
+    });
+    return download.response.body.pipe(res);
+  } catch (err) {
+    console.error('Error in /api/print-queue/qc/:sku/pdf:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/print-queue/preform-builds/:buildId/:artifact/download', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const buildId = String(req.params.buildId || '').trim();
+    const artifact = String(req.params.artifact || '').trim().toLowerCase();
+
+    if (artifact === 'zip') {
+      const artifacts = getExistingPreformBuildArtifacts(buildId);
+      if (artifacts.length === 0) {
+        return res.status(404).json({
+          success: false,
+          error: 'No downloadable files found for this PreForm build',
+        });
+      }
+
+      const filename = `${artifacts[0].buildId}.zip`;
+      res.setHeader('Content-Type', 'application/zip');
+      res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+
+      const archive = new ZipArchive({ zlib: { level: 9 } });
+      archive.on('error', (archiveErr) => {
+        console.error(`PreForm build zip failed for ${buildId}:`, archiveErr);
+        if (!res.headersSent) {
+          res.status(500).end('Failed to create build zip');
+        } else {
+          res.destroy(archiveErr);
+        }
+      });
+
+      archive.pipe(res);
+      artifacts.forEach((artifactInfo) => {
+        archive.file(artifactInfo.filePath, { name: artifactInfo.filename });
+      });
+      await archive.finalize();
+      return;
+    }
+
+    const artifactInfo = resolvePreformBuildArtifact(buildId, artifact);
+    if (!artifactInfo) {
+      return res.status(400).json({
+        success: false,
+        error: 'Invalid PreForm build download',
+      });
+    }
+
+    if (!fs.existsSync(artifactInfo.filePath)) {
+      return res.status(404).json({
+        success: false,
+        error: 'PreForm build file not found',
+      });
+    }
+
+    const stats = fs.statSync(artifactInfo.filePath);
+    res.setHeader('Content-Type', artifactInfo.contentType);
+    res.setHeader('Content-Disposition', `attachment; filename="${artifactInfo.filename}"`);
+    res.setHeader('Content-Length', String(stats.size));
+
+    const stream = fs.createReadStream(artifactInfo.filePath);
+    stream.on('error', (streamErr) => {
+      console.error(`PreForm build download failed for ${buildId}:`, streamErr);
+      if (!res.headersSent) {
+        res.status(500).end('Failed to download build file');
+      } else {
+        res.destroy(streamErr);
+      }
+    });
+    return stream.pipe(res);
+  } catch (err) {
+    console.error('Error in /api/print-queue/preform-builds/:buildId/:artifact/download:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
 router.post('/api/print-queue/preform-build', async (req, res) => {
   try {
     const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
@@ -2411,10 +2906,33 @@ router.post('/api/print-queue/preform-build', async (req, res) => {
       });
     }
 
-    const buildResult = await preparePreformBuildFromQueueItems(needsPrintedItems);
-    const movedItemIds = [];
+    const printQueueSettings = sessionsStore.getPrintQueueSettings({ shop: auth.shop });
+    const orientationRequired = await findPrintQueueOrientationRequirements({
+      shop: auth.shop,
+      items: needsPrintedItems,
+      settings: printQueueSettings,
+    });
+    if (orientationRequired.length > 0) {
+      return res.status(409).json({
+        success: false,
+        code: 'PRINT_ORIENTATION_REQUIRED',
+        error: 'Every STL must be manually oriented before preparing a PreForm build.',
+        orientationRequired,
+      });
+    }
 
-    if (buildResult.preform?.formFilePath && req.body?.moveToInBuild !== false) {
+    const orientationSkus = Array.from(new Set(needsPrintedItems.flatMap(collectPrintQueueSkus)));
+    printQueueSettings.partOrientations = sessionsStore.getPrintPartOrientationsForSkus({
+      shop: auth.shop,
+      skus: orientationSkus,
+    });
+    const buildResult = await preparePreformBuildFromQueueItems(needsPrintedItems, printQueueSettings);
+    const movedItemIds = [];
+    const hasBuildIssues = Boolean(buildResult.hasBuildIssues)
+      || Number(buildResult.manifest?.missingFiles?.length || 0) > 0
+      || Number(buildResult.manifest?.skippedCustomItems?.length || 0) > 0;
+
+    if (buildResult.preform?.formFilePath && req.body?.moveToInBuild !== false && !hasBuildIssues) {
       const queueItemIds = Array.isArray(buildResult.manifest?.queueItemIds)
         ? buildResult.manifest.queueItemIds
         : [];
@@ -2434,6 +2952,9 @@ router.post('/api/print-queue/preform-build', async (req, res) => {
       manifest: buildResult.manifest,
       manifestPath: buildResult.manifestPath,
       preform: buildResult.preform,
+      hasBuildIssues,
+      partialBuild: Boolean(buildResult.partialBuild),
+      downloads: getPreformBuildDownloads(buildResult),
       movedItemIds,
     });
   } catch (err) {
@@ -2478,6 +2999,45 @@ router.post('/api/print-queue/:id/stage', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /api/print-queue/:id/stage:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.delete('/api/print-queue/:id', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing print item id',
+      });
+    }
+
+    const result = sessionsStore.removePrintQueueItem({
+      shop: auth.shop,
+      id,
+      removedBy: auth.userId,
+    });
+
+    if (result.reason === 'not_found') {
+      return res.status(404).json({
+        success: false,
+        error: 'Print queue item not found',
+      });
+    }
+
+    return res.json({
+      success: true,
+      item: result.item,
+    });
+  } catch (err) {
+    console.error('Error in DELETE /api/print-queue/:id:', err);
     return res.status(500).json({
       success: false,
       error: err.message || 'Server error',

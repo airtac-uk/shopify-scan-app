@@ -197,7 +197,9 @@ db.prepare(`
     createdAt TEXT NOT NULL,
     updatedAt TEXT NOT NULL,
     completedAt TEXT,
-    putAwayAt TEXT
+    putAwayAt TEXT,
+    removedAt TEXT,
+    removedBy TEXT
   )
 `).run();
 
@@ -226,6 +228,20 @@ if (!printQueueItemColumns.some((column) => column?.name === 'location')) {
   `).run();
 }
 
+if (!printQueueItemColumns.some((column) => column?.name === 'removedAt')) {
+  db.prepare(`
+    ALTER TABLE print_queue_items
+    ADD COLUMN removedAt TEXT
+  `).run();
+}
+
+if (!printQueueItemColumns.some((column) => column?.name === 'removedBy')) {
+  db.prepare(`
+    ALTER TABLE print_queue_items
+    ADD COLUMN removedBy TEXT
+  `).run();
+}
+
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_stage
   ON print_queue_items (shop, stageKey, updatedAt DESC)
@@ -239,6 +255,42 @@ db.prepare(`
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_put_away
   ON print_queue_items (shop, putAwayAt, completedAt, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_removed
+  ON print_queue_items (shop, removedAt, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS print_queue_settings (
+    shop TEXT PRIMARY KEY,
+    driveFolderIdsJson TEXT NOT NULL,
+    stlExtensions TEXT NOT NULL,
+    updatedBy TEXT,
+    updatedAt TEXT NOT NULL
+  )
+`).run();
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS print_part_orientations (
+    shop TEXT NOT NULL,
+    sku TEXT NOT NULL,
+    driveFileId TEXT,
+    driveFileName TEXT,
+    driveModifiedTime TEXT,
+    driveSize TEXT,
+    orientationJson TEXT NOT NULL,
+    lockMode TEXT NOT NULL,
+    updatedBy TEXT,
+    updatedAt TEXT NOT NULL,
+    PRIMARY KEY (shop, sku)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_part_orientations_shop_updated
+  ON print_part_orientations (shop, updatedAt DESC)
 `).run();
 
 function normalizeBarcode(barcode) {
@@ -312,6 +364,48 @@ function buildPrintQueueItemRecord(row) {
     updatedAt: row.updatedAt || null,
     completedAt: row.completedAt || null,
     putAwayAt: row.putAwayAt || null,
+    removedAt: row.removedAt || null,
+    removedBy: String(row.removedBy || '').trim(),
+  };
+}
+
+function normalizePrintQueueSettings(row) {
+  return {
+    driveFolderIds: safeJsonParse(row?.driveFolderIdsJson || '[]', [])
+      .map((folderId) => String(folderId || '').trim())
+      .filter(Boolean),
+    stlExtensions: String(row?.stlExtensions || 'stl,3mf').trim() || 'stl,3mf',
+    updatedBy: String(row?.updatedBy || '').trim(),
+    updatedAt: row?.updatedAt || null,
+  };
+}
+
+function normalizeOrientationValue(value) {
+  const parsed = typeof value === 'string' ? safeJsonParse(value || '{}', {}) : (value || {});
+  const x = Number(parsed?.x || 0);
+  const y = Number(parsed?.y || 0);
+  const z = Number(parsed?.z || 0);
+  return {
+    x: Number.isFinite(x) ? x : 0,
+    y: Number.isFinite(y) ? y : 0,
+    z: Number.isFinite(z) ? z : 0,
+  };
+}
+
+function normalizePrintPartOrientationRecord(row) {
+  if (!row) return null;
+
+  return {
+    shop: String(row.shop || '').trim(),
+    sku: normalizeBarcode(row.sku),
+    driveFileId: String(row.driveFileId || '').trim(),
+    driveFileName: String(row.driveFileName || '').trim(),
+    driveModifiedTime: String(row.driveModifiedTime || '').trim(),
+    driveSize: String(row.driveSize || '').trim(),
+    orientation: normalizeOrientationValue(row.orientationJson),
+    lockMode: String(row.lockMode || 'LOCKED_XY_ROTATION_FREE_TRANSLATION').trim() || 'LOCKED_XY_ROTATION_FREE_TRANSLATION',
+    updatedBy: String(row.updatedBy || '').trim(),
+    updatedAt: row.updatedAt || null,
   };
 }
 
@@ -864,6 +958,157 @@ module.exports = {
       .map((item) => item.partSku);
   },
 
+  getPrintQueueSettings({ shop } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) {
+      return normalizePrintQueueSettings(null);
+    }
+
+    const row = db.prepare(`
+      SELECT *
+      FROM print_queue_settings
+      WHERE shop = ?
+      LIMIT 1
+    `).get(normalizedShop);
+
+    return normalizePrintQueueSettings(row);
+  },
+
+  updatePrintQueueSettings({ shop, driveFolderIds = [], stlExtensions = 'stl,3mf', updatedBy = null } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) {
+      return normalizePrintQueueSettings(null);
+    }
+
+    const normalizedFolderIds = Array.from(new Set((Array.isArray(driveFolderIds) ? driveFolderIds : [])
+      .map((folderId) => String(folderId || '').trim())
+      .filter(Boolean)));
+    const normalizedExtensions = String(stlExtensions || 'stl,3mf')
+      .split(',')
+      .map((extension) => extension.trim().replace(/^\./, '').toLowerCase())
+      .filter(Boolean)
+      .join(',') || 'stl,3mf';
+    const nowIso = new Date().toISOString();
+
+    db.prepare(`
+      INSERT INTO print_queue_settings (
+        shop, driveFolderIdsJson, stlExtensions, updatedBy, updatedAt
+      ) VALUES (?, ?, ?, ?, ?)
+      ON CONFLICT(shop) DO UPDATE SET
+        driveFolderIdsJson = excluded.driveFolderIdsJson,
+        stlExtensions = excluded.stlExtensions,
+        updatedBy = excluded.updatedBy,
+        updatedAt = excluded.updatedAt
+    `).run(
+      normalizedShop,
+      JSON.stringify(normalizedFolderIds),
+      normalizedExtensions,
+      updatedBy ? String(updatedBy).trim() : null,
+      nowIso
+    );
+
+    return this.getPrintQueueSettings({ shop: normalizedShop });
+  },
+
+  getPrintPartOrientation({ shop, sku } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedSku = normalizeBarcode(sku);
+    if (!normalizedShop || !normalizedSku) return null;
+
+    const row = db.prepare(`
+      SELECT *
+      FROM print_part_orientations
+      WHERE shop = ?
+        AND sku = ?
+      LIMIT 1
+    `).get(normalizedShop, normalizedSku);
+
+    return normalizePrintPartOrientationRecord(row);
+  },
+
+  getPrintPartOrientationsForSkus({ shop, skus = [] } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedSkus = Array.from(new Set((Array.isArray(skus) ? skus : [])
+      .map(normalizeBarcode)
+      .filter(Boolean)));
+    if (!normalizedShop || normalizedSkus.length === 0) return {};
+
+    const placeholders = normalizedSkus.map(() => '?').join(', ');
+    const rows = db.prepare(`
+      SELECT *
+      FROM print_part_orientations
+      WHERE shop = ?
+        AND sku IN (${placeholders})
+    `).all(normalizedShop, ...normalizedSkus);
+
+    return rows.reduce((acc, row) => {
+      const record = normalizePrintPartOrientationRecord(row);
+      if (record?.sku) acc[record.sku] = record;
+      return acc;
+    }, {});
+  },
+
+  listPrintPartOrientations({ shop, limit = 50 } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const safeLimit = Math.min(200, Math.max(1, Number(limit) || 50));
+    if (!normalizedShop) return [];
+
+    return db.prepare(`
+      SELECT *
+      FROM print_part_orientations
+      WHERE shop = ?
+      ORDER BY updatedAt DESC
+      LIMIT ?
+    `).all(normalizedShop, safeLimit).map(normalizePrintPartOrientationRecord).filter(Boolean);
+  },
+
+  savePrintPartOrientation({
+    shop,
+    sku,
+    driveFile = null,
+    orientation = {},
+    lockMode = 'LOCKED_XY_ROTATION_FREE_TRANSLATION',
+    updatedBy = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedSku = normalizeBarcode(sku);
+    if (!normalizedShop || !normalizedSku) return null;
+
+    const normalizedOrientation = normalizeOrientationValue(orientation);
+    const normalizedLockMode = String(lockMode || 'LOCKED_XY_ROTATION_FREE_TRANSLATION').trim()
+      || 'LOCKED_XY_ROTATION_FREE_TRANSLATION';
+    const nowIso = new Date().toISOString();
+
+    db.prepare(`
+      INSERT INTO print_part_orientations (
+        shop, sku, driveFileId, driveFileName, driveModifiedTime, driveSize,
+        orientationJson, lockMode, updatedBy, updatedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(shop, sku) DO UPDATE SET
+        driveFileId = excluded.driveFileId,
+        driveFileName = excluded.driveFileName,
+        driveModifiedTime = excluded.driveModifiedTime,
+        driveSize = excluded.driveSize,
+        orientationJson = excluded.orientationJson,
+        lockMode = excluded.lockMode,
+        updatedBy = excluded.updatedBy,
+        updatedAt = excluded.updatedAt
+    `).run(
+      normalizedShop,
+      normalizedSku,
+      String(driveFile?.id || '').trim(),
+      String(driveFile?.name || '').trim(),
+      String(driveFile?.modifiedTime || '').trim(),
+      String(driveFile?.size || '').trim(),
+      JSON.stringify(normalizedOrientation),
+      normalizedLockMode,
+      updatedBy ? String(updatedBy).trim() : null,
+      nowIso
+    );
+
+    return this.getPrintPartOrientation({ shop: normalizedShop, sku: normalizedSku });
+  },
+
   getOpenAwaitingPartsItemsForSkus({ shop, skus = [] } = {}) {
     const normalizedShop = String(shop || '').trim();
     const normalizedSkus = Array.from(new Set((Array.isArray(skus) ? skus : [])
@@ -1020,6 +1265,7 @@ module.exports = {
       FROM print_queue_items
       WHERE shop = ?
         AND putAwayAt IS NULL
+        AND removedAt IS NULL
         AND completedAt IS NULL
       ORDER BY updatedAt DESC, id DESC
     `).all(normalizedShop);
@@ -1029,6 +1275,7 @@ module.exports = {
       FROM print_queue_items
       WHERE shop = ?
         AND putAwayAt IS NULL
+        AND removedAt IS NULL
         AND completedAt IS NOT NULL
       ORDER BY completedAt DESC, id DESC
       LIMIT ?
@@ -1046,6 +1293,7 @@ module.exports = {
       FROM print_queue_items
       WHERE shop = ?
         AND putAwayAt IS NULL
+        AND removedAt IS NULL
       ORDER BY updatedAt DESC, id DESC
     `).all(normalizedShop);
 
@@ -1069,6 +1317,7 @@ module.exports = {
           completedAt = ?
       WHERE shop = ?
         AND id = ?
+        AND removedAt IS NULL
     `).run(normalizedStageKey, nowIso, completedAt, normalizedShop, normalizedId);
 
     if (Number(result?.changes || 0) === 0) {
@@ -1080,6 +1329,7 @@ module.exports = {
       FROM print_queue_items
       WHERE shop = ?
         AND id = ?
+        AND removedAt IS NULL
       LIMIT 1
     `).get(normalizedShop, normalizedId);
 
@@ -1098,6 +1348,7 @@ module.exports = {
       FROM print_queue_items
       WHERE shop = ?
         AND id = ?
+        AND removedAt IS NULL
       LIMIT 1
     `).get(normalizedShop, normalizedId);
     const existingItem = buildPrintQueueItemRecord(existingRow);
@@ -1120,7 +1371,55 @@ module.exports = {
           updatedAt = ?
       WHERE shop = ?
         AND id = ?
+        AND removedAt IS NULL
     `).run(nowIso, nowIso, normalizedShop, normalizedId);
+
+    const updatedRow = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+        AND removedAt IS NULL
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+
+    return {
+      item: buildPrintQueueItemRecord(updatedRow),
+      reason: null,
+    };
+  },
+
+  removePrintQueueItem({ shop, id, removedBy = null, removedAt = null } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0) {
+      return { item: null, reason: 'not_found' };
+    }
+
+    const existingRow = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+        AND removedAt IS NULL
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+    const existingItem = buildPrintQueueItemRecord(existingRow);
+    if (!existingItem) {
+      return { item: null, reason: 'not_found' };
+    }
+
+    const nowIso = removedAt || new Date().toISOString();
+    const safeRemovedBy = removedBy ? String(removedBy).trim() : null;
+    db.prepare(`
+      UPDATE print_queue_items
+      SET removedAt = ?,
+          removedBy = ?,
+          updatedAt = ?
+      WHERE shop = ?
+        AND id = ?
+        AND removedAt IS NULL
+    `).run(nowIso, safeRemovedBy, nowIso, normalizedShop, normalizedId);
 
     const updatedRow = db.prepare(`
       SELECT *
