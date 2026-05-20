@@ -15,6 +15,7 @@
           <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
           <a href="/putting_away.html" class="pick-list-link">Putting Away</a>
           <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
+          <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
         </nav>
         <div class="pick-list-order-summary" aria-live="polite">
           <p id="pickListOrderMeta" class="pick-list-order-meta">No order loaded</p>
@@ -115,6 +116,16 @@
       <div class="pick-modal-actions">
         <button id="qcFailCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
         <button id="qcFailConfirmBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">Confirm</button>
+      </div>
+    </div>
+  </div>
+
+  <div id="awaitingPrintQueueResultModal" class="pick-modal" aria-hidden="true">
+    <div class="pick-modal__panel pick-print-queue-result">
+      <h3 id="awaitingPrintQueueResultTitle">Print Queue</h3>
+      <p id="awaitingPrintQueueResultMessage">No print queue changes needed.</p>
+      <div class="pick-modal-actions">
+        <button id="awaitingPrintQueueResultCloseBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">OK</button>
       </div>
     </div>
   </div>

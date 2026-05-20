@@ -199,6 +199,82 @@ function setStatus(message, type = 'info') {
   el.dataset.type = type;
 }
 
+function formatSkuSummary(skus, maxVisible = 3) {
+  const uniqueSkus = Array.from(new Set((skus || []).map(normalizeDisplaySku).filter(Boolean)));
+  if (uniqueSkus.length <= maxVisible) return uniqueSkus.join(', ');
+  return `${uniqueSkus.slice(0, maxVisible).join(', ')} +${uniqueSkus.length - maxVisible}`;
+}
+
+function formatAwaitingPrintQueueMessage(update) {
+  if (!update) return '';
+
+  const parts = [];
+  const addedSkus = Array.isArray(update.addedSkus) ? update.addedSkus : [];
+  const alreadyQueuedSkus = Array.isArray(update.alreadyQueuedSkus) ? update.alreadyQueuedSkus : [];
+  const notPrintableSkus = Array.isArray(update.notPrintableSkus) ? update.notPrintableSkus : [];
+  const missingSkus = Array.isArray(update.missingSkus) ? update.missingSkus : [];
+  const blockedByQueued = Array.isArray(update.blockedByQueued) ? update.blockedByQueued : [];
+
+  if (addedSkus.length > 0) {
+    parts.push(`added ${formatSkuSummary(addedSkus)} to Needs Printed`);
+  }
+  if (alreadyQueuedSkus.length > 0) {
+    parts.push(`${formatSkuSummary(alreadyQueuedSkus)} already in the print queue`);
+  }
+  if (blockedByQueued.length > 0) {
+    const blockedLabels = blockedByQueued.map((entry) => {
+      const sku = normalizeDisplaySku(entry?.sku);
+      const queuedSkus = formatSkuSummary(entry?.queuedSkus || [], 2);
+      return queuedSkus ? `${sku} blocked by ${queuedSkus}` : sku;
+    }).filter(Boolean);
+    if (blockedLabels.length > 0) {
+      parts.push(`${blockedLabels.join(', ')} already represented in the print queue`);
+    }
+  }
+  if (notPrintableSkus.length > 0) {
+    parts.push(`${formatSkuSummary(notPrintableSkus)} not SLS/Adapter`);
+  }
+  if (missingSkus.length > 0) {
+    parts.push(`${formatSkuSummary(missingSkus)} not found in the sheet`);
+  }
+  if (update.error) {
+    parts.push(`print queue not updated: ${update.error}`);
+  }
+
+  return parts.length > 0 ? `Print queue: ${parts.join('; ')}.` : '';
+}
+
+function openAwaitingPrintQueueResultPopup(message, { isError = false } = {}) {
+  const modal = document.getElementById('awaitingPrintQueueResultModal');
+  const title = document.getElementById('awaitingPrintQueueResultTitle');
+  const messageEl = document.getElementById('awaitingPrintQueueResultMessage');
+  const safeMessage = String(message || '').trim();
+
+  if (!safeMessage) return;
+
+  if (!modal || !messageEl) {
+    window.alert(safeMessage);
+    return;
+  }
+
+  if (title) {
+    title.textContent = isError ? 'Print Queue Issue' : 'Print Queue';
+  }
+  const displayMessage = safeMessage.replace(/^Print queue:\s*/i, '');
+  messageEl.textContent = displayMessage
+    ? displayMessage.charAt(0).toUpperCase() + displayMessage.slice(1)
+    : safeMessage;
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeAwaitingPrintQueueResultPopup() {
+  const modal = document.getElementById('awaitingPrintQueueResultModal');
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
 function formatWorkflowStatusLabel(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -769,11 +845,13 @@ function handleOrderActionReminderScan(scannedCode) {
 
 function isAnyDialogOpen() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
+  const printQueueResultModal = document.getElementById('awaitingPrintQueueResultModal');
   const qcFailModal = document.getElementById('qcFailModal');
   const onHoldModal = document.getElementById('onHoldModal');
 
   return Boolean(
     awaitingPartsModal?.classList.contains('is-open') ||
+    printQueueResultModal?.classList.contains('is-open') ||
     qcFailModal?.classList.contains('is-open') ||
     onHoldModal?.classList.contains('is-open') ||
     isOrderActionReminderDialogOpen()
@@ -822,15 +900,25 @@ async function saveAwaitingPartsSelection({ orderId, items, closeDialog = false 
     }
 
     const savedOrderNumber = data.orderNumber || currentOrderNumber || normalizedOrderId;
+    const baseStatus = normalizedItems.length > 0
+      ? `Awaiting parts updated for ${savedOrderNumber}.`
+      : `Awaiting parts cleared for ${savedOrderNumber}.`;
+    const printQueueStatus = normalizedItems.length > 0
+      ? formatAwaitingPrintQueueMessage(data.printQueueUpdate)
+      : '';
     setStatus(
-      normalizedItems.length > 0
-        ? `Awaiting parts updated for ${savedOrderNumber}.`
-        : `Awaiting parts cleared for ${savedOrderNumber}.`,
-      'success'
+      [baseStatus, printQueueStatus].filter(Boolean).join(' '),
+      data.printQueueUpdate?.error ? 'error' : 'success'
     );
 
     if (closeDialog) {
       closeAwaitingPartsDialog();
+    }
+
+    if (printQueueStatus) {
+      openAwaitingPrintQueueResultPopup(printQueueStatus, {
+        isError: Boolean(data.printQueueUpdate?.error),
+      });
     }
 
     return true;
@@ -2755,12 +2843,14 @@ function registerOrderActionReminderNavigationGuards() {
 
 function registerModalHandlers() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
+  const printQueueResultModal = document.getElementById('awaitingPrintQueueResultModal');
   const qcFailModal = document.getElementById('qcFailModal');
   const onHoldModal = document.getElementById('onHoldModal');
   const orderActionReminderModal = document.getElementById('orderActionReminderModal');
 
   const awaitingCancel = document.getElementById('awaitingPartsCancelBtn');
   const awaitingConfirm = document.getElementById('awaitingPartsConfirmBtn');
+  const printQueueResultClose = document.getElementById('awaitingPrintQueueResultCloseBtn');
   const qcCancel = document.getElementById('qcFailCancelBtn');
   const qcConfirm = document.getElementById('qcFailConfirmBtn');
   const onHoldCancel = document.getElementById('onHoldCancelBtn');
@@ -2770,6 +2860,7 @@ function registerModalHandlers() {
 
   if (awaitingCancel) awaitingCancel.addEventListener('click', cancelAwaitingPartsDialog);
   if (awaitingConfirm) awaitingConfirm.addEventListener('click', submitAwaitingParts);
+  if (printQueueResultClose) printQueueResultClose.addEventListener('click', closeAwaitingPrintQueueResultPopup);
   if (qcCancel) qcCancel.addEventListener('click', closeQcFailDialog);
   if (qcConfirm) qcConfirm.addEventListener('click', submitQcFail);
   if (onHoldCancel) onHoldCancel.addEventListener('click', closeOnHoldDialog);
@@ -2787,6 +2878,14 @@ function registerModalHandlers() {
     awaitingPartsModal.addEventListener('click', (event) => {
       if (event.target === event.currentTarget) {
         cancelAwaitingPartsDialog();
+      }
+    });
+  }
+
+  if (printQueueResultModal) {
+    printQueueResultModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeAwaitingPrintQueueResultPopup();
       }
     });
   }

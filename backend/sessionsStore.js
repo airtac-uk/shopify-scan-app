@@ -175,6 +175,72 @@ db.prepare(`
   WHERE resolvedAt IS NULL
 `).run();
 
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS print_queue_items (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop TEXT NOT NULL,
+    sourceType TEXT NOT NULL,
+    sku TEXT,
+    rootSku TEXT,
+    parentSku TEXT,
+    title TEXT NOT NULL,
+    typeRaw TEXT,
+    location TEXT,
+    quantity INTEGER NOT NULL,
+    rsq INTEGER,
+    stageKey TEXT NOT NULL,
+    childItemsJson TEXT,
+    customFileName TEXT,
+    customFileUrl TEXT,
+    notes TEXT,
+    createdBy TEXT,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    completedAt TEXT,
+    putAwayAt TEXT
+  )
+`).run();
+
+const printQueueItemColumns = db.prepare(`
+  PRAGMA table_info(print_queue_items)
+`).all();
+
+if (!printQueueItemColumns.some((column) => column?.name === 'putAwayAt')) {
+  db.prepare(`
+    ALTER TABLE print_queue_items
+    ADD COLUMN putAwayAt TEXT
+  `).run();
+}
+
+if (!printQueueItemColumns.some((column) => column?.name === 'childItemsJson')) {
+  db.prepare(`
+    ALTER TABLE print_queue_items
+    ADD COLUMN childItemsJson TEXT
+  `).run();
+}
+
+if (!printQueueItemColumns.some((column) => column?.name === 'location')) {
+  db.prepare(`
+    ALTER TABLE print_queue_items
+    ADD COLUMN location TEXT
+  `).run();
+}
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_stage
+  ON print_queue_items (shop, stageKey, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_open
+  ON print_queue_items (shop, completedAt, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_put_away
+  ON print_queue_items (shop, putAwayAt, completedAt, updatedAt DESC)
+`).run();
+
 function normalizeBarcode(barcode) {
   return String(barcode || '').trim().toUpperCase();
 }
@@ -206,6 +272,46 @@ function buildOrderTrackerRecord(tracker) {
     currentStageIsTerminal: Boolean(tracker.currentStageIsTerminal),
     lineItems: safeJsonParse(tracker.lineItemsJson || '[]', []),
     events,
+  };
+}
+
+function buildPrintQueueItemRecord(row) {
+  if (!row) return null;
+
+  return {
+    id: Number(row.id),
+    shop: String(row.shop || ''),
+    sourceType: String(row.sourceType || ''),
+    sku: normalizeBarcode(row.sku),
+    rootSku: normalizeBarcode(row.rootSku),
+    parentSku: normalizeBarcode(row.parentSku),
+    title: String(row.title || '').trim(),
+    typeRaw: String(row.typeRaw || '').trim().toUpperCase(),
+    location: String(row.location || '').trim(),
+    quantity: Math.max(1, Number(row.quantity) || 1),
+    rsq: Number(row.rsq) > 0 ? Number(row.rsq) : null,
+    stageKey: String(row.stageKey || '').trim(),
+    childItems: safeJsonParse(row.childItemsJson || '[]', [])
+      .map((item) => ({
+        sku: normalizeBarcode(item?.sku),
+        parentSku: normalizeBarcode(item?.parentSku),
+        title: String(item?.title || item?.sku || '').trim(),
+        typeRaw: String(item?.typeRaw || 'UNKNOWN').trim().toUpperCase(),
+        location: String(item?.location || '').trim(),
+        quantity: Math.max(1, Number(item?.quantity) || 1),
+        rsq: Number(item?.rsq) > 0 ? Number(item.rsq) : null,
+        quantityMultiplier: Math.max(1, Number(item?.quantityMultiplier) || 1),
+        notes: String(item?.notes || '').trim(),
+      }))
+      .filter((item) => item.sku),
+    customFileName: String(row.customFileName || '').trim(),
+    customFileUrl: String(row.customFileUrl || '').trim(),
+    notes: String(row.notes || '').trim(),
+    createdBy: String(row.createdBy || '').trim(),
+    createdAt: row.createdAt || null,
+    updatedAt: row.updatedAt || null,
+    completedAt: row.completedAt || null,
+    putAwayAt: row.putAwayAt || null,
   };
 }
 
@@ -756,6 +862,231 @@ module.exports = {
   getOpenAwaitingPartsSkusForOrder({ shop, orderId }) {
     return this.getOpenAwaitingPartsItemsForOrder({ shop, orderId })
       .map((item) => item.partSku);
+  },
+
+  addPrintQueueItems({ shop, items = [], createdBy = null }) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) return [];
+
+    const nowIso = new Date().toISOString();
+    const safeCreatedBy = createdBy ? String(createdBy).trim() : null;
+    const normalizedItems = (Array.isArray(items) ? items : [])
+      .map((item) => {
+        const sourceType = String(item?.sourceType || 'catalog').trim().toLowerCase() === 'custom'
+          ? 'custom'
+          : 'catalog';
+        const sku = normalizeBarcode(item?.sku);
+        const rootSku = normalizeBarcode(item?.rootSku || sku);
+        const parentSku = normalizeBarcode(item?.parentSku);
+        const title = String(item?.title || sku || 'Custom print file').trim();
+        const location = String(item?.location || '').trim();
+        const quantity = Math.max(1, Math.floor(Number(item?.quantity) || 1));
+        const rsq = Number(item?.rsq) > 0 ? Math.floor(Number(item.rsq)) : null;
+        const stageKey = String(item?.stageKey || 'needs_printed').trim().toLowerCase();
+        const childItems = Array.isArray(item?.childItems)
+          ? item.childItems.map((childItem) => ({
+              sku: normalizeBarcode(childItem?.sku),
+              parentSku: normalizeBarcode(childItem?.parentSku),
+              title: String(childItem?.title || childItem?.sku || '').trim(),
+              typeRaw: String(childItem?.typeRaw || 'UNKNOWN').trim().toUpperCase(),
+              location: String(childItem?.location || '').trim(),
+              quantity: Math.max(1, Math.floor(Number(childItem?.quantity) || 1)),
+              rsq: Number(childItem?.rsq) > 0 ? Math.floor(Number(childItem.rsq)) : null,
+              quantityMultiplier: Math.max(1, Number(childItem?.quantityMultiplier) || 1),
+              notes: String(childItem?.notes || '').trim(),
+            })).filter((childItem) => childItem.sku)
+          : [];
+
+        return {
+          sourceType,
+          sku,
+          rootSku,
+          parentSku,
+          title,
+          typeRaw: String(item?.typeRaw || (sourceType === 'custom' ? 'CUSTOM' : 'UNKNOWN')).trim().toUpperCase(),
+          location,
+          quantity,
+          rsq,
+          stageKey,
+          childItems,
+          customFileName: String(item?.customFileName || '').trim(),
+          customFileUrl: String(item?.customFileUrl || '').trim(),
+          notes: String(item?.notes || '').trim(),
+        };
+      })
+      .filter((item) => item.title && item.quantity > 0);
+
+    if (normalizedItems.length === 0) return [];
+
+    const insertStmt = db.prepare(`
+      INSERT INTO print_queue_items (
+        shop, sourceType, sku, rootSku, parentSku, title, typeRaw, location, quantity, rsq,
+        stageKey, childItemsJson, customFileName, customFileUrl, notes, createdBy, createdAt, updatedAt, completedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    const getStmt = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE id = ?
+    `);
+    const insertedRows = [];
+
+    const tx = db.transaction(() => {
+      normalizedItems.forEach((item) => {
+        const completedAt = item.stageKey === 'complete' ? nowIso : null;
+        const result = insertStmt.run(
+          normalizedShop,
+          item.sourceType,
+          item.sku || null,
+          item.rootSku || null,
+          item.parentSku || null,
+          item.title,
+          item.typeRaw,
+          item.location || null,
+          item.quantity,
+          item.rsq,
+          item.stageKey,
+          JSON.stringify(item.childItems || []),
+          item.customFileName || null,
+          item.customFileUrl || null,
+          item.notes || null,
+          safeCreatedBy,
+          nowIso,
+          nowIso,
+          completedAt
+        );
+
+        insertedRows.push(buildPrintQueueItemRecord(getStmt.get(Number(result.lastInsertRowid))));
+      });
+    });
+
+    tx();
+    return insertedRows.filter(Boolean);
+  },
+
+  getPrintQueueItems({ shop, completeLimit = 80 } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) return [];
+
+    const openRows = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND putAwayAt IS NULL
+        AND completedAt IS NULL
+      ORDER BY updatedAt DESC, id DESC
+    `).all(normalizedShop);
+
+    const completedRows = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND putAwayAt IS NULL
+        AND completedAt IS NOT NULL
+      ORDER BY completedAt DESC, id DESC
+      LIMIT ?
+    `).all(normalizedShop, Math.max(0, Math.floor(Number(completeLimit) || 0)));
+
+    return [...openRows, ...completedRows].map(buildPrintQueueItemRecord).filter(Boolean);
+  },
+
+  getActivePrintQueueItems({ shop } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) return [];
+
+    const rows = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND putAwayAt IS NULL
+      ORDER BY updatedAt DESC, id DESC
+    `).all(normalizedShop);
+
+    return rows.map(buildPrintQueueItemRecord).filter(Boolean);
+  },
+
+  updatePrintQueueItemStage({ shop, id, stageKey }) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    const normalizedStageKey = String(stageKey || '').trim().toLowerCase();
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0 || !normalizedStageKey) {
+      return null;
+    }
+
+    const nowIso = new Date().toISOString();
+    const completedAt = normalizedStageKey === 'complete' ? nowIso : null;
+    const result = db.prepare(`
+      UPDATE print_queue_items
+      SET stageKey = ?,
+          updatedAt = ?,
+          completedAt = ?
+      WHERE shop = ?
+        AND id = ?
+    `).run(normalizedStageKey, nowIso, completedAt, normalizedShop, normalizedId);
+
+    if (Number(result?.changes || 0) === 0) {
+      return null;
+    }
+
+    const row = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+
+    return buildPrintQueueItemRecord(row);
+  },
+
+  putAwayPrintQueueItem({ shop, id, putAwayAt = null }) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0) {
+      return { item: null, reason: 'not_found' };
+    }
+
+    const existingRow = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+    const existingItem = buildPrintQueueItemRecord(existingRow);
+    if (!existingItem) {
+      return { item: null, reason: 'not_found' };
+    }
+
+    if (existingItem.stageKey !== 'complete') {
+      return { item: existingItem, reason: 'not_complete' };
+    }
+
+    if (existingItem.putAwayAt) {
+      return { item: existingItem, reason: null };
+    }
+
+    const nowIso = putAwayAt || new Date().toISOString();
+    db.prepare(`
+      UPDATE print_queue_items
+      SET putAwayAt = ?,
+          updatedAt = ?
+      WHERE shop = ?
+        AND id = ?
+    `).run(nowIso, nowIso, normalizedShop, normalizedId);
+
+    const updatedRow = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+
+    return {
+      item: buildPrintQueueItemRecord(updatedRow),
+      reason: null,
+    };
   },
 
   getAwaitingPartsSummary({ shop, typeGroup } = {}) {

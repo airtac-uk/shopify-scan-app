@@ -1,0 +1,86 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Print Queue</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body class="pick-list-page print-queue-page">
+  <main class="pick-list-layout print-queue-layout">
+    <header class="pick-list-topbar">
+      <nav class="pick-list-link-row" aria-label="Print queue navigation">
+        <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
+        <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
+        <a href="/putting_away.html" class="pick-list-link">Putting Away</a>
+        <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
+      </nav>
+      <h1>Print Queue</h1>
+      <p>Manage SLS, adapter, child SKU, and custom print jobs through the build and dye workflow.</p>
+    </header>
+
+    <section class="print-queue-controls">
+      <div>
+        <p class="print-queue-eyebrow">Live Queue</p>
+        <p id="printQueueLastUpdated" class="print-queue-muted">Waiting for first load.</p>
+      </div>
+      <div class="print-queue-actions">
+        <span id="printQueueSpinner" class="loader" style="display:none;"></span>
+        <button id="printQueueBuildBtn" type="button">Prepare SLS Build</button>
+        <button id="printQueueRefreshBtn" type="button">Refresh</button>
+      </div>
+      <p id="printQueueStatus" class="print-queue-status" data-type="info">Ready.</p>
+    </section>
+
+    <section id="printQueueOverview" class="print-queue-overview"></section>
+
+    <section class="print-queue-entry-grid">
+      <section class="print-queue-panel print-queue-panel--catalog">
+        <div class="print-queue-panel__head">
+          <div>
+            <h2 class="pick-list-section-title">Sheet Catalog</h2>
+            <p id="printCatalogSheetStatus">SLS and adapter rows from the pick-list sheet.</p>
+          </div>
+          <input id="printCatalogSearch" class="print-queue-search" type="search" placeholder="Search SKU, type:sls, rsq&gt;2, has:children" autocomplete="off" autocapitalize="characters" aria-label="Search printable catalog" />
+        </div>
+        <div id="printCatalogList" class="print-catalog-list"></div>
+      </section>
+
+      <section class="print-queue-panel">
+        <div class="print-queue-panel__head">
+          <div>
+            <h2 class="pick-list-section-title">Custom File</h2>
+            <p>Add one-off files to the same workflow.</p>
+          </div>
+        </div>
+        <form id="printCustomForm" class="print-custom-form">
+          <label>
+            <span>File or job name</span>
+            <input id="printCustomTitle" type="text" required autocomplete="off" />
+          </label>
+          <label>
+            <span>Quantity</span>
+            <input id="printCustomQuantity" type="number" min="1" step="1" value="1" />
+          </label>
+          <label>
+            <span>File link</span>
+            <input id="printCustomFileUrl" type="url" placeholder="https://..." autocomplete="off" />
+          </label>
+          <label>
+            <span>Notes</span>
+            <textarea id="printCustomNotes" rows="4"></textarea>
+          </label>
+          <button type="submit">Add Custom Job</button>
+        </form>
+      </section>
+    </section>
+
+    <section>
+      <div id="printQueueBoard" class="print-queue-board"></div>
+    </section>
+  </main>
+
+  <script src="js/print-queue.js"></script>
+</body>
+</html>

@@ -270,7 +270,8 @@ function renderAwaitingPartsList(items) {
                     <div class="awaiting-parts-minimal-order-stack">
                       ${orders.map((order) => `
                         <a class="awaiting-parts-minimal-order-link" href="${escapeHtml(buildOrderViewerUrl(order.orderNumber || order.orderId))}">
-                          ${escapeHtml(order.orderNumber || order.orderId)} x${escapeHtml(order.quantity)}${escapeHtml(formatCompactReporter(order.reportedBy))}
+                          <span class="awaiting-parts-minimal-order-number">${escapeHtml(order.orderNumber || order.orderId)}</span>
+                          <span class="awaiting-parts-minimal-order-extra">x${escapeHtml(order.quantity)}${escapeHtml(formatCompactReporter(order.reportedBy))}</span>
                         </a>
                       `).join('')}
                     </div>

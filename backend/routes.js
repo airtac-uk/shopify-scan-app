@@ -25,6 +25,18 @@ const {
   buildPublicTrackerPayload,
   buildInternalOrderTimeline,
 } = require('./orderTrackerService');
+const {
+  PRINT_QUEUE_STAGES,
+  DEFAULT_PRINT_QUEUE_STAGE,
+  normalizeStageKey,
+  isPrintableSheetRow,
+  buildPrintCatalogFromSheet,
+  buildPrintQueueItemsForCatalogSku,
+  parsePositiveInteger,
+} = require('./printQueueService');
+const {
+  preparePreformBuildFromQueueItems,
+} = require('./preformBuildService');
 
 router.use(cookieParser());
 
@@ -248,6 +260,28 @@ function normalizeOrderTags(tags) {
 function hasAwaitingPartsTag(tags) {
   return normalizeOrderTags(tags)
     .some((tag) => String(tag || '').trim().toLowerCase() === 'awaiting_parts');
+}
+
+function resolveAuthenticatedRequest(req, res, { requireUser = false } = {}) {
+  const shop = req.cookies.shop;
+  if (!shop) {
+    res.status(401).json({ success: false, error: 'Not logged in' });
+    return null;
+  }
+
+  const session = sessionsStore.get(shop);
+  if (!session) {
+    res.status(401).json({ success: false, error: 'No session found' });
+    return null;
+  }
+
+  const userId = String(req.cookies.userId || '').trim();
+  if (requireUser && !userId) {
+    res.status(401).json({ success: false, error: 'Username needs to be set' });
+    return null;
+  }
+
+  return { shop, session, userId };
 }
 
 function hasWholesaleAdapterBuiltNote(orderNote) {
@@ -554,6 +588,96 @@ function buildTypedAwaitingPartsItems({ skus, items, skuMap }) {
       quantity: Math.max(1, Number(item.quantity) || 1),
     };
   }).filter((item) => item.partSku);
+}
+
+function collectPrintQueueSkus(item) {
+  const skus = [];
+  const ownSku = normalizeSku(item?.sku);
+  if (ownSku) skus.push(ownSku);
+
+  (Array.isArray(item?.childItems) ? item.childItems : []).forEach((childItem) => {
+    const childSku = normalizeSku(childItem?.sku);
+    if (childSku) skus.push(childSku);
+  });
+
+  return skus;
+}
+
+function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
+  const result = {
+    addedSkus: [],
+    alreadyQueuedSkus: [],
+    blockedByQueued: [],
+    notPrintableSkus: [],
+    missingSkus: [],
+    createdCount: 0,
+    createdPartCount: 0,
+    error: null,
+  };
+
+  const normalizedShop = String(shop || '').trim();
+  if (!normalizedShop || !(skuMap instanceof Map)) {
+    return result;
+  }
+
+  const activePrintQueueItems = sessionsStore.getActivePrintQueueItems({ shop: normalizedShop });
+  const activePrintQueueSkus = new Set(activePrintQueueItems.flatMap(collectPrintQueueSkus));
+  const queueItemsToCreate = [];
+
+  (Array.isArray(items) ? items : []).forEach((item) => {
+    const sku = normalizeSku(item?.sku || item?.partSku);
+    if (!sku) return;
+
+    if (activePrintQueueSkus.has(sku)) {
+      result.alreadyQueuedSkus.push(sku);
+      return;
+    }
+
+    const sheetRow = skuMap.get(sku);
+    if (!sheetRow) {
+      result.missingSkus.push(sku);
+      return;
+    }
+
+    if (!isPrintableSheetRow(sheetRow)) {
+      result.notPrintableSkus.push(sku);
+      return;
+    }
+
+    const queueItems = buildPrintQueueItemsForCatalogSku({ skuMap, sku });
+    if (!queueItems.length) {
+      result.notPrintableSkus.push(sku);
+      return;
+    }
+
+    const queueItemSkus = Array.from(new Set(queueItems.flatMap(collectPrintQueueSkus)));
+    const queuedConflicts = queueItemSkus.filter((queueSku) => activePrintQueueSkus.has(queueSku));
+    if (queuedConflicts.length > 0) {
+      result.blockedByQueued.push({ sku, queuedSkus: queuedConflicts });
+      return;
+    }
+
+    queueItemsToCreate.push(...queueItems);
+    result.addedSkus.push(sku);
+    queueItemSkus.forEach((queueSku) => activePrintQueueSkus.add(queueSku));
+  });
+
+  if (queueItemsToCreate.length === 0) {
+    return result;
+  }
+
+  const createdItems = sessionsStore.addPrintQueueItems({
+    shop: normalizedShop,
+    createdBy: staff,
+    items: queueItemsToCreate,
+  });
+
+  result.createdCount = createdItems.length;
+  result.createdPartCount = createdItems.reduce((count, item) => (
+    count + 1 + (Array.isArray(item.childItems) ? item.childItems.length : 0)
+  ), 0);
+
+  return result;
 }
 
 function normalizeTrackerOrderId(ref) {
@@ -1728,10 +1852,21 @@ router.post('/api/awaiting-parts', async (req, res) => {
       partTypeGroup: 'UNKNOWN',
       quantity: Math.max(1, Number(item.quantity) || 1),
     }));
+    let pickListSheet = null;
+    let printQueueUpdate = {
+      addedSkus: [],
+      alreadyQueuedSkus: [],
+      blockedByQueued: [],
+      notPrintableSkus: [],
+      missingSkus: [],
+      createdCount: 0,
+      createdPartCount: 0,
+      error: null,
+    };
 
     if (normalizedAwaitingPartsItems.length > 0) {
       try {
-        const pickListSheet = await fetchPickListSheet();
+        pickListSheet = await fetchPickListSheet();
         typedAwaitingPartsItems = normalizedAwaitingPartsItems.map((item) => {
           const normalizedSku = normalizeSku(item.sku);
           const sheetRow = pickListSheet.skuMap.get(normalizedSku);
@@ -1745,6 +1880,21 @@ router.post('/api/awaiting-parts', async (req, res) => {
         });
       } catch (sheetErr) {
         console.error('Failed to enrich awaiting parts items with sheet types:', sheetErr);
+        printQueueUpdate.error = 'Failed to load the sheet, so the print queue was not updated.';
+      }
+    }
+
+    if (normalizedAwaitingPartsItems.length > 0 && pickListSheet?.skuMap) {
+      try {
+        printQueueUpdate = syncAwaitingPartsToPrintQueue({
+          shop,
+          staff,
+          items: normalizedAwaitingPartsItems,
+          skuMap: pickListSheet.skuMap,
+        });
+      } catch (printQueueErr) {
+        console.error('Failed to sync awaiting parts to print queue:', printQueueErr);
+        printQueueUpdate.error = printQueueErr.message || 'Failed to update the print queue.';
       }
     }
 
@@ -1841,6 +1991,7 @@ router.post('/api/awaiting-parts', async (req, res) => {
       skus: normalizedAwaitingPartsItems.map((item) => item.sku),
       awaitingPartsSelection: normalizedAwaitingPartsItems,
       awaitingPartsItems: typedAwaitingPartsItems,
+      printQueueUpdate,
     });
 
   } catch (err) {
@@ -2003,6 +2154,312 @@ router.get('/api/awaiting-parts-summary', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /api/awaiting-parts-summary:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/print-catalog', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const pickListSheet = await fetchPickListSheet();
+    const items = buildPrintCatalogFromSheet({
+      skuMap: pickListSheet.skuMap,
+    });
+
+    return res.json({
+      success: true,
+      items,
+      sheetFetchedAt: pickListSheet.fetchedAt,
+      sheetSkuCount: pickListSheet.sourceRowCount,
+      notesEnabled: pickListSheet.notesEnabled || false,
+      notesLoaded: pickListSheet.notesLoaded || false,
+      notesError: pickListSheet.notesError || null,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-catalog:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/print-queue', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const items = sessionsStore.getPrintQueueItems({
+      shop: auth.shop,
+      completeLimit: 80,
+    });
+
+    return res.json({
+      success: true,
+      stages: PRINT_QUEUE_STAGES,
+      items,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/print-queue/catalog', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const sku = normalizeSku(req.body?.sku);
+    if (!sku) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing SKU',
+      });
+    }
+
+    const pickListSheet = await fetchPickListSheet();
+    const sheetRow = pickListSheet.skuMap.get(sku);
+    if (!sheetRow) {
+      return res.status(404).json({
+        success: false,
+        error: `SKU ${sku} not found in pick list sheet`,
+      });
+    }
+
+    if (!isPrintableSheetRow(sheetRow)) {
+      return res.status(400).json({
+        success: false,
+        error: `SKU ${sku} is not an SLS or Adapter item`,
+      });
+    }
+
+    const queueItems = buildPrintQueueItemsForCatalogSku({
+      skuMap: pickListSheet.skuMap,
+      sku,
+    });
+
+    if (!queueItems.length) {
+      return res.status(400).json({
+        success: false,
+        error: `No eligible SLS or Adapter print jobs found for ${sku}`,
+      });
+    }
+
+    const createdItems = sessionsStore.addPrintQueueItems({
+      shop: auth.shop,
+      createdBy: auth.userId,
+      items: queueItems,
+    });
+    const createdPartCount = createdItems.reduce((count, item) => (
+      count + 1 + (Array.isArray(item.childItems) ? item.childItems.length : 0)
+    ), 0);
+
+    return res.json({
+      success: true,
+      createdItems,
+      createdCount: createdItems.length,
+      createdPartCount,
+      rootSku: sku,
+      sheetFetchedAt: pickListSheet.fetchedAt,
+      sheetSkuCount: pickListSheet.sourceRowCount,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/catalog:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/print-queue/custom', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const title = String(req.body?.title || '').trim();
+    if (!title) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing custom file name',
+      });
+    }
+
+    const quantity = parsePositiveInteger(req.body?.quantity, 1);
+    const customFileUrl = String(req.body?.customFileUrl || '').trim();
+    if (customFileUrl && !/^https?:\/\//i.test(customFileUrl)) {
+      return res.status(400).json({
+        success: false,
+        error: 'Custom file link must start with http:// or https://',
+      });
+    }
+
+    const createdItems = sessionsStore.addPrintQueueItems({
+      shop: auth.shop,
+      createdBy: auth.userId,
+      items: [{
+        sourceType: 'custom',
+        title,
+        typeRaw: 'CUSTOM',
+        quantity,
+        customFileName: String(req.body?.customFileName || title).trim(),
+        customFileUrl,
+        notes: String(req.body?.notes || '').trim(),
+        stageKey: DEFAULT_PRINT_QUEUE_STAGE,
+      }],
+    });
+
+    return res.json({
+      success: true,
+      createdItems,
+      createdCount: createdItems.length,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/custom:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/print-queue/preform-build', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const queueItems = sessionsStore.getActivePrintQueueItems({
+      shop: auth.shop,
+    });
+    const needsPrintedItems = queueItems.filter((item) => item.stageKey === DEFAULT_PRINT_QUEUE_STAGE);
+    if (!needsPrintedItems.length) {
+      return res.status(400).json({
+        success: false,
+        error: 'No jobs are currently in Needs Printed',
+      });
+    }
+
+    const buildResult = await preparePreformBuildFromQueueItems(needsPrintedItems);
+    const movedItemIds = [];
+
+    if (buildResult.preform?.formFilePath && req.body?.moveToInBuild !== false) {
+      const queueItemIds = Array.isArray(buildResult.manifest?.queueItemIds)
+        ? buildResult.manifest.queueItemIds
+        : [];
+      queueItemIds.forEach((id) => {
+        const updatedItem = sessionsStore.updatePrintQueueItemStage({
+          shop: auth.shop,
+          id: Number(id),
+          stageKey: 'in_build',
+        });
+        if (updatedItem) movedItemIds.push(updatedItem.id);
+      });
+    }
+
+    return res.json({
+      success: true,
+      mode: buildResult.mode,
+      manifest: buildResult.manifest,
+      manifestPath: buildResult.manifestPath,
+      preform: buildResult.preform,
+      movedItemIds,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/preform-build:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/print-queue/:id/stage', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const id = Number(req.params.id);
+    const stageKey = normalizeStageKey(req.body?.stageKey);
+    if (!Number.isInteger(id) || id <= 0 || !stageKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing print item id or valid stage',
+      });
+    }
+
+    const item = sessionsStore.updatePrintQueueItemStage({
+      shop: auth.shop,
+      id,
+      stageKey,
+    });
+
+    if (!item) {
+      return res.status(404).json({
+        success: false,
+        error: 'Print queue item not found',
+      });
+    }
+
+    return res.json({
+      success: true,
+      item,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/:id/stage:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/print-queue/:id/put-away', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing print item id',
+      });
+    }
+
+    const result = sessionsStore.putAwayPrintQueueItem({
+      shop: auth.shop,
+      id,
+    });
+
+    if (result.reason === 'not_found') {
+      return res.status(404).json({
+        success: false,
+        error: 'Print queue item not found',
+      });
+    }
+
+    if (result.reason === 'not_complete') {
+      return res.status(400).json({
+        success: false,
+        error: 'Only complete print jobs can be put away',
+      });
+    }
+
+    return res.json({
+      success: true,
+      item: result.item,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/:id/put-away:', err);
     return res.status(500).json({
       success: false,
       error: err.message || 'Server error',

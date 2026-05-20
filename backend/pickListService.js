@@ -46,6 +46,51 @@ function normalizeBundleGroupId(value) {
   return String(value || '').trim();
 }
 
+function parsePositiveInteger(value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) return 0;
+
+  const parsed = Number(normalized);
+  if (!Number.isFinite(parsed)) return 0;
+
+  return Math.max(0, Math.floor(parsed));
+}
+
+function parseComponentCellValue(value, skuSet = new Set()) {
+  const rawValue = String(value || '').trim();
+  if (!rawValue) return null;
+
+  const exactSku = normalizeSku(rawValue);
+  if (skuSet.has(exactSku)) {
+    return { sku: exactSku, quantityMultiplier: 1 };
+  }
+
+  const patterns = [
+    { regex: /^(.*?)\s*\|\s*QTY\s*(\d+)\s*$/i, skuIndex: 1, multiplierIndex: 2 },
+    { regex: /^(.*?)\s+(?:QTY|QUANTITY)\s*(\d+)\s*$/i, skuIndex: 1, multiplierIndex: 2 },
+    { regex: /^(.*?)\s*(?:\(|\[)?\s*(?:X|×|\*)\s*(\d+)\s*(?:\)|\])?\s*$/i, skuIndex: 1, multiplierIndex: 2 },
+    { regex: /^(\d+)\s*(?:X|×|\*)\s+(.+)$/i, skuIndex: 2, multiplierIndex: 1 },
+  ];
+
+  for (const pattern of patterns) {
+    const match = rawValue.match(pattern.regex);
+    if (!match) continue;
+
+    const skuCandidate = normalizeSku(match[pattern.skuIndex]);
+    const multiplier = Math.max(1, Math.floor(Number(match[pattern.multiplierIndex]) || 1));
+
+    if (!skuCandidate) continue;
+    if (skuSet.size > 0 && !skuSet.has(skuCandidate)) continue;
+
+    return {
+      sku: skuCandidate,
+      quantityMultiplier: multiplier,
+    };
+  }
+
+  return { sku: exactSku, quantityMultiplier: 1 };
+}
+
 function parseGoogleVizJson(text) {
   const startIndex = text.indexOf('{');
   const endIndex = text.lastIndexOf('}');
@@ -189,6 +234,14 @@ function buildRowsFromTable(table) {
   const typeIdx = headers.findIndex((h) => h === 'TYPE');
   const locationIdx = headers.findIndex((h) => h === 'LOCATION');
   const showPickIdx = headers.findIndex((h) => h === 'SHOWPICK');
+  const rsqIdx = headers.findIndex((h) => h === 'RSQ');
+  const titleIdx = headers.findIndex((h) => (
+    h === 'TITLE'
+    || h === 'NAME'
+    || h === 'PRODUCT'
+    || h === 'PRODUCTTITLE'
+    || h === 'DESCRIPTION'
+  ));
   const plIndexes = headers
     .map((h, idx) => ({ h, idx }))
     .filter((item) => /^PL\d+$/.test(item.h))
@@ -210,19 +263,36 @@ function buildRowsFromTable(table) {
     const type = typeIdx >= 0 ? String(getCellValue(rowCells[typeIdx] || '')).trim().toUpperCase() : '';
     const location = locationIdx >= 0 ? String(getCellValue(rowCells[locationIdx] || '')).trim() : '';
     const showPick = showPickIdx >= 0 ? String(getCellValue(rowCells[showPickIdx] || '')).trim() : '';
-    const components = plIndexes
-      .map((idx) => normalizeSku(getCellValue(rowCells[idx] || '')))
+    const rsq = rsqIdx >= 0 ? parsePositiveInteger(getCellValue(rowCells[rsqIdx] || '')) : 0;
+    const title = titleIdx >= 0 ? String(getCellValue(rowCells[titleIdx] || '')).trim() : '';
+    const rawComponents = plIndexes
+      .map((idx) => String(getCellValue(rowCells[idx] || '')).trim())
       .filter(Boolean);
 
     skuMap.set(sku, {
       sku,
       pickType,
       type,
+      title,
       location,
+      rsq,
       hideOwnPickRow: showPick.toUpperCase() === 'NO',
-      components,
+      components: [],
+      componentItems: [],
+      rawComponents,
       note: '',
     });
+  }
+
+  const skuSet = new Set(skuMap.keys());
+  for (const row of skuMap.values()) {
+    const componentItems = (Array.isArray(row.rawComponents) ? row.rawComponents : [])
+      .map((rawComponent) => parseComponentCellValue(rawComponent, skuSet))
+      .filter((component) => component?.sku);
+
+    row.componentItems = componentItems;
+    row.components = componentItems.map((component) => component.sku);
+    delete row.rawComponents;
   }
 
   return { skuMap, sourceRowCount: skuMap.size };
@@ -400,11 +470,18 @@ function expandSkuRecursively({ skuMap, sku, quantity, outCounts, stackSet }) {
 
   stackSet.add(sku);
 
-  for (const componentSku of row.components) {
+  const componentItems = Array.isArray(row.componentItems) && row.componentItems.length > 0
+    ? row.componentItems
+    : row.components.map((componentSku) => ({
+        sku: componentSku,
+        quantityMultiplier: 1,
+      }));
+
+  for (const component of componentItems) {
     expandSkuRecursively({
       skuMap,
-      sku: componentSku,
-      quantity,
+      sku: component.sku,
+      quantity: quantity * Math.max(1, Number(component.quantityMultiplier) || 1),
       outCounts,
       stackSet,
     });
@@ -567,7 +644,9 @@ function buildPutAwaySkuLookup({ skuMap, sku }) {
       found: Boolean(componentRow),
       pickType: componentRow?.pickType || componentMeta.type || 'UNKNOWN',
       type: componentRow?.type || '',
+      title: componentRow?.title || '',
       location: componentRow?.location || componentMeta.location || '',
+      rsq: componentRow?.rsq || 0,
       note: componentRow?.note || componentMeta.note || '',
       classification: componentMeta.classification,
       componentCount: Array.isArray(componentRow?.components) ? componentRow.components.length : 0,
@@ -578,7 +657,9 @@ function buildPutAwaySkuLookup({ skuMap, sku }) {
     sku: normalizedSku,
     pickType: row.pickType || meta.type || 'UNKNOWN',
     type: row.type || '',
+    title: row.title || '',
     location: row.location || meta.location || '',
+    rsq: row.rsq || 0,
     note: row.note || meta.note || '',
     classification: meta.classification,
     hideOwnPickRow: Boolean(row.hideOwnPickRow),
