@@ -818,15 +818,45 @@ async function putAwayPrintItem(itemId) {
       method: 'POST',
       headers: { Accept: 'application/json' },
     });
-    await readJsonResponse(response, 'Failed to put away print job');
+    const data = await readJsonResponse(response, 'Failed to put away print job');
 
     setLoading(false);
     await fetchPrintQueue({ silent: true, includeCatalog: false });
-    setStatus('Print job put away.', 'success');
+    setStatus(formatPutAwayResultMessage(data), data.awaitingPartsChatError ? 'error' : 'success');
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
     setLoading(false);
   }
+}
+
+function formatPutAwayResultMessage(data) {
+  const matches = Array.isArray(data?.awaitingPartsMatches) ? data.awaitingPartsMatches : [];
+  if (matches.length === 0) {
+    const chatStatus = data.awaitingPartsChatSent
+      ? 'Team notified in chat.'
+      : (data.awaitingPartsChatError ? `Chat not sent: ${data.awaitingPartsChatError}.` : '');
+    return ['Print job put away.', 'No waiting orders found for these SKUs.', chatStatus]
+      .filter(Boolean)
+      .join(' ');
+  }
+
+  const orderNumbers = Array.from(new Set(matches.flatMap((match) => (
+    Array.isArray(match.orders) ? match.orders : []
+  )).map((order) => String(order.orderNumber || order.orderId || '').trim()).filter(Boolean)));
+  const skuLabels = matches.map((match) => String(match.partSku || '').trim()).filter(Boolean);
+  const orderSummary = orderNumbers.slice(0, 4).join(', ')
+    + (orderNumbers.length > 4 ? ` +${orderNumbers.length - 4}` : '');
+  const skuSummary = skuLabels.slice(0, 4).join(', ')
+    + (skuLabels.length > 4 ? ` +${skuLabels.length - 4}` : '');
+  const chatStatus = data.awaitingPartsChatSent
+    ? 'Team notified in chat.'
+    : (data.awaitingPartsChatError ? `Chat not sent: ${data.awaitingPartsChatError}.` : '');
+
+  return [
+    'Print job put away.',
+    `${orderNumbers.length} ${orderNumbers.length === 1 ? 'order is' : 'orders are'} waiting on ${skuSummary}: ${orderSummary}.`,
+    chatStatus,
+  ].filter(Boolean).join(' ');
 }
 
 function formatPreformBuildSummary(data) {

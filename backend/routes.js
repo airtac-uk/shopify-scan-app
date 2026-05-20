@@ -603,6 +603,69 @@ function collectPrintQueueSkus(item) {
   return skus;
 }
 
+function summarizeAwaitingPartsMatches(rows) {
+  const bySku = new Map();
+
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const sku = normalizeSku(row?.partSku);
+    if (!sku) return;
+
+    if (!bySku.has(sku)) {
+      bySku.set(sku, {
+        partSku: sku,
+        totalQuantity: 0,
+        openOrderCount: 0,
+        orders: [],
+      });
+    }
+
+    const entry = bySku.get(sku);
+    const quantity = Math.max(1, Number(row?.quantity) || 1);
+    entry.totalQuantity += quantity;
+    entry.orders.push({
+      orderId: String(row?.orderId || '').trim(),
+      orderNumber: String(row?.orderNumber || '').trim(),
+      quantity,
+      reportedBy: String(row?.reportedBy || '').trim(),
+      createdAt: row?.createdAt || null,
+    });
+  });
+
+  return Array.from(bySku.values())
+    .map((entry) => ({
+      ...entry,
+      openOrderCount: entry.orders.length,
+    }))
+    .sort((left, right) => left.partSku.localeCompare(right.partSku));
+}
+
+function formatPrintPutAwayAwaitingPartsChat({ item, matches, staff }) {
+  const label = normalizeSku(item?.sku) || String(item?.title || item?.customFileName || item?.id || '').trim();
+  const lines = [
+    `✅ Printed parts put away${label ? `: ${label}` : ''}`,
+    staff ? `Put away by: ${staff}` : '',
+  ].filter(Boolean);
+
+  if (!Array.isArray(matches) || matches.length === 0) {
+    lines.push('', 'No open awaiting-parts orders are currently waiting on these SKUs.');
+    return lines.join('\n');
+  }
+
+  lines.push('', '🚨 Orders waiting on these parts:');
+
+  matches.forEach((match) => {
+    const orderText = match.orders
+      .map((order) => {
+        const orderLabel = order.orderNumber || order.orderId;
+        return `${orderLabel} x${order.quantity}`;
+      })
+      .join(', ');
+    lines.push(`- ${match.partSku}: ${orderText}`);
+  });
+
+  return lines.join('\n');
+}
+
 function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
   const result = {
     addedSkus: [],
@@ -2454,9 +2517,41 @@ router.post('/api/print-queue/:id/put-away', async (req, res) => {
       });
     }
 
+    const printedSkus = collectPrintQueueSkus(result.item);
+    const awaitingRows = sessionsStore.getOpenAwaitingPartsItemsForSkus({
+      shop: auth.shop,
+      skus: printedSkus,
+    });
+    const awaitingPartsMatches = summarizeAwaitingPartsMatches(awaitingRows);
+    let awaitingPartsChatSent = false;
+    let awaitingPartsChatError = null;
+
+    const webhookUrl = String(process.env.GCHAT_WEBHOOK_URL || '').trim();
+    if (webhookUrl) {
+      try {
+        await sendGoogleChatMessage(
+          webhookUrl,
+          formatPrintPutAwayAwaitingPartsChat({
+            item: result.item,
+            matches: awaitingPartsMatches,
+            staff: auth.userId,
+          })
+        );
+        awaitingPartsChatSent = true;
+      } catch (chatErr) {
+        awaitingPartsChatError = chatErr.message || 'Failed to send Google Chat message';
+        console.error('Google Chat print put-away notification failed:', chatErr);
+      }
+    } else {
+      awaitingPartsChatError = 'GCHAT_WEBHOOK_URL is not configured';
+    }
+
     return res.json({
       success: true,
       item: result.item,
+      awaitingPartsMatches,
+      awaitingPartsChatSent,
+      awaitingPartsChatError,
     });
   } catch (err) {
     console.error('Error in /api/print-queue/:id/put-away:', err);

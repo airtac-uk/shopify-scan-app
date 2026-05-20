@@ -864,6 +864,53 @@ module.exports = {
       .map((item) => item.partSku);
   },
 
+  getOpenAwaitingPartsItemsForSkus({ shop, skus = [] } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedSkus = Array.from(new Set((Array.isArray(skus) ? skus : [])
+      .map(normalizeBarcode)
+      .filter(Boolean)));
+
+    if (!normalizedShop || normalizedSkus.length === 0) {
+      return [];
+    }
+
+    const placeholders = normalizedSkus.map(() => '?').join(', ');
+    const rows = db.prepare(`
+      SELECT
+        api.partSku AS partSku,
+        api.partTypeRaw AS partTypeRaw,
+        api.partTypeGroup AS partTypeGroup,
+        api.orderId AS orderId,
+        api.orderNumber AS orderNumber,
+        api.quantity AS quantity,
+        api.reportedBy AS reportedBy,
+        api.createdAt AS createdAt,
+        api.updatedAt AS updatedAt
+      FROM awaiting_parts_items api
+      INNER JOIN order_trackers ot
+        ON ot.shop = api.shop
+       AND ot.orderId = api.orderId
+      WHERE api.shop = ?
+        AND api.resolvedAt IS NULL
+        AND api.partSku IN (${placeholders})
+        AND ot.currentStageKey = 'awaiting_parts'
+        AND COALESCE(UPPER(ot.workflowStatus), '') != 'CANCELLED'
+      ORDER BY api.partSku ASC, api.createdAt ASC, api.orderNumber ASC
+    `).all(normalizedShop, ...normalizedSkus);
+
+    return rows.map((row) => ({
+      partSku: normalizeBarcode(row.partSku),
+      partTypeRaw: String(row.partTypeRaw || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN',
+      partTypeGroup: String(row.partTypeGroup || 'UNKNOWN').trim().toUpperCase() || 'UNKNOWN',
+      orderId: String(row.orderId || '').trim(),
+      orderNumber: String(row.orderNumber || '').trim(),
+      quantity: Math.max(1, Number(row.quantity) || 1),
+      reportedBy: String(row.reportedBy || '').trim(),
+      createdAt: row.createdAt || null,
+      updatedAt: row.updatedAt || null,
+    })).filter((row) => row.partSku && row.orderId);
+  },
+
   addPrintQueueItems({ shop, items = [], createdBy = null }) {
     const normalizedShop = String(shop || '').trim();
     if (!normalizedShop) return [];
