@@ -41,6 +41,11 @@ const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
 const WHOLESALE_MODE_COOKIE = 'pick_list_wholesale_mode';
 const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built', 'on_hold']);
 
+function appendOrderNoteWarning(message, data) {
+  const warning = String(data?.orderNoteWarning || '').trim();
+  return warning ? `${message} Note was not updated: ${warning}` : message;
+}
+
 function getCookieValue(name) {
   const prefix = `${name}=`;
   const cookie = document.cookie
@@ -915,7 +920,7 @@ async function saveAwaitingPartsSelection({ orderId, items, closeDialog = false 
       ? formatAwaitingPrintQueueMessage(data.printQueueUpdate)
       : '';
     setStatus(
-      [baseStatus, printQueueStatus].filter(Boolean).join(' '),
+      [appendOrderNoteWarning(baseStatus, data), printQueueStatus].filter(Boolean).join(' '),
       data.printQueueUpdate?.error ? 'error' : 'success'
     );
 
@@ -2488,7 +2493,10 @@ async function submitOnHold() {
     lastActionTag = 'on_hold';
     lastActionBarcode = orderId;
     closeOnHoldDialog();
-    setStatus(`Order ${data.orderNumber} put on hold by ${data.staff}: ${reason}`, 'success');
+    setStatus(
+      appendOrderNoteWarning(`Order ${data.orderNumber} put on hold by ${data.staff}: ${reason}`, data),
+      'success'
+    );
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
   } finally {
@@ -2608,11 +2616,17 @@ async function runOrderAction(tag) {
 
     if (tag === 'wholesale_adapter_built') {
       setStatus(
-        `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`,
+        appendOrderNoteWarning(
+          `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`,
+          data
+        ),
         'success'
       );
     } else {
-      setStatus(`Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`, 'success');
+      setStatus(
+        appendOrderNoteWarning(`Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`, data),
+        'success'
+      );
     }
 
     if (tag === 'awaiting_parts') {

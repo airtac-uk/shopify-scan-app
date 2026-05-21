@@ -90,6 +90,21 @@ async function appendOrderNote( client, orderGid, appendText ) {
   return { success: true };
 }
 
+async function appendOrderNoteOrWarn(client, orderGid, appendText, context = {}) {
+  try {
+    await appendOrderNote(client, orderGid, appendText);
+    return { success: true, error: null };
+  } catch (err) {
+    const error = err.message || 'Failed to update order note';
+    console.error('Order note update failed; continuing action:', {
+      ...context,
+      orderGid,
+      error,
+    });
+    return { success: false, error };
+  }
+}
+
 
 // ---------------------
 // 1️⃣ /auth - start OAuth
@@ -1592,6 +1607,7 @@ router.post('/api/tag-order', async (req, res) => {
     }
 
     const staff = userId;
+    let orderNoteWarning = null;
     const normalizedBarcode = normalizeScanBarcode(barcode);
     const client = shopifyClient(session);
 
@@ -1809,8 +1825,17 @@ router.post('/api/tag-order', async (req, res) => {
         }
 
         if (orderNoteBlock) {
-          await appendOrderNote(client, order.id, orderNoteBlock);
-          order.note = `${order.note || ''}${orderNoteBlock}`;
+          const noteResult = await appendOrderNoteOrWarn(client, order.id, orderNoteBlock, {
+            route: '/api/tag-order',
+            orderNumber: order.name,
+            barcode,
+            tag,
+          });
+          if (noteResult.success) {
+            order.note = `${order.note || ''}${orderNoteBlock}`;
+          } else {
+            orderNoteWarning = noteResult.error;
+          }
         }
       } else {
       console.log("Skipped as already tagged")
@@ -1905,6 +1930,7 @@ router.post('/api/tag-order', async (req, res) => {
       lineItems: lineItemArray,
       staff: attributedStaff,
       wholesaleAdapterBuiltCount,
+      orderNoteWarning,
       trackerToken: trackerInfo.trackerToken,
       trackerUrl: trackerInfo.trackerUrl,
     });
@@ -2032,20 +2058,54 @@ router.post('/api/awaiting-parts', async (req, res) => {
       }
     `;
 
-    const updateRes = await client.graphql(updateNoteMutation, {
-      variables: {
-        id: order.id,
-        note: updatedNote,
-        tags: nextTags,
-      },
-    });
-
-    if (updateRes.data?.orderUpdate?.userErrors?.length) {
-      console.error(updateRes.data.orderUpdate.userErrors);
-      return res.status(500).json({
-        success: false,
-        error: 'Failed to update order note',
+    let orderNoteWarning = null;
+    try {
+      const updateRes = await client.graphql(updateNoteMutation, {
+        variables: {
+          id: order.id,
+          note: updatedNote,
+          tags: nextTags,
+        },
       });
+
+      const userErrors = updateRes.data?.orderUpdate?.userErrors || [];
+      if (userErrors.length) {
+        throw new Error(userErrors.map((entry) => entry.message).join('; '));
+      }
+    } catch (noteErr) {
+      orderNoteWarning = noteErr.message || 'Failed to update order note';
+      console.error('Awaiting parts order note update failed; continuing action:', {
+        orderId: order.id,
+        orderNumber: order.name,
+        barcode,
+        error: orderNoteWarning,
+      });
+
+      const updateTagsOnlyMutation = `
+        mutation updateOrderAwaitingPartsTags($id: ID!, $tags: [String!]) {
+          orderUpdate(input: { id: $id, tags: $tags }) {
+            userErrors {
+              field
+              message
+            }
+          }
+        }
+      `;
+      const tagUpdateRes = await client.graphql(updateTagsOnlyMutation, {
+        variables: {
+          id: order.id,
+          tags: nextTags,
+        },
+      });
+      const tagUserErrors = tagUpdateRes.data?.orderUpdate?.userErrors || [];
+      if (tagUserErrors.length) {
+        console.error(tagUserErrors);
+        return res.status(500).json({
+          success: false,
+          error: 'Failed to update order tags',
+          orderNoteWarning,
+        });
+      }
     }
 
     let typedAwaitingPartsItems = normalizedAwaitingPartsItems.map((item) => ({
@@ -2194,6 +2254,7 @@ router.post('/api/awaiting-parts', async (req, res) => {
       awaitingPartsSelection: normalizedAwaitingPartsItems,
       awaitingPartsItems: typedAwaitingPartsItems,
       printQueueUpdate,
+      orderNoteWarning,
     });
 
   } catch (err) {
@@ -3348,8 +3409,15 @@ router.post('/api/wholesale-progress', async (req, res) => {
               '',
             ].join('\n');
 
-            await appendOrderNote(client, order.id, orderNoteBlock);
-            order.note = `${order.note || ''}${orderNoteBlock}`;
+            const noteResult = await appendOrderNoteOrWarn(client, order.id, orderNoteBlock, {
+              route: '/api/pick-list',
+              orderNumber: order.name,
+              barcode: normalizedBarcode,
+              tag: 'wholesale_adapter_built',
+            });
+            if (noteResult.success) {
+              order.note = `${order.note || ''}${orderNoteBlock}`;
+            }
 
             const lineItemArray = buildCurrentOrderLineItems(order.lineItems?.edges || []);
             await persistOrderTrackerSnapshot({

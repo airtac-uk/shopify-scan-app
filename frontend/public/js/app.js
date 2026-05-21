@@ -6,6 +6,11 @@ var hidBuffer = "";
 var hidLastKeyAt = 0;
 var hidBufferTimeoutId = null;
 
+function appendOrderNoteWarning(message, data) {
+  const warning = String(data?.orderNoteWarning || '').trim();
+  return warning ? `${message} Note was not updated: ${warning}` : message;
+}
+
 function loading() {
 
   loadingTrack = true;
@@ -125,11 +130,16 @@ async function submitAwaitingParts() {
     return;
   }
 
-  await fetch('/api/awaiting-parts', {
+  const response = await fetch('/api/awaiting-parts', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({ orderId, skus }),
   });
+  const data = await response.json().catch(() => ({}));
+  const scanResult = document.getElementById('scanResult');
+  if (scanResult && data?.success) {
+    scanResult.textContent = appendOrderNoteWarning(`Awaiting parts updated for ${data.orderNumber || orderId}.`, data);
+  }
 
   closeAwaitingParts();
 }
@@ -307,9 +317,15 @@ document.addEventListener('DOMContentLoaded', () => {
         lastBarcode = normalizedBarcode;
         positiveDing();
         if (tag === 'wholesale_adapter_built') {
-          scanResult.textContent = `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`;
+          scanResult.textContent = appendOrderNoteWarning(
+            `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`,
+            data
+          );
         } else {
-          scanResult.textContent = `Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`;
+          scanResult.textContent = appendOrderNoteWarning(
+            `Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`,
+            data
+          );
         }
       } else {
         negativeDing();
