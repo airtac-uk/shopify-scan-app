@@ -4,7 +4,15 @@ const path = require('path');
 const fs = require('fs');
 const crypto = require('crypto');
 
-const dbPath = path.resolve(__dirname, './db/sessions.db');
+function resolveSessionDbPath() {
+  const configuredPath = String(process.env.SESSION_DB || '').trim();
+  if (!configuredPath) return path.resolve(__dirname, './db/sessions.db');
+  return path.isAbsolute(configuredPath)
+    ? configuredPath
+    : path.resolve(__dirname, configuredPath);
+}
+
+const dbPath = resolveSessionDbPath();
 
 // Ensure DB folder exists
 if (!fs.existsSync(path.dirname(dbPath))) {
