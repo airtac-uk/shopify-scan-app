@@ -2505,9 +2505,14 @@ router.post('/api/print-queue/catalog', async (req, res) => {
       });
     }
 
+    const requestedQuantity = req.body?.quantity == null || req.body?.quantity === ''
+      ? null
+      : parsePositiveInteger(req.body.quantity, 1);
+
     const queueItems = buildPrintQueueItemsForCatalogSku({
       skuMap: pickListSheet.skuMap,
       sku,
+      quantity: requestedQuantity,
     });
 
     if (!queueItems.length) {
@@ -2532,6 +2537,7 @@ router.post('/api/print-queue/catalog', async (req, res) => {
       createdCount: createdItems.length,
       createdPartCount,
       rootSku: sku,
+      requestedQuantity,
       sheetFetchedAt: pickListSheet.fetchedAt,
       sheetSkuCount: pickListSheet.sourceRowCount,
     });

@@ -415,8 +415,10 @@ function classifyComponent(skuMap, sku) {
     return {
       sku,
       type: 'UNKNOWN',
+      typeRaw: '',
       location: '',
       note: '',
+      rsq: 0,
       classification: 'review',
     };
   }
@@ -427,8 +429,10 @@ function classifyComponent(skuMap, sku) {
     return {
       sku,
       type: pickType,
+      typeRaw: sheetRow.type || '',
       location: sheetRow.location,
       note: sheetRow.note || '',
+      rsq: sheetRow.rsq || 0,
       classification: 'desk',
     };
   }
@@ -437,8 +441,10 @@ function classifyComponent(skuMap, sku) {
     return {
       sku,
       type: pickType,
+      typeRaw: sheetRow.type || '',
       location: sheetRow.location,
       note: sheetRow.note || '',
+      rsq: sheetRow.rsq || 0,
       classification: 'pick',
     };
   }
@@ -446,8 +452,10 @@ function classifyComponent(skuMap, sku) {
   return {
     sku,
     type: pickType || 'UNKNOWN',
+    typeRaw: sheetRow.type || '',
     location: sheetRow.location,
     note: sheetRow.note || '',
+    rsq: sheetRow.rsq || 0,
     classification: 'review',
   };
 }
@@ -498,7 +506,9 @@ function mapCountsToDisplayRows({ skuMap, counts }) {
       quantity: qty,
       location: meta.location,
       type: meta.type,
+      typeRaw: meta.typeRaw || '',
       note: meta.note,
+      rsq: meta.rsq || 0,
       classification: meta.classification,
     };
   });

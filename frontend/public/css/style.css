@@ -2398,9 +2398,10 @@ button:hover { background: #0056b3; }
   color: #d8f9e5;
 }
 
-.pick-list-awaiting-toggle {
+.pick-list-awaiting-toggle,
+.pick-list-getting-low-btn {
   width: auto;
-  min-width: 68px;
+  min-width: 96px;
   padding: 6px 10px;
   border-radius: 999px;
   border: 1px solid #33506f;
@@ -2413,9 +2414,23 @@ button:hover { background: #0056b3; }
 }
 
 .pick-list-awaiting-toggle:hover:not(:disabled),
-.pick-list-awaiting-toggle:focus-visible:not(:disabled) {
+.pick-list-awaiting-toggle:focus-visible:not(:disabled),
+.pick-list-getting-low-btn:hover:not(:disabled),
+.pick-list-getting-low-btn:focus-visible:not(:disabled) {
   background: rgba(43, 72, 102, 0.96);
   border-color: #5f8fbc;
+}
+
+.pick-list-getting-low-btn {
+  border-color: rgba(76, 116, 80, 0.85);
+  background: rgba(24, 50, 34, 0.92);
+  color: #d9f7df;
+}
+
+.pick-list-getting-low-btn:hover:not(:disabled),
+.pick-list-getting-low-btn:focus-visible:not(:disabled) {
+  background: rgba(36, 78, 49, 0.96);
+  border-color: #78b987;
 }
 
 .pick-list-awaiting-toggle.is-active {
@@ -2424,7 +2439,8 @@ button:hover { background: #0056b3; }
   color: #f6ddaf;
 }
 
-.pick-list-awaiting-toggle:disabled {
+.pick-list-awaiting-toggle:disabled,
+.pick-list-getting-low-btn:disabled {
   opacity: 0.55;
   cursor: not-allowed;
 }
@@ -2513,7 +2529,9 @@ button:hover { background: #0056b3; }
 .pick-list-item-action {
   display: flex;
   justify-content: flex-end;
-  align-items: flex-start;
+  align-items: flex-end;
+  flex-direction: column;
+  gap: 1px;
 }
 
 .pick-list-item-header .pick-list-cell {
@@ -4034,6 +4052,8 @@ button:hover { background: #0056b3; }
     grid-column: 2;
     grid-row: 1 / span 3;
     justify-content: flex-end;
+    align-items: flex-end;
+    flex-direction: column;
     align-self: start;
     margin-top: 0;
   }
@@ -4453,6 +4473,18 @@ html.theme-light .pick-list-awaiting-toggle.is-active {
   background: #fff1d9;
   border-color: #d6ae61;
   color: #8d5f18;
+}
+
+html.theme-light .pick-list-getting-low-btn {
+  background: #edf8f0;
+  border-color: #a9cfb3;
+  color: #245b32;
+}
+
+html.theme-light .pick-list-getting-low-btn:hover:not(:disabled),
+html.theme-light .pick-list-getting-low-btn:focus-visible:not(:disabled) {
+  background: #def1e3;
+  border-color: #7cb98b;
 }
 
 html.theme-light .pick-list-timeline-item {

@@ -203,6 +203,9 @@ function syncAwaitingToggleDisabledState() {
   document.querySelectorAll('.pick-list-awaiting-toggle').forEach((button) => {
     button.disabled = disabled;
   });
+  document.querySelectorAll('.pick-list-getting-low-btn').forEach((button) => {
+    button.disabled = disabled;
+  });
 }
 
 function setStatus(message, type = 'info') {
@@ -255,6 +258,36 @@ function formatAwaitingPrintQueueMessage(update) {
   }
 
   return parts.length > 0 ? `Print queue: ${parts.join('; ')}.` : '';
+}
+
+function isPrintablePickListType(type) {
+  const normalized = String(type || '').trim().toUpperCase();
+  return /(^|[^A-Z0-9])SLS([^A-Z0-9]|$)/.test(normalized)
+    || /(^|[^A-Z0-9])ADAPTER([^A-Z0-9]|$)/.test(normalized);
+}
+
+function getRowRsq(row) {
+  const rsq = Math.floor(Number(row?.rsq) || 0);
+  return rsq > 0 ? rsq : 0;
+}
+
+function promptGettingLowQuantity(row) {
+  const sku = normalizeDisplaySku(row?.sku);
+  const rsq = getRowRsq(row);
+  const defaultQuantity = rsq > 0 ? rsq : 1;
+  const rawValue = window.prompt(
+    [`Quantity to print for ${sku}`, rsq > 0 ? `RSQ: ${rsq}` : 'RSQ: not set'].join('\n'),
+    String(defaultQuantity)
+  );
+  if (rawValue === null) return null;
+
+  const quantity = Math.floor(Number(rawValue));
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    setStatus('Enter a positive whole-number print quantity.', 'error');
+    return null;
+  }
+
+  return quantity;
 }
 
 function openAwaitingPrintQueueResultPopup(message, { isError = false } = {}) {
@@ -988,6 +1021,56 @@ function createAwaitingToggleButton(sku) {
   return button;
 }
 
+async function addGettingLowToPrintQueue(row) {
+  const normalizedSku = normalizeDisplaySku(row?.sku);
+  if (!normalizedSku || loading || isCurrentOrderWorkflowBlocked()) return false;
+
+  const quantity = promptGettingLowQuantity(row);
+  if (quantity === null) return false;
+
+  setLoading(true);
+  setStatus(`Adding ${normalizedSku} x${quantity} to Needs Printed...`, 'info');
+
+  try {
+    const response = await fetch('/api/print-queue/catalog', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+      body: JSON.stringify({ sku: normalizedSku, quantity }),
+    });
+    const data = await response.json().catch(() => ({}));
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to add to print queue');
+    }
+
+    const addedPartCount = Number(data.createdPartCount || data.createdCount || 0);
+    const message = `Added ${normalizedSku} x${quantity} to Needs Printed${addedPartCount > 1 ? ` (${addedPartCount} build parts)` : ''}.`;
+    setStatus(message, 'success');
+    openAwaitingPrintQueueResultPopup(`Print queue: ${message}`, { isError: false });
+    return true;
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, 'error');
+    return false;
+  } finally {
+    setLoading(false);
+  }
+}
+
+function createGettingLowButton(row) {
+  const normalizedSku = normalizeDisplaySku(row?.sku);
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'pick-list-getting-low-btn';
+  button.textContent = 'Getting low';
+  button.title = `Add ${normalizedSku} to Needs Printed without changing the order tag`;
+  button.disabled = loading || isCurrentOrderWorkflowBlocked();
+  button.addEventListener('click', async (event) => {
+    event.preventDefault();
+    event.stopPropagation();
+    await addGettingLowToPrintQueue(row);
+  });
+  return button;
+}
+
 function parsePickLocation(value) {
   const raw = String(value || '').trim();
   if (!raw) {
@@ -1402,6 +1485,9 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
 
     const action = document.createElement('div');
     action.className = 'pick-list-cell pick-list-col-action pick-list-item-action';
+    if (isPrintablePickListType(row.typeRaw || row.type)) {
+      action.appendChild(createGettingLowButton(row));
+    }
     action.appendChild(createAwaitingToggleButton(row.sku));
 
     item.appendChild(main);

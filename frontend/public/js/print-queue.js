@@ -507,6 +507,30 @@ function setCatalogAddedFeedback(sku, { createdCount = 0, createdPartCount = 0 }
   }, PRINT_CATALOG_FEEDBACK_MS + 50);
 }
 
+function getCatalogDefaultQuantity(item) {
+  const value = Number(item?.defaultQuantity || item?.rsq || 1);
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : 1;
+}
+
+function promptCatalogPrintQuantity(item) {
+  const sku = String(item?.sku || '').trim().toUpperCase();
+  const defaultQuantity = getCatalogDefaultQuantity(item);
+  const rsq = Math.max(0, Math.floor(Number(item?.rsq) || 0));
+  const rawValue = window.prompt(
+    [`Quantity to add for ${sku}`, rsq > 0 ? `RSQ: ${rsq}` : 'RSQ: not set'].join('\n'),
+    String(defaultQuantity)
+  );
+  if (rawValue === null) return null;
+
+  const quantity = Math.floor(Number(rawValue));
+  if (!Number.isFinite(quantity) || quantity <= 0) {
+    setStatus('Enter a positive whole-number print quantity.', 'error');
+    return null;
+  }
+
+  return quantity;
+}
+
 async function readJsonResponse(response, fallbackMessage) {
   let data = null;
   try {
@@ -1292,12 +1316,13 @@ async function fetchPrintQueue({ silent = false, includeCatalog = false } = {}) 
   }
 }
 
-async function addCatalogSkuToQueue(sku) {
+async function addCatalogSkuToQueue(sku, quantity = null) {
   const normalizedSku = String(sku || '').trim().toUpperCase();
   if (!normalizedSku || printQueueLoading) return;
+  const requestedQuantity = Math.max(1, Math.floor(Number(quantity) || 1));
 
   setLoading(true);
-  setStatus(`Adding ${normalizedSku}...`, 'info');
+  setStatus(`Adding ${normalizedSku} x${requestedQuantity}...`, 'info');
 
   try {
     const response = await fetch('/api/print-queue/catalog', {
@@ -1306,7 +1331,7 @@ async function addCatalogSkuToQueue(sku) {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({ sku: normalizedSku }),
+      body: JSON.stringify({ sku: normalizedSku, quantity: requestedQuantity }),
     });
     const data = await readJsonResponse(response, 'Failed to add SKU to print queue');
 
@@ -1320,7 +1345,7 @@ async function addCatalogSkuToQueue(sku) {
     renderCatalog();
     const addedPartCount = Number(data.createdPartCount || data.createdCount || 0);
     setStatus(
-      `Added ${data.createdCount || 0} build card with ${addedPartCount} ${addedPartCount === 1 ? 'part' : 'parts'} for ${normalizedSku}.`,
+      `Added ${data.createdCount || 0} build card with ${addedPartCount} ${addedPartCount === 1 ? 'part' : 'parts'} for ${normalizedSku} at x${requestedQuantity}.`,
       'success'
     );
   } catch (err) {
@@ -1889,7 +1914,11 @@ document.addEventListener('DOMContentLoaded', () => {
       if (!button) return;
 
       event.preventDefault();
-      addCatalogSkuToQueue(button.getAttribute('data-print-add-sku'));
+      const sku = button.getAttribute('data-print-add-sku');
+      const item = printCatalogItems.find((catalogItem) => normalizeSearchText(catalogItem?.sku) === normalizeSearchText(sku));
+      const quantity = promptCatalogPrintQuantity(item || { sku });
+      if (quantity === null) return;
+      addCatalogSkuToQueue(sku, quantity);
     });
   }
 

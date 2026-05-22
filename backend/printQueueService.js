@@ -160,7 +160,7 @@ function collectPrintableSkuWithChildren({
     rootSku: rootSku || normalizedSku,
   });
   const baseQuantity = rootQuantity == null ? row.defaultQuantity : rootQuantity;
-  const isRootRow = rootQuantity == null;
+  const isRootRow = !normalizeSku(parentSku);
   const noteMultiplier = isRootRow ? 1 : row.noteQuantityMultiplier;
   const rowWithQuantity = {
     ...row,
@@ -195,7 +195,7 @@ function buildPrintCatalogFromSheet({ skuMap }) {
     });
 }
 
-function buildPrintQueueItemsForCatalogSku({ skuMap, sku }) {
+function buildPrintQueueItemsForCatalogSku({ skuMap, sku, quantity = null }) {
   const normalizedSku = normalizeSku(sku);
   if (!normalizedSku || !(skuMap instanceof Map) || !skuMap.has(normalizedSku)) {
     return [];
@@ -209,6 +209,7 @@ function buildPrintQueueItemsForCatalogSku({ skuMap, sku }) {
     skuMap,
     sku: normalizedSku,
     includeCurrent: true,
+    rootQuantity: quantity == null ? null : parsePositiveInteger(quantity, 1),
   });
   const rootRow = printableRows[0];
   if (!rootRow) return [];
