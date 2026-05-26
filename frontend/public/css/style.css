@@ -547,17 +547,22 @@ button:hover { background: #0056b3; }
   background: #183626;
 }
 
-.pick-verify-item--click-scan {
+.pick-verify-item--tap-scan {
+  grid-template-columns: minmax(0, 1fr) auto;
   cursor: pointer;
 }
 
-.pick-verify-item--click-scan:hover,
-.pick-verify-item--click-scan:focus-visible {
-  border-color: #4d8ad5;
-  background: rgba(43, 72, 102, 0.28);
+.pick-verify-item--tap-scan.pick-list-item--picked {
+  background: rgba(38, 138, 92, 0.22);
+  box-shadow: inset 3px 0 0 rgba(71, 209, 140, 0.82);
 }
 
-.pick-verify-item--click-scan:focus-visible {
+.pick-verify-item--tap-scan.pick-list-item--picked-partial {
+  background: rgba(217, 185, 110, 0.15);
+  box-shadow: inset 3px 0 0 rgba(217, 185, 110, 0.72);
+}
+
+.pick-verify-item--tap-scan:focus-visible {
   outline: 2px solid rgba(124, 200, 255, 0.55);
   outline-offset: 2px;
 }
@@ -4536,10 +4541,14 @@ html.theme-light .pick-verify-item.is-complete {
   background: #e8f8ee;
 }
 
-html.theme-light .pick-verify-item--click-scan:hover,
-html.theme-light .pick-verify-item--click-scan:focus-visible {
-  border-color: #8fb1d3;
-  background: #eef6ff;
+html.theme-light .pick-verify-item--tap-scan.pick-list-item--picked {
+  background: rgba(190, 239, 214, 0.68);
+  box-shadow: inset 3px 0 0 rgba(34, 150, 94, 0.78);
+}
+
+html.theme-light .pick-verify-item--tap-scan.pick-list-item--picked-partial {
+  background: rgba(255, 232, 184, 0.72);
+  box-shadow: inset 3px 0 0 rgba(196, 154, 78, 0.82);
 }
 
 html.theme-light .pick-verify-item-progress {

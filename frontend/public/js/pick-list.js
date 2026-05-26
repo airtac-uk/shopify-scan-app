@@ -1990,26 +1990,31 @@ function renderVerifyOrderCards() {
     }
 
     const complete = row.scannedQty >= row.requiredQty;
+    const usePickStyleVerifyTap = verifyModeEnabled && !wholesaleModeEnabled;
     const item = document.createElement('div');
     item.className = `pick-verify-item${complete ? ' is-complete' : ''}`;
     if (row.isWholesaleBundle) {
       item.classList.add('pick-verify-item--bundle-build');
     }
     item.dataset.verifyKey = row.key;
-    if (verifyModeEnabled && !wholesaleModeEnabled && !loading && !complete) {
-      item.classList.add('pick-verify-item--click-scan');
+    if (usePickStyleVerifyTap) {
+      item.classList.add('pick-verify-item--tap-scan', 'pick-list-item--pickable');
+      item.classList.toggle('pick-list-item--picked', complete);
+      item.classList.toggle('pick-list-item--picked-partial', row.scannedQty > 0 && !complete);
       item.tabIndex = 0;
       item.setAttribute('role', 'button');
-      item.setAttribute('aria-label', `Scan +1: ${getVerifyDisplayLabel(row)}`);
+      item.setAttribute('aria-label', `${complete ? 'Clear' : 'Scan'} ${getVerifyDisplayLabel(row)}`);
       item.addEventListener('click', async (event) => {
+        if (loading) return;
         const target = event.target instanceof Element ? event.target : null;
         if (target?.closest('button, a, input, select, textarea')) return;
-        await processVerifyManual(row.key);
+        await processVerifyTap(row.key);
       });
       item.addEventListener('keydown', async (event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
         event.preventDefault();
-        await processVerifyManual(row.key);
+        if (loading) return;
+        await processVerifyTap(row.key);
       });
     }
 
@@ -2062,37 +2067,38 @@ function renderVerifyOrderCards() {
     progress.className = 'pick-verify-item-progress';
     progress.textContent = `${row.scannedQty} / ${row.requiredQty}`;
 
-    const actions = document.createElement('div');
-    actions.className = 'pick-verify-item-actions';
-
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = 'pick-verify-item-btn';
-    button.textContent = getVerificationIncrementLabel(row, complete);
-    button.dataset.role = 'increment';
-    button.dataset.complete = complete ? '1' : '0';
-    button.disabled = loading || complete;
-    button.addEventListener('click', () => {
-      processVerifyManual(row.key);
-    });
-
-    const undoButton = document.createElement('button');
-    undoButton.type = 'button';
-    undoButton.className = 'pick-verify-item-btn pick-verify-item-btn--undo';
-    undoButton.textContent = '-1';
-    undoButton.dataset.role = 'undo';
-    undoButton.dataset.canUndo = row.scannedQty > 0 ? '1' : '0';
-    undoButton.disabled = loading || row.scannedQty <= 0;
-    undoButton.addEventListener('click', () => {
-      processVerifyUndo(row.key);
-    });
-
-    actions.appendChild(button);
-    actions.appendChild(undoButton);
-
     item.appendChild(info);
     item.appendChild(progress);
-    item.appendChild(actions);
+    if (!usePickStyleVerifyTap) {
+      const actions = document.createElement('div');
+      actions.className = 'pick-verify-item-actions';
+
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'pick-verify-item-btn';
+      button.textContent = getVerificationIncrementLabel(row, complete);
+      button.dataset.role = 'increment';
+      button.dataset.complete = complete ? '1' : '0';
+      button.disabled = loading || complete;
+      button.addEventListener('click', () => {
+        processVerifyManual(row.key);
+      });
+
+      const undoButton = document.createElement('button');
+      undoButton.type = 'button';
+      undoButton.className = 'pick-verify-item-btn pick-verify-item-btn--undo';
+      undoButton.textContent = '-1';
+      undoButton.dataset.role = 'undo';
+      undoButton.dataset.canUndo = row.scannedQty > 0 ? '1' : '0';
+      undoButton.disabled = loading || row.scannedQty <= 0;
+      undoButton.addEventListener('click', () => {
+        processVerifyUndo(row.key);
+      });
+
+      actions.appendChild(button);
+      actions.appendChild(undoButton);
+      item.appendChild(actions);
+    }
     list.appendChild(item);
 
     if (shouldRenderBundleMarkers && bundleGroupId && bundleGroupId !== nextBundleGroupId && hasFollowingItem) {
@@ -2209,6 +2215,40 @@ function getVerifyDisplayLabel(row) {
   if (!row) return 'Item';
   if (row.sku && row.sku !== '(No SKU)') return row.sku;
   return row.productName || 'Item';
+}
+
+async function processVerifyTap(key) {
+  if (!verifyModeEnabled || wholesaleModeEnabled) return;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
+  const row = verifyItems.find((item) => item.key === key);
+  if (!row) {
+    setStatus('Error: Verification item not found.', 'error');
+    return;
+  }
+
+  const requiredQty = Math.max(1, Number(row.requiredQty) || 1);
+  const wasComplete = row.scannedQty >= requiredQty;
+  row.scannedQty = wasComplete ? 0 : Math.min(requiredQty, Math.max(0, Number(row.scannedQty) || 0) + 1);
+
+  renderVerifyOrderCards();
+
+  const totals = getVerifyTotals();
+  if (wasComplete) {
+    setStatus(`Cleared: ${getVerifyDisplayLabel(row)} (0/${requiredQty}).`, totals.isComplete ? 'success' : 'info');
+    return;
+  }
+
+  if (totals.isComplete) {
+    playVerifyCompleteSound();
+    setStatus(`Order ${currentOrderNumber} fully verified (${totals.scanned}/${totals.required}).`, 'success');
+  } else {
+    playVerifyScanSound();
+    setStatus(`${getManualVerificationVerb()}: ${getVerifyDisplayLabel(row)} (${row.scannedQty}/${row.requiredQty}).`, 'success');
+  }
 }
 
 async function processVerifyManual(key) {
