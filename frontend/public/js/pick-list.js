@@ -1996,6 +1996,22 @@ function renderVerifyOrderCards() {
       item.classList.add('pick-verify-item--bundle-build');
     }
     item.dataset.verifyKey = row.key;
+    if (verifyModeEnabled && !wholesaleModeEnabled && !loading && !complete) {
+      item.classList.add('pick-verify-item--click-scan');
+      item.tabIndex = 0;
+      item.setAttribute('role', 'button');
+      item.setAttribute('aria-label', `Scan +1: ${getVerifyDisplayLabel(row)}`);
+      item.addEventListener('click', async (event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest('button, a, input, select, textarea')) return;
+        await processVerifyManual(row.key);
+      });
+      item.addEventListener('keydown', async (event) => {
+        if (event.key !== 'Enter' && event.key !== ' ') return;
+        event.preventDefault();
+        await processVerifyManual(row.key);
+      });
+    }
 
     const info = document.createElement('div');
     info.className = 'pick-verify-item-info';

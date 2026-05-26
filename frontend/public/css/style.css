@@ -547,6 +547,21 @@ button:hover { background: #0056b3; }
   background: #183626;
 }
 
+.pick-verify-item--click-scan {
+  cursor: pointer;
+}
+
+.pick-verify-item--click-scan:hover,
+.pick-verify-item--click-scan:focus-visible {
+  border-color: #4d8ad5;
+  background: rgba(43, 72, 102, 0.28);
+}
+
+.pick-verify-item--click-scan:focus-visible {
+  outline: 2px solid rgba(124, 200, 255, 0.55);
+  outline-offset: 2px;
+}
+
 .pick-verify-item-info h3 {
   margin: 0;
   font-size: 15px;
@@ -1628,12 +1643,14 @@ button:hover { background: #0056b3; }
   display: grid;
   grid-template-columns: repeat(5, minmax(230px, 1fr));
   gap: 12px;
-  align-items: start;
+  align-items: stretch;
   overflow-x: auto;
   padding-bottom: 12px;
 }
 
 .print-queue-column {
+  display: flex;
+  flex-direction: column;
   min-width: 230px;
   min-height: 220px;
   background: #111821;
@@ -1676,6 +1693,8 @@ button:hover { background: #0056b3; }
 
 .print-queue-column__body {
   display: grid;
+  flex: 1 1 auto;
+  align-content: start;
   gap: 10px;
   padding: 10px;
 }
@@ -4515,6 +4534,12 @@ html.theme-light .pick-verify-summary.is-complete,
 html.theme-light .pick-verify-item.is-complete {
   border-color: #82c2a0;
   background: #e8f8ee;
+}
+
+html.theme-light .pick-verify-item--click-scan:hover,
+html.theme-light .pick-verify-item--click-scan:focus-visible {
+  border-color: #8fb1d3;
+  background: #eef6ff;
 }
 
 html.theme-light .pick-verify-item-progress {

@@ -626,6 +626,12 @@ function collectPrintQueueSkus(item) {
   return skus;
 }
 
+function collectPrintQueueCardSkus(items = []) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => normalizeSku(item?.sku))
+    .filter(Boolean);
+}
+
 function extractGoogleDriveFolderId(value) {
   const text = String(value || '').trim();
   if (!text) return '';
@@ -838,14 +844,14 @@ function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
   }
 
   const activePrintQueueItems = sessionsStore.getActivePrintQueueItems({ shop: normalizedShop });
-  const activePrintQueueSkus = new Set(activePrintQueueItems.flatMap(collectPrintQueueSkus));
+  const activePrintQueueCardSkus = new Set(collectPrintQueueCardSkus(activePrintQueueItems));
   const queueItemsToCreate = [];
 
   (Array.isArray(items) ? items : []).forEach((item) => {
     const sku = normalizeSku(item?.sku || item?.partSku);
     if (!sku) return;
 
-    if (activePrintQueueSkus.has(sku)) {
+    if (activePrintQueueCardSkus.has(sku)) {
       result.alreadyQueuedSkus.push(sku);
       return;
     }
@@ -867,16 +873,9 @@ function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
       return;
     }
 
-    const queueItemSkus = Array.from(new Set(queueItems.flatMap(collectPrintQueueSkus)));
-    const queuedConflicts = queueItemSkus.filter((queueSku) => activePrintQueueSkus.has(queueSku));
-    if (queuedConflicts.length > 0) {
-      result.blockedByQueued.push({ sku, queuedSkus: queuedConflicts });
-      return;
-    }
-
     queueItemsToCreate.push(...queueItems);
     result.addedSkus.push(sku);
-    queueItemSkus.forEach((queueSku) => activePrintQueueSkus.add(queueSku));
+    collectPrintQueueCardSkus(queueItems).forEach((queueSku) => activePrintQueueCardSkus.add(queueSku));
   });
 
   if (queueItemsToCreate.length === 0) {
