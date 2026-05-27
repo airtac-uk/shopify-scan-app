@@ -46,6 +46,15 @@ function appendOrderNoteWarning(message, data) {
   return warning ? `${message} Note was not updated: ${warning}` : message;
 }
 
+function appendGeckoboardWarning(message, data) {
+  const warning = String(data?.geckoboardEventWarning || '').trim();
+  return warning ? `${message} Geckoboard event was not sent: ${warning}` : message;
+}
+
+function appendActionWarnings(message, data) {
+  return appendGeckoboardWarning(appendOrderNoteWarning(message, data), data);
+}
+
 function getCookieValue(name) {
   const prefix = `${name}=`;
   const cookie = document.cookie
@@ -2264,7 +2273,12 @@ async function processVerifyManual(key) {
     return;
   }
 
-  if (wholesaleModeEnabled && row.isWholesaleBundle) {
+  if (row.scannedQty >= row.requiredQty) {
+    setStatus(`${getVerifyDisplayLabel(row)} is already fully scanned.`, 'info');
+    return;
+  }
+
+  if (wholesaleModeEnabled) {
     const actionResult = await runOrderAction('wholesale_adapter_built');
     if (actionResult !== true) {
       return;
@@ -2318,7 +2332,7 @@ function processVerifyUndo(key) {
   setStatus(`Undo: ${getVerifyDisplayLabel(row)} (${row.scannedQty}/${row.requiredQty}).`, totals.isComplete ? 'success' : 'info');
 }
 
-function processVerifyScan(scannedCode) {
+async function processVerifyScan(scannedCode) {
   if (!isVerificationStyleModeEnabled()) return false;
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
@@ -2349,6 +2363,18 @@ function processVerifyScan(scannedCode) {
   }
 
   const target = candidates.find((row) => row.scannedQty < row.requiredQty) || candidates[0];
+  if (target.scannedQty >= target.requiredQty) {
+    setStatus(`${getVerifyDisplayLabel(target)} is already fully scanned.`, 'info');
+    return true;
+  }
+
+  if (wholesaleModeEnabled) {
+    const actionResult = await runOrderAction('wholesale_adapter_built');
+    if (actionResult !== true) {
+      return true;
+    }
+  }
+
   const result = incrementVerifyRow(target);
 
   if (!result.success) {
@@ -2636,7 +2662,7 @@ async function submitOnHold() {
     lastActionBarcode = orderId;
     closeOnHoldDialog();
     setStatus(
-      appendOrderNoteWarning(`Order ${data.orderNumber} put on hold by ${data.staff}: ${reason}`, data),
+      appendActionWarnings(`Order ${data.orderNumber} put on hold by ${data.staff}: ${reason}`, data),
       'success'
     );
   } catch (err) {
@@ -2758,7 +2784,7 @@ async function runOrderAction(tag) {
 
     if (tag === 'wholesale_adapter_built') {
       setStatus(
-        appendOrderNoteWarning(
+        appendActionWarnings(
           `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`,
           data
         ),
@@ -2766,7 +2792,7 @@ async function runOrderAction(tag) {
       );
     } else {
       setStatus(
-        appendOrderNoteWarning(`Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`, data),
+        appendActionWarnings(`Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`, data),
         'success'
       );
     }
@@ -2916,7 +2942,7 @@ function setupHidScan() {
   const BUFFER_RESET_MS = 200;
   const MIN_SCAN_LENGTH = 3;
 
-  document.addEventListener('keydown', (event) => {
+  document.addEventListener('keydown', async (event) => {
     if (loading) return;
 
     const actionReminderOpen = isOrderActionReminderDialogOpen();
@@ -2951,7 +2977,7 @@ function setupHidScan() {
         }
 
         if (isVerificationStyleModeEnabled() && hasRenderedPickList && !isOrderCode) {
-          processVerifyScan(scannedCode);
+          await processVerifyScan(scannedCode);
           return;
         }
 
@@ -3112,7 +3138,7 @@ document.addEventListener('DOMContentLoaded', () => {
   if (input) {
     input.addEventListener('focus', () => focusBarcodeInput({ selectAll: true }));
     input.addEventListener('click', () => focusBarcodeInput({ selectAll: true }));
-    input.addEventListener('keydown', (event) => {
+    input.addEventListener('keydown', async (event) => {
       if (event.key === 'Enter') {
         event.preventDefault();
         const rawValue = input.value;
@@ -3129,7 +3155,7 @@ document.addEventListener('DOMContentLoaded', () => {
         }
 
         if (isVerificationStyleModeEnabled() && hasRenderedPickList && !isOrderCode) {
-          processVerifyScan(rawValue);
+          await processVerifyScan(rawValue);
           input.value = '';
           focusBarcodeInput();
           return;

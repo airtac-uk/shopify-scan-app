@@ -244,6 +244,28 @@ async function sendGeckoboardEvent(eventData) {
   }
 }
 
+async function trySendGeckoboardEvent(eventData) {
+  const apiKey = process.env.GECKOBOARD_API_KEY;
+  const datasetId = process.env.GECKOBOARD_DATASET_ID;
+  if (!apiKey || !datasetId) {
+    return {
+      sent: false,
+      warning: 'GECKOBOARD_API_KEY or GECKOBOARD_DATASET_ID is not configured',
+    };
+  }
+
+  try {
+    await sendGeckoboardEvent(eventData);
+    return { sent: true, warning: null };
+  } catch (err) {
+    console.error('Geckoboard event send failed:', err);
+    return {
+      sent: false,
+      warning: err?.message || 'Unknown Geckoboard error',
+    };
+  }
+}
+
 let geckoboardDatasetChecked = false;
 const wholesaleAdapterBuiltScanCounts = new Map();
 const webhookRegistrationCheckedShops = new Set();
@@ -1607,6 +1629,8 @@ router.post('/api/tag-order', async (req, res) => {
 
     const staff = userId;
     let orderNoteWarning = null;
+    let geckoboardEventSent = false;
+    let geckoboardEventWarning = null;
     const normalizedBarcode = normalizeScanBarcode(barcode);
     const client = shopifyClient(session);
 
@@ -1841,18 +1865,16 @@ router.post('/api/tag-order', async (req, res) => {
       }
     }
     
-    try {
-      await sendGeckoboardEvent({
-        timestamp: new Date().toISOString(),
-        order_number: order.name,
-        order_id: order.id,
-        barcode,
-        tag,
-        staff: attributedStaff,
-      });
-    } catch (geckoboardErr) {
-      console.error('Geckoboard event send failed:', geckoboardErr);
-    }
+    const geckoboardResult = await trySendGeckoboardEvent({
+      timestamp: new Date().toISOString(),
+      order_number: order.name,
+      order_id: order.id,
+      barcode: normalizedBarcode,
+      tag,
+      staff: attributedStaff,
+    });
+    geckoboardEventSent = geckoboardResult.sent;
+    geckoboardEventWarning = geckoboardResult.warning;
 
     if (tag == "racked_up") {
       try {
@@ -1930,6 +1952,8 @@ router.post('/api/tag-order', async (req, res) => {
       staff: attributedStaff,
       wholesaleAdapterBuiltCount,
       orderNoteWarning,
+      geckoboardEventSent,
+      geckoboardEventWarning,
       trackerToken: trackerInfo.trackerToken,
       trackerUrl: trackerInfo.trackerUrl,
     });
@@ -3437,17 +3461,16 @@ router.post('/api/wholesale-progress', async (req, res) => {
               staff,
             });
 
-            try {
-              await sendGeckoboardEvent({
-                timestamp: new Date().toISOString(),
-                order_number: order.name,
-                order_id: order.id,
-                barcode: normalizedBarcode,
-                tag: 'wholesale_adapter_built',
-                staff,
-              });
-            } catch (geckoboardErr) {
-              console.error('Geckoboard event send failed:', geckoboardErr);
+            const geckoboardResult = await trySendGeckoboardEvent({
+              timestamp: new Date().toISOString(),
+              order_number: order.name,
+              order_id: order.id,
+              barcode: normalizedBarcode,
+              tag: 'wholesale_adapter_built',
+              staff,
+            });
+            if (!geckoboardResult.sent && geckoboardResult.warning) {
+              console.error('Wholesale progress Geckoboard event was not sent:', geckoboardResult.warning);
             }
 
             const nextCount = (wholesaleAdapterBuiltScanCounts.get(normalizedBarcode) || 0) + 1;

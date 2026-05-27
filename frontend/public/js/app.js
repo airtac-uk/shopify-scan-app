@@ -11,6 +11,15 @@ function appendOrderNoteWarning(message, data) {
   return warning ? `${message} Note was not updated: ${warning}` : message;
 }
 
+function appendGeckoboardWarning(message, data) {
+  const warning = String(data?.geckoboardEventWarning || '').trim();
+  return warning ? `${message} Geckoboard event was not sent: ${warning}` : message;
+}
+
+function appendActionWarnings(message, data) {
+  return appendGeckoboardWarning(appendOrderNoteWarning(message, data), data);
+}
+
 function loading() {
 
   loadingTrack = true;
@@ -317,12 +326,12 @@ document.addEventListener('DOMContentLoaded', () => {
         lastBarcode = normalizedBarcode;
         positiveDing();
         if (tag === 'wholesale_adapter_built') {
-          scanResult.textContent = appendOrderNoteWarning(
+          scanResult.textContent = appendActionWarnings(
             `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`,
             data
           );
         } else {
-          scanResult.textContent = appendOrderNoteWarning(
+          scanResult.textContent = appendActionWarnings(
             `Order ${data.orderNumber} tagged ${tag} successfully by ${data.staff}`,
             data
           );
