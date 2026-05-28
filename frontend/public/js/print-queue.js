@@ -1063,6 +1063,9 @@ function renderQueueCard(item) {
   const isComplete = item.stageKey === 'complete';
   const isNeedsPrinted = item.stageKey === 'needs_printed';
   const isPostDye = item.stageKey === 'post_dye';
+  const awaitingPartsMatches = Array.isArray(item.awaitingPartsMatches) ? item.awaitingPartsMatches : [];
+  const hasAwaitingPartsOrders = awaitingPartsMatches.length > 0;
+  const awaitingPartsOrderCount = Math.max(0, Number(item.awaitingPartsOrderCount) || 0);
   const isDeletePending = String(pendingPrintDeleteItemId) === String(item.id);
   const itemId = String(item.id);
   const isChildrenExpanded = expandedPrintChildItemIds.has(itemId);
@@ -1081,6 +1084,21 @@ function renderQueueCard(item) {
     : '';
   const parentMeta = item.parentSku
     ? `<span>Parent ${escapeHtml(item.parentSku)}</span>`
+    : '';
+  const awaitingPartsMeta = hasAwaitingPartsOrders
+    ? `<span class="print-queue-card__awaiting-parts">Waiting orders ${escapeHtml(awaitingPartsOrderCount || awaitingPartsMatches.length)}</span>`
+    : '';
+  const awaitingPartsTitle = hasAwaitingPartsOrders
+    ? awaitingPartsMatches
+        .map((match) => {
+          const orderNumbers = (Array.isArray(match.orders) ? match.orders : [])
+            .map((order) => String(order.orderNumber || order.orderId || '').trim())
+            .filter(Boolean)
+            .join(', ');
+          return orderNumbers ? `${match.partSku}: ${orderNumbers}` : match.partSku;
+        })
+        .filter(Boolean)
+        .join(' | ')
     : '';
   const typeLabel = isCustom ? 'CUSTOM' : (item.typeRaw || 'UNKNOWN');
   const fileLink = isCustom && item.customFileUrl
@@ -1181,10 +1199,11 @@ function renderQueueCard(item) {
 
   return `
     <article
-      class="print-queue-card"
+      class="print-queue-card${hasAwaitingPartsOrders ? ' print-queue-card--awaiting-parts' : ''}"
       draggable="true"
       data-print-item-id="${escapeHtmlAttribute(item.id)}"
       data-print-item-stage="${escapeHtmlAttribute(item.stageKey)}"
+      ${awaitingPartsTitle ? `title="${escapeHtmlAttribute(`Orders waiting on these parts: ${awaitingPartsTitle}`)}"` : ''}
     >
       <div class="print-queue-card__head">
         <div>
@@ -1200,6 +1219,7 @@ function renderQueueCard(item) {
         <span>${escapeHtml(typeLabel)}</span>
         ${item.rsq ? `<span>RSQ ${escapeHtml(item.rsq)}</span>` : ''}
         ${childItems.length > 0 ? `<span>${escapeHtml(childItems.length + 1)} parts</span>` : ''}
+        ${awaitingPartsMeta}
         ${rootMeta}
         ${parentMeta}
       </div>

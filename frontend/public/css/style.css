@@ -2278,6 +2278,16 @@ button:hover { background: #0056b3; }
   cursor: grab;
 }
 
+.print-queue-card--awaiting-parts {
+  border-color: #b42335;
+  background:
+    linear-gradient(180deg, rgba(114, 24, 36, 0.9), rgba(76, 18, 29, 0.96)),
+    #4c121d;
+  box-shadow:
+    0 0 0 1px rgba(255, 124, 143, 0.24),
+    0 10px 26px rgba(0, 0, 0, 0.22);
+}
+
 .print-queue-card.is-dragging {
   opacity: 0.55;
 }
@@ -2368,6 +2378,16 @@ button:hover { background: #0056b3; }
   color: #b6c6d8;
   font-size: 11px;
   font-weight: 800;
+}
+
+.print-queue-card--awaiting-parts .print-queue-card__meta span {
+  background: rgba(255, 255, 255, 0.12);
+  color: #ffd7de;
+}
+
+.print-queue-card__meta .print-queue-card__awaiting-parts {
+  background: #ffd7de;
+  color: #7d1423;
 }
 
 .print-queue-card__notes {
@@ -5654,6 +5674,14 @@ html.theme-light .print-queue-card {
   border-color: #d0dcea;
 }
 
+html.theme-light .print-queue-card--awaiting-parts {
+  border-color: #d92f45;
+  background: #fff1f3;
+  box-shadow:
+    0 0 0 1px rgba(217, 47, 69, 0.16),
+    0 10px 24px rgba(98, 22, 34, 0.1);
+}
+
 html.theme-light .print-queue-card__head p,
 html.theme-light .print-queue-card__notes,
 html.theme-light .print-queue-card__children-toggle,
@@ -5666,6 +5694,16 @@ html.theme-light .print-queue-card__child-location {
 html.theme-light .print-queue-card__meta span {
   background: #eef4fb;
   color: #486178;
+}
+
+html.theme-light .print-queue-card--awaiting-parts .print-queue-card__meta span {
+  background: #ffe0e5;
+  color: #8e1b2c;
+}
+
+html.theme-light .print-queue-card__meta .print-queue-card__awaiting-parts {
+  background: #d92f45;
+  color: #ffffff;
 }
 
 html.theme-light .print-queue-card__children {

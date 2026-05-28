@@ -868,6 +868,11 @@ function isPackagedActionLocked() {
 function setActionButtonsEnabled(enabled) {
   actionButtonsUnlocked = Boolean(enabled);
   actionButtons.forEach((button) => {
+    if (button.id === 'bagLabelsOpenBtn') {
+      button.disabled = loading || !actionButtonsUnlocked || !canManageShippingForCurrentOrder();
+      return;
+    }
+
     const tag = button.dataset.orderAction || '';
     const packagedLocked = tag === 'packaged' && isPackagedActionLocked();
     button.disabled = loading || !actionButtonsUnlocked || packagedLocked || isCurrentOrderWorkflowBlocked();

@@ -1114,6 +1114,46 @@ function summarizeAwaitingPartsMatches(rows) {
     .sort((left, right) => left.partSku.localeCompare(right.partSku));
 }
 
+function attachAwaitingPartsMatchesToPrintQueueItems({ shop, items }) {
+  const queueItems = Array.isArray(items) ? items : [];
+  const skus = Array.from(new Set(queueItems.flatMap(collectPrintQueueSkus).filter(Boolean)));
+  if (!shop || skus.length === 0) {
+    return queueItems.map((item) => ({
+      ...item,
+      awaitingPartsMatches: [],
+      awaitingPartsOrderCount: 0,
+      awaitingPartsQuantity: 0,
+    }));
+  }
+
+  const awaitingRows = sessionsStore.getOpenAwaitingPartsItemsForSkus({ shop, skus });
+  const matchesBySku = new Map(
+    summarizeAwaitingPartsMatches(awaitingRows).map((match) => [match.partSku, match])
+  );
+
+  return queueItems.map((item) => {
+    const itemMatches = collectPrintQueueSkus(item)
+      .map((sku) => matchesBySku.get(sku))
+      .filter(Boolean);
+    const orderKeys = new Set();
+    itemMatches.forEach((match) => {
+      (Array.isArray(match.orders) ? match.orders : []).forEach((order) => {
+        const orderKey = String(order.orderNumber || order.orderId || '').trim();
+        if (orderKey) orderKeys.add(orderKey);
+      });
+    });
+
+    return {
+      ...item,
+      awaitingPartsMatches: itemMatches,
+      awaitingPartsOrderCount: orderKeys.size,
+      awaitingPartsQuantity: itemMatches.reduce((sum, match) => (
+        sum + Math.max(0, Number(match.totalQuantity) || 0)
+      ), 0),
+    };
+  });
+}
+
 function formatPrintPutAwayAwaitingPartsChat({ item, matches, staff }) {
   const label = normalizeSku(item?.sku) || String(item?.title || item?.customFileName || item?.id || '').trim();
   const lines = [
@@ -2777,11 +2817,15 @@ router.get('/api/print-queue', async (req, res) => {
       shop: auth.shop,
       completeLimit: 80,
     });
+    const itemsWithAwaitingParts = attachAwaitingPartsMatchesToPrintQueueItems({
+      shop: auth.shop,
+      items,
+    });
 
     return res.json({
       success: true,
       stages: PRINT_QUEUE_STAGES,
-      items,
+      items: itemsWithAwaitingParts,
     });
   } catch (err) {
     console.error('Error in /api/print-queue:', err);
