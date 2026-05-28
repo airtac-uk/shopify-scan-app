@@ -8,6 +8,7 @@ let wholesaleModeEnabled = false;
 let lastRenderedLineItems = [];
 let lastOrderItems = [];
 let lastWholesaleProgressByItemKey = {};
+let lastVerifyProgressByItemKey = {};
 let hasRenderedPickList = false;
 let currentOrderBarcode = '';
 let currentOrderNumber = '';
@@ -16,6 +17,7 @@ let currentOrderTimeline = [];
 let currentWorkflowBlock = null;
 let currentOrderTags = [];
 let currentOrderStatus = '';
+let currentOrderFinancialStatus = '';
 let currentOrderStageLabel = '';
 let currentAwaitingPartsSkuMap = new Map();
 let currentAwaitingPartsCatalog = new Map();
@@ -32,14 +34,30 @@ let verifyAudioContext = null;
 let wholesaleSaveTimeoutId = null;
 let wholesaleSaveInFlight = false;
 let wholesaleSaveQueued = false;
+let verifySaveTimeoutId = null;
+let verifySaveInFlight = false;
+let verifySaveQueued = false;
 let pickedRowsSaveTimeoutId = null;
 let pickedRowsSaveInFlight = false;
 let pickedRowsSaveQueued = false;
+let shippingPanelState = createShippingPanelInitialState();
+let shippingLookupInFlight = false;
+let shippingRequestToken = 0;
+let verifyShippingPreloadTimeoutId = null;
+let verifyShippingAutoRateTimeoutId = null;
 
 const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
 const WHOLESALE_MODE_COOKIE = 'pick_list_wholesale_mode';
 const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built', 'on_hold']);
+const SHIPPING_PACKAGE_DIMENSION_UNIT = 'centimeter';
+const SHIPPING_PACKAGE_PRESETS = [
+  { key: 'small', label: 'Small', length: 23, width: 16, height: 17 },
+  { key: 'medium', label: 'Medium', length: 30, width: 20, height: 20 },
+  { key: 'wholesale', label: 'Wholesale', length: 50, width: 75, height: 75 },
+  { key: 'tank_box', label: 'Tank Box', length: 50, width: 75, height: 75 },
+  { key: 'custom', label: 'Custom', custom: true },
+];
 
 function appendOrderNoteWarning(message, data) {
   const warning = String(data?.orderNoteWarning || '').trim();
@@ -224,6 +242,404 @@ function setStatus(message, type = 'info') {
   el.dataset.type = type;
 }
 
+function createShippingPanelInitialState(barcode = currentOrderBarcode) {
+  return {
+    barcode: String(barcode || '').trim().toUpperCase(),
+    status: 'idle',
+    actionLoading: '',
+    error: '',
+    orderNumber: '',
+    payment: null,
+    shipment: null,
+    selectedAttemptLabel: '',
+    attemptedIdentifiers: [],
+    attemptedQueries: [],
+    rates: [],
+    selectedQuoteId: '',
+    expiresAt: '',
+    noRateReason: '',
+    rateInputSignature: '',
+    label: null,
+    reusedExistingLabel: false,
+    weightGrams: '',
+    packagePresetKey: '',
+    packageDimensions: {
+      length: '',
+      width: '',
+      height: '',
+      unit: 'centimeter',
+    },
+  };
+}
+
+function resetShippingPanelState(barcode = currentOrderBarcode) {
+  shippingPanelState = createShippingPanelInitialState(barcode);
+  shippingLookupInFlight = false;
+  shippingRequestToken += 1;
+  if (verifyShippingPreloadTimeoutId) {
+    window.clearTimeout(verifyShippingPreloadTimeoutId);
+    verifyShippingPreloadTimeoutId = null;
+  }
+  if (verifyShippingAutoRateTimeoutId) {
+    window.clearTimeout(verifyShippingAutoRateTimeoutId);
+    verifyShippingAutoRateTimeoutId = null;
+  }
+}
+
+function setShippingPanelState(patch = {}) {
+  shippingPanelState = {
+    ...shippingPanelState,
+    ...patch,
+    barcode: String(patch.barcode || shippingPanelState.barcode || currentOrderBarcode || '').trim().toUpperCase(),
+  };
+}
+
+function formatShippingMoney(amount, currency) {
+  const numericAmount = Number(amount || 0);
+  const safeCurrency = String(currency || '').trim().toUpperCase();
+  if (!safeCurrency) return numericAmount.toFixed(2);
+
+  try {
+    return new Intl.NumberFormat(undefined, {
+      style: 'currency',
+      currency: safeCurrency,
+    }).format(numericAmount);
+  } catch (err) {
+    return `${safeCurrency} ${numericAmount.toFixed(2)}`;
+  }
+}
+
+function formatShippingService(entity) {
+  const carrier = String(entity?.carrierName || entity?.carrierFriendlyName || entity?.carrierCode || '').trim();
+  const service = String(entity?.serviceName || entity?.serviceType || entity?.serviceCode || '').trim();
+  return [carrier, service].filter(Boolean).join(' - ') || 'Selected service';
+}
+
+function formatShippingServiceCode(value) {
+  return String(value || '').trim().toUpperCase() || 'Not set';
+}
+
+function formatRequestedShippingService(shipment) {
+  return String(shipment?.requestedShipmentService || shipment?.serviceType || '').trim() || 'Not set';
+}
+
+function formatShippingCountryName(countryCode) {
+  const code = String(countryCode || '').trim().toUpperCase();
+  if (!code) return '';
+
+  try {
+    if (typeof Intl !== 'undefined' && typeof Intl.DisplayNames === 'function') {
+      const regionNames = new Intl.DisplayNames(['en'], { type: 'region' });
+      const countryName = regionNames.of(code);
+      if (countryName && countryName !== code) {
+        return countryName.toUpperCase();
+      }
+    }
+  } catch (err) {
+    // Fall through to known country-code labels.
+  }
+
+  const fallbackNames = {
+    GB: 'UNITED KINGDOM',
+    UK: 'UNITED KINGDOM',
+    US: 'UNITED STATES',
+    IE: 'IRELAND',
+    FR: 'FRANCE',
+    DE: 'GERMANY',
+    ES: 'SPAIN',
+    IT: 'ITALY',
+    NL: 'NETHERLANDS',
+  };
+  return fallbackNames[code] || code;
+}
+
+function getShippingOrderCountryLabel() {
+  return formatShippingCountryName(shippingPanelState.shipment?.shipTo?.countryCode);
+}
+
+function getVerifyShippingModalTitle() {
+  const orderLabel = shippingPanelState.orderNumber || currentOrderNumber || currentOrderBarcode || 'Shipping';
+  const countryLabel = getShippingOrderCountryLabel();
+  return countryLabel ? `${orderLabel} - ${countryLabel}` : orderLabel;
+}
+
+function formatShippingMetaValue(value) {
+  return String(value || '')
+    .trim()
+    .replace(/_/g, ' ')
+    .replace(/\s+/g, ' ')
+    .replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function getPrimaryShippingPackage(shipment) {
+  return Array.isArray(shipment?.packages) && shipment.packages.length
+    ? shipment.packages[0]
+    : null;
+}
+
+function normalizeShippingDimension(value) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric) || numeric <= 0) return '';
+  return Number.isInteger(numeric) ? String(numeric) : String(Number(numeric.toFixed(2)));
+}
+
+function getPresetDimensions(presetKey) {
+  const preset = SHIPPING_PACKAGE_PRESETS.find((item) => item.key === presetKey);
+  if (!preset || preset.custom) return null;
+  return {
+    length: preset.length,
+    width: preset.width,
+    height: preset.height,
+    unit: SHIPPING_PACKAGE_DIMENSION_UNIT,
+  };
+}
+
+function formatShippingPresetOptionLabel(preset) {
+  if (!preset || preset.custom) return preset?.label || 'Custom';
+  return `${preset.label} - ${preset.length}x${preset.width}x${preset.height} cm`;
+}
+
+function getShipmentPackageDimensions(shipment) {
+  const primaryPackage = getPrimaryShippingPackage(shipment);
+  const dimensions = primaryPackage?.dimensions || shipment?.raw?.dimensions || null;
+  if (!dimensions) return null;
+  const length = normalizeShippingDimension(dimensions.length);
+  const width = normalizeShippingDimension(dimensions.width);
+  const height = normalizeShippingDimension(dimensions.height);
+  if (!length || !width || !height) return null;
+  return {
+    length,
+    width,
+    height,
+    unit: String(dimensions.unit || dimensions.units || SHIPPING_PACKAGE_DIMENSION_UNIT).trim() || SHIPPING_PACKAGE_DIMENSION_UNIT,
+  };
+}
+
+function convertShippingWeightToGrams(weight) {
+  const value = Number(weight?.value || 0);
+  const unit = String(weight?.unit || '').trim().toLowerCase();
+  if (!Number.isFinite(value) || value <= 0) return '';
+
+  if (unit === 'gram' || unit === 'grams' || unit === 'g') return String(Math.round(value));
+  if (unit === 'kilogram' || unit === 'kilograms' || unit === 'kg') return String(Math.round(value * 1000));
+  if (unit === 'ounce' || unit === 'ounces' || unit === 'oz') return String(Math.round(value * 28.349523125));
+  if (unit === 'pound' || unit === 'pounds' || unit === 'lb' || unit === 'lbs') return String(Math.round(value * 453.59237));
+  return String(Math.round(value));
+}
+
+function getShipmentPackageWeightGrams(shipment) {
+  const primaryPackage = getPrimaryShippingPackage(shipment);
+  return convertShippingWeightToGrams(primaryPackage?.weight || shipment?.raw?.weight);
+}
+
+function dimensionsMatchPreset(dimensions, preset) {
+  if (!dimensions || !preset || preset.custom) return false;
+  return Number(dimensions.length) === Number(preset.length)
+    && Number(dimensions.width) === Number(preset.width)
+    && Number(dimensions.height) === Number(preset.height);
+}
+
+function inferShippingPackagePresetKey(shipment, dimensions = getShipmentPackageDimensions(shipment)) {
+  const packageText = [
+    shipment?.packageCode,
+    shipment?.packages?.[0]?.packageCode,
+    shipment?.raw?.package_code,
+    shipment?.raw?.packages?.[0]?.package_code,
+  ].filter(Boolean).join(' ').toLowerCase();
+  const matchingPresets = SHIPPING_PACKAGE_PRESETS.filter((preset) => dimensionsMatchPreset(dimensions, preset));
+  if (!matchingPresets.length) return 'custom';
+  if (matchingPresets.some((preset) => preset.key === 'tank_box') && packageText.includes('tank')) {
+    return 'tank_box';
+  }
+  return matchingPresets[0].key;
+}
+
+function getShippingPackageStateFromShipment(shipment) {
+  const dimensions = getShipmentPackageDimensions(shipment);
+  const weightGrams = getShipmentPackageWeightGrams(shipment);
+  const packagePresetKey = inferShippingPackagePresetKey(shipment, dimensions);
+  const presetDimensions = getPresetDimensions(packagePresetKey);
+  return {
+    packagePresetKey,
+    ...(shippingPanelState.weightGrams ? {} : { weightGrams }),
+    packageDimensions: presetDimensions || {
+      length: dimensions?.length || '',
+      width: dimensions?.width || '',
+      height: dimensions?.height || '',
+      unit: dimensions?.unit || SHIPPING_PACKAGE_DIMENSION_UNIT,
+    },
+  };
+}
+
+function getSelectedShippingPackageDimensions() {
+  const presetDimensions = getPresetDimensions(shippingPanelState.packagePresetKey);
+  const dimensions = presetDimensions || shippingPanelState.packageDimensions || {};
+  const length = Number(dimensions.length);
+  const width = Number(dimensions.width);
+  const height = Number(dimensions.height);
+  if (![length, width, height].every((value) => Number.isFinite(value) && value > 0)) {
+    return null;
+  }
+  return {
+    length,
+    width,
+    height,
+    unit: String(dimensions.unit || SHIPPING_PACKAGE_DIMENSION_UNIT).trim() || SHIPPING_PACKAGE_DIMENSION_UNIT,
+  };
+}
+
+function hasRequiredShippingRateInputs() {
+  return Math.floor(Number(shippingPanelState.weightGrams || 0)) > 0
+    && Boolean(getSelectedShippingPackageDimensions());
+}
+
+function getShippingRateInputSignature() {
+  const shipmentId = String(shippingPanelState.shipment?.shipmentId || '').trim();
+  const weightGrams = Math.floor(Number(shippingPanelState.weightGrams || 0));
+  const dimensions = getSelectedShippingPackageDimensions();
+  if (!shipmentId || !Number.isInteger(weightGrams) || weightGrams <= 0 || !dimensions) return '';
+  return [
+    shipmentId,
+    weightGrams,
+    dimensions.length,
+    dimensions.width,
+    dimensions.height,
+    dimensions.unit,
+  ].join('|');
+}
+
+function canAutoRateVerifyShippingShipment(force = false) {
+  if (!isVerifyShippingModalOpen()) return false;
+  if (loading || shippingLookupInFlight || shippingPanelState.actionLoading) return false;
+  if (['payment_blocked', 'no_shipment', 'error', 'purchased'].includes(shippingPanelState.status)) return false;
+  const signature = getShippingRateInputSignature();
+  if (!signature) return false;
+  return force || shippingPanelState.rateInputSignature !== signature || shippingPanelState.status !== 'rates';
+}
+
+function queueVerifyShippingRateRefresh({ force = false, delay = 0 } = {}) {
+  if (verifyShippingAutoRateTimeoutId) {
+    window.clearTimeout(verifyShippingAutoRateTimeoutId);
+  }
+  verifyShippingAutoRateTimeoutId = window.setTimeout(() => {
+    verifyShippingAutoRateTimeoutId = null;
+    if (canAutoRateVerifyShippingShipment(force)) {
+      rateVerifyShippingShipment({ automatic: true, force });
+    }
+  }, delay);
+}
+
+function formatShippingConfirmation(value) {
+  return formatShippingMetaValue(value) || 'None';
+}
+
+function formatShippingInsurance(shipment) {
+  const primaryPackage = getPrimaryShippingPackage(shipment);
+  const provider = formatShippingMetaValue(shipment?.insuranceProvider);
+  const insuredValue = primaryPackage?.insuredValue || {};
+  const amount = Number(insuredValue.amount || 0);
+  const currency = String(insuredValue.currency || '').trim();
+  const valueLabel = amount > 0 ? formatShippingMoney(amount, currency) : '';
+  return [provider, valueLabel].filter(Boolean).join(' - ') || 'None';
+}
+
+function getSelectedShippingRate() {
+  const selectedQuoteId = String(shippingPanelState.selectedQuoteId || '').trim();
+  return (shippingPanelState.rates || []).find((rate) => rate.quoteId === selectedQuoteId)
+    || shippingPanelState.rates?.[0]
+    || null;
+}
+
+function getShippingLabelDownloadUrl(label = shippingPanelState.label) {
+  const labelId = String(label?.labelId || '').trim();
+  return labelId ? `/api/pick-list/shipping/labels/${encodeURIComponent(labelId)}/download` : '';
+}
+
+function isShippingLabelVoided(label = shippingPanelState.label) {
+  return String(label?.status || '').trim().toLowerCase() === 'voided';
+}
+
+function canManageShippingForCurrentOrder() {
+  if (!isCurrentOrderWorkflowBlocked()) return true;
+  const status = String(currentWorkflowBlock?.status || currentWorkflowBlock?.code || '').trim().toUpperCase();
+  return status === 'FULFILLED' || status === 'PARTIALLY_FULFILLED';
+}
+
+function shouldShowFulfilledShippingPanel() {
+  if (!isCurrentOrderWorkflowBlocked()) return false;
+  return canManageShippingForCurrentOrder();
+}
+
+function shouldShowVerifyShippingPanel(totals = getVerifyTotals()) {
+  return Boolean(
+    verifyModeEnabled
+    && !wholesaleModeEnabled
+    && hasRenderedPickList
+    && currentOrderBarcode
+    && canManageShippingForCurrentOrder()
+    && (totals?.isComplete || shouldShowFulfilledShippingPanel())
+  );
+}
+
+function queueVerifyShippingLookupPreload() {
+  if (verifyShippingPreloadTimeoutId || shippingLookupInFlight) return;
+  if (!shouldShowVerifyShippingPanel()) return;
+
+  verifyShippingPreloadTimeoutId = window.setTimeout(() => {
+    verifyShippingPreloadTimeoutId = null;
+    loadVerifyShippingLookup();
+  }, 0);
+}
+
+function isVerifyShippingModalOpen() {
+  return Boolean(document.getElementById('verifyShippingModal')?.classList.contains('is-open'));
+}
+
+function renderVerifyShippingModal() {
+  const body = document.getElementById('verifyShippingModalBody');
+  if (!body) return;
+  const title = document.getElementById('verifyShippingModalTitle');
+  if (title) {
+    title.textContent = getVerifyShippingModalTitle();
+  }
+  body.className = `pick-shipping-modal__body pick-shipping-panel pick-shipping-panel--${shippingPanelState.status}`;
+  renderVerifyShippingPanel(body, { includeHeader: false });
+}
+
+function openVerifyShippingModal() {
+  if (!shouldShowVerifyShippingPanel()) return;
+  if (shippingPanelState.barcode !== currentOrderBarcode) {
+    resetShippingPanelState(currentOrderBarcode);
+  }
+
+  const modal = document.getElementById('verifyShippingModal');
+  if (!modal) return;
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+  renderVerifyShippingModal();
+  queueVerifyShippingLookupPreload();
+  queueVerifyShippingRateRefresh({ force: true, delay: 0 });
+}
+
+function closeVerifyShippingModal() {
+  const modal = document.getElementById('verifyShippingModal');
+  if (!modal) return;
+  if (verifyShippingAutoRateTimeoutId) {
+    window.clearTimeout(verifyShippingAutoRateTimeoutId);
+    verifyShippingAutoRateTimeoutId = null;
+  }
+  modal.classList.remove('is-open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function syncShippingPanelDisabledState() {
+  const disabled = loading || Boolean(shippingPanelState.actionLoading);
+  if (!disabled) return;
+  document.querySelectorAll('.pick-shipping-panel button, .pick-shipping-panel input').forEach((control) => {
+    control.disabled = true;
+  });
+}
+
 function formatSkuSummary(skus, maxVisible = 3) {
   const uniqueSkus = Array.from(new Set((skus || []).map(normalizeDisplaySku).filter(Boolean)));
   if (uniqueSkus.length <= maxVisible) return uniqueSkus.join(', ');
@@ -389,6 +805,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   lastRenderedLineItems = [];
   lastOrderItems = [];
   lastWholesaleProgressByItemKey = {};
+  lastVerifyProgressByItemKey = {};
   hasRenderedPickList = false;
   currentOrderBarcode = '';
   currentOrderNumber = '';
@@ -397,6 +814,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentWorkflowBlock = null;
   currentOrderTags = [];
   currentOrderStatus = '';
+  currentOrderFinancialStatus = '';
   currentOrderStageLabel = '';
   currentAwaitingPartsSkuMap = new Map();
   currentAwaitingPartsCatalog = new Map();
@@ -411,6 +829,13 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   suppressNextActionReminderUnload = false;
   verifyItems = [];
   verifyCodeIndex = new Map();
+  if (verifySaveTimeoutId) {
+    clearTimeout(verifySaveTimeoutId);
+    verifySaveTimeoutId = null;
+  }
+  verifySaveInFlight = false;
+  verifySaveQueued = false;
+  resetShippingPanelState('');
 
   const lineItems = document.getElementById('pickListLineItems');
   const timelineSection = document.getElementById('pickListTimelineSection');
@@ -602,6 +1027,7 @@ function setLoading(isLoading) {
   setActionButtonsEnabled(actionButtonsUnlocked);
   syncVerifyButtonDisabledState();
   syncAwaitingToggleDisabledState();
+  syncShippingPanelDisabledState();
 }
 
 function normalizeTypeKey(type) {
@@ -670,6 +1096,7 @@ function applyOrderHeaderData(data, { fallbackTag = '' } = {}) {
   }
 
   currentOrderStatus = String(data?.orderStatus || data?.workflowStatus || '').trim();
+  currentOrderFinancialStatus = String(data?.orderFinancialStatus || currentOrderFinancialStatus || '').trim();
   currentOrderStageLabel = String(data?.currentStage?.label || '').trim();
   renderOrderHeaderMeta();
 }
@@ -903,12 +1330,14 @@ function isAnyDialogOpen() {
   const printQueueResultModal = document.getElementById('awaitingPrintQueueResultModal');
   const qcFailModal = document.getElementById('qcFailModal');
   const onHoldModal = document.getElementById('onHoldModal');
+  const verifyShippingModal = document.getElementById('verifyShippingModal');
 
   return Boolean(
     awaitingPartsModal?.classList.contains('is-open') ||
     printQueueResultModal?.classList.contains('is-open') ||
     qcFailModal?.classList.contains('is-open') ||
     onHoldModal?.classList.contains('is-open') ||
+    verifyShippingModal?.classList.contains('is-open') ||
     isOrderActionReminderDialogOpen()
   );
 }
@@ -1315,6 +1744,92 @@ function sendPickedRowCountsBeacon() {
   });
   const blob = new Blob([payload], { type: 'application/json' });
   navigator.sendBeacon('/api/pick-list-picked-progress', blob);
+}
+
+function getVerifyProgressSnapshot() {
+  const progressByItemKey = {};
+  verifyItems.forEach((row) => {
+    const qty = Math.max(0, Math.floor(Number(row.scannedQty) || 0));
+    if (qty <= 0) return;
+    progressByItemKey[row.key] = qty;
+  });
+  return progressByItemKey;
+}
+
+function updateVerifyProgressCacheFromState() {
+  lastVerifyProgressByItemKey = getVerifyProgressSnapshot();
+}
+
+async function flushVerifyProgressSave(force = false) {
+  if (!hasRenderedPickList || !currentOrderBarcode) return;
+  if (!force && (!verifyModeEnabled || wholesaleModeEnabled)) return;
+
+  if (verifySaveInFlight) {
+    verifySaveQueued = true;
+    return;
+  }
+
+  verifySaveInFlight = true;
+  verifySaveQueued = false;
+
+  try {
+    const response = await fetch('/api/pick-list-verify-progress', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        barcode: currentOrderBarcode,
+        progressByItemKey: getVerifyProgressSnapshot(),
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to save verify progress');
+    }
+  } catch (err) {
+    console.error('Error saving verify progress:', err);
+  } finally {
+    verifySaveInFlight = false;
+    if (verifySaveQueued) {
+      verifySaveQueued = false;
+      flushVerifyProgressSave(force);
+    }
+  }
+}
+
+function scheduleVerifyProgressSave() {
+  if (!verifyModeEnabled || wholesaleModeEnabled) return;
+
+  updateVerifyProgressCacheFromState();
+
+  if (verifySaveTimeoutId) {
+    clearTimeout(verifySaveTimeoutId);
+  }
+
+  verifySaveTimeoutId = setTimeout(() => {
+    verifySaveTimeoutId = null;
+    flushVerifyProgressSave(false);
+  }, 150);
+}
+
+async function flushPendingVerifyProgressSave() {
+  if (!verifySaveTimeoutId) return;
+
+  clearTimeout(verifySaveTimeoutId);
+  verifySaveTimeoutId = null;
+  await flushVerifyProgressSave(true);
+}
+
+function sendVerifyProgressBeacon() {
+  if (!hasRenderedPickList || !currentOrderBarcode || !verifyModeEnabled || wholesaleModeEnabled) return;
+  if (!navigator.sendBeacon) return;
+
+  const payload = JSON.stringify({
+    barcode: currentOrderBarcode,
+    progressByItemKey: getVerifyProgressSnapshot(),
+  });
+  const blob = new Blob([payload], { type: 'application/json' });
+  navigator.sendBeacon('/api/pick-list-verify-progress', blob);
 }
 
 function getPickedRowCount(rowKey) {
@@ -1954,6 +2469,862 @@ function getVerificationIncrementLabel(row, complete) {
   return 'Scan +1';
 }
 
+async function fetchShippingJson(url, options = {}) {
+  const response = await fetch(url, {
+    ...options,
+    headers: {
+      'Content-Type': 'application/json',
+      ...(options.headers || {}),
+    },
+  });
+  const data = await response.json().catch(() => ({}));
+  if (!response.ok || !data.success) {
+    const err = new Error(data.error || 'Shipping request failed');
+    err.data = data;
+    throw err;
+  }
+  return data;
+}
+
+async function loadVerifyShippingLookup() {
+  if (!shouldShowVerifyShippingPanel() || shippingLookupInFlight) return;
+  const barcode = String(currentOrderBarcode || '').trim().toUpperCase();
+  if (!barcode) return;
+
+  if (shippingPanelState.barcode !== barcode) {
+    resetShippingPanelState(barcode);
+  }
+
+  if (shippingPanelState.status !== 'idle') return;
+
+  const requestToken = shippingRequestToken + 1;
+  shippingRequestToken = requestToken;
+  shippingLookupInFlight = true;
+  setShippingPanelState({ status: 'loading_lookup', error: '', actionLoading: 'lookup' });
+  renderVerifyShippingModal();
+  renderCurrentOrderSection();
+
+  try {
+    const data = await fetchShippingJson('/api/pick-list/shipping/lookup', {
+      method: 'POST',
+      body: JSON.stringify({ barcode }),
+    });
+    if (requestToken !== shippingRequestToken) return;
+
+    const existingLabels = Array.isArray(data.existingLabels) ? data.existingLabels : [];
+    const existingLabel = existingLabels.find((label) => !isShippingLabelVoided(label)) || existingLabels[0] || null;
+    const packageDefaults = data.shipment ? getShippingPackageStateFromShipment(data.shipment) : {};
+    if (!data.payment?.canShip) {
+      setShippingPanelState({
+        status: 'payment_blocked',
+        actionLoading: '',
+        orderNumber: data.orderNumber || currentOrderNumber,
+        payment: data.payment || null,
+        attemptedIdentifiers: data.attemptedIdentifiers || [],
+      });
+    } else if (existingLabel?.labelId && !isShippingLabelVoided(existingLabel)) {
+      setShippingPanelState({
+        status: 'purchased',
+        actionLoading: '',
+        orderNumber: data.orderNumber || currentOrderNumber,
+        payment: data.payment || null,
+        shipment: data.shipment || null,
+        selectedAttemptLabel: data.selectedAttemptLabel || '',
+        attemptedIdentifiers: data.attemptedIdentifiers || [],
+        attemptedQueries: data.attemptedQueries || [],
+        label: existingLabel,
+        reusedExistingLabel: true,
+        ...packageDefaults,
+      });
+    } else if (existingLabel?.labelId && data.shipmentFound && data.shipment) {
+      setShippingPanelState({
+        status: 'shipment_found',
+        actionLoading: '',
+        orderNumber: data.orderNumber || currentOrderNumber,
+        payment: data.payment || null,
+        shipment: data.shipment,
+        selectedAttemptLabel: data.selectedAttemptLabel || '',
+        attemptedIdentifiers: data.attemptedIdentifiers || [],
+        attemptedQueries: data.attemptedQueries || [],
+        label: existingLabel,
+        reusedExistingLabel: false,
+        ...packageDefaults,
+      });
+    } else if (data.shipmentFound && data.shipment) {
+      setShippingPanelState({
+        status: 'shipment_found',
+        actionLoading: '',
+        orderNumber: data.orderNumber || currentOrderNumber,
+        payment: data.payment || null,
+        shipment: data.shipment,
+        selectedAttemptLabel: data.selectedAttemptLabel || '',
+        attemptedIdentifiers: data.attemptedIdentifiers || [],
+        attemptedQueries: data.attemptedQueries || [],
+        ...packageDefaults,
+      });
+    } else {
+      setShippingPanelState({
+        status: 'no_shipment',
+        actionLoading: '',
+        orderNumber: data.orderNumber || currentOrderNumber,
+        payment: data.payment || null,
+        shipment: null,
+        selectedAttemptLabel: data.selectedAttemptLabel || '',
+        attemptedIdentifiers: data.attemptedIdentifiers || [],
+        attemptedQueries: data.attemptedQueries || [],
+      });
+    }
+  } catch (err) {
+    if (requestToken !== shippingRequestToken) return;
+    setShippingPanelState({
+      status: 'error',
+      actionLoading: '',
+      error: err.message || 'Failed to load shipping details',
+      payment: err.data?.payment || shippingPanelState.payment,
+      label: err.data?.label || shippingPanelState.label,
+    });
+  } finally {
+    if (requestToken === shippingRequestToken) {
+      shippingLookupInFlight = false;
+      renderVerifyShippingModal();
+      renderCurrentOrderSection();
+      queueVerifyShippingRateRefresh({ force: true, delay: 0 });
+    }
+  }
+}
+
+async function rateVerifyShippingShipment({ automatic = false, force = false } = {}) {
+  if (shippingPanelState.actionLoading || loading) return;
+  const shipmentId = String(shippingPanelState.shipment?.shipmentId || '').trim();
+  const weightGrams = Math.floor(Number(shippingPanelState.weightGrams || 0));
+  const rateInputSignature = getShippingRateInputSignature();
+  if (!force && rateInputSignature && shippingPanelState.status === 'rates' && shippingPanelState.rateInputSignature === rateInputSignature) {
+    return;
+  }
+  if (!shipmentId) {
+    if (!automatic) setStatus('No ShipStation shipment selected.', 'error');
+    return;
+  }
+  if (!Number.isInteger(weightGrams) || weightGrams <= 0) {
+    if (!automatic) setStatus('Enter a valid package weight in grams.', 'error');
+    return;
+  }
+  const packageDimensions = getSelectedShippingPackageDimensions();
+  if (!packageDimensions) {
+    if (!automatic) setStatus('Select a package size, or enter valid custom package dimensions.', 'error');
+    return;
+  }
+
+  setShippingPanelState({ actionLoading: 'rates', error: '' });
+  renderVerifyShippingModal();
+  renderCurrentOrderSection();
+  setStatus('Checking ShipStation rates...', 'info');
+
+  try {
+    const data = await fetchShippingJson('/api/pick-list/shipping/rates', {
+      method: 'POST',
+      body: JSON.stringify({
+        barcode: currentOrderBarcode,
+        shipmentId,
+        weightGrams,
+        packageDimensions,
+      }),
+    });
+    const rates = Array.isArray(data.rates) ? data.rates : [];
+    setShippingPanelState({
+      status: 'rates',
+      actionLoading: '',
+      payment: data.payment || shippingPanelState.payment,
+      shipment: data.shipment || shippingPanelState.shipment,
+      rates,
+      selectedQuoteId: rates[0]?.quoteId || '',
+      expiresAt: data.expiresAt || '',
+      noRateReason: data.noRateReason || '',
+      rateInputSignature,
+    });
+    setStatus(`Rates ready for ${currentOrderNumber}.`, 'success');
+  } catch (err) {
+    setShippingPanelState({
+      status: err.data?.rateError ? 'shipment_found' : shippingPanelState.status,
+      actionLoading: '',
+      error: err.message || 'Failed to check shipping rates',
+      payment: err.data?.payment || shippingPanelState.payment,
+      shipment: err.data?.shipment || shippingPanelState.shipment,
+      rates: [],
+      selectedQuoteId: '',
+      expiresAt: '',
+      noRateReason: '',
+      rateInputSignature: '',
+    });
+    setStatus(`Shipping error: ${err.message}`, 'error');
+  } finally {
+    renderVerifyShippingModal();
+    renderCurrentOrderSection();
+  }
+}
+
+async function buyVerifyShippingLabel() {
+  if (shippingPanelState.actionLoading || loading) return;
+  const rate = getSelectedShippingRate();
+  if (!rate?.quoteId) {
+    setStatus('Select a shipping rate first.', 'error');
+    return;
+  }
+
+  setShippingPanelState({ actionLoading: 'buy', error: '' });
+  renderVerifyShippingModal();
+  renderCurrentOrderSection();
+  setStatus('Buying ShipStation label...', 'info');
+
+  try {
+    const data = await fetchShippingJson('/api/pick-list/shipping/labels', {
+      method: 'POST',
+      body: JSON.stringify({ quoteId: rate.quoteId }),
+    });
+    const label = data.label || null;
+    setShippingPanelState({
+      status: 'purchased',
+      actionLoading: '',
+      payment: data.payment || shippingPanelState.payment,
+      label,
+      reusedExistingLabel: Boolean(data.reusedExistingLabel),
+    });
+
+    if (label?.printStatus === 'error') {
+      setStatus(`Label bought, but printing failed: ${label.printError || 'PrintNode error'}`, 'error');
+    } else if (data.reusedExistingLabel) {
+      setStatus('Existing ShipStation label found. No new label was bought.', 'info');
+    } else {
+      setStatus('Label bought and sent to PrintNode.', 'success');
+      closeVerifyShippingModal();
+    }
+  } catch (err) {
+    setShippingPanelState({
+      actionLoading: '',
+      error: err.message || 'Failed to buy shipping label',
+      payment: err.data?.payment || shippingPanelState.payment,
+      label: err.data?.label || shippingPanelState.label,
+    });
+    setStatus(`Shipping error: ${err.message}`, 'error');
+  } finally {
+    renderVerifyShippingModal();
+    renderCurrentOrderSection();
+  }
+}
+
+async function retryVerifyShippingLabelPrint() {
+  if (shippingPanelState.actionLoading || loading) return;
+  const labelId = String(shippingPanelState.label?.labelId || '').trim();
+  if (!labelId) {
+    setStatus('No purchased label to print.', 'error');
+    return;
+  }
+
+  setShippingPanelState({ actionLoading: 'print', error: '' });
+  renderVerifyShippingModal();
+  renderCurrentOrderSection();
+  setStatus('Sending label to PrintNode...', 'info');
+
+  try {
+    const data = await fetchShippingJson(`/api/pick-list/shipping/labels/${encodeURIComponent(labelId)}/print`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    setShippingPanelState({
+      actionLoading: '',
+      label: data.label || shippingPanelState.label,
+    });
+    setStatus('Label sent to PrintNode.', 'success');
+  } catch (err) {
+    setShippingPanelState({
+      actionLoading: '',
+      error: err.message || 'Failed to print label',
+      label: err.data?.label || shippingPanelState.label,
+    });
+    setStatus(`Print error: ${err.message}`, 'error');
+  } finally {
+    renderVerifyShippingModal();
+    renderCurrentOrderSection();
+  }
+}
+
+async function voidVerifyShippingLabel() {
+  if (shippingPanelState.actionLoading || loading) return;
+  const labelId = String(shippingPanelState.label?.labelId || '').trim();
+  if (!labelId || isShippingLabelVoided()) {
+    setStatus('No active shipping label to void.', 'error');
+    return;
+  }
+
+  const confirmed = window.confirm('Void this ShipStation label? You will need to check rates and buy a new label before shipping.');
+  if (!confirmed) return;
+
+  setShippingPanelState({ actionLoading: 'void', error: '' });
+  renderVerifyShippingModal();
+  renderCurrentOrderSection();
+  setStatus('Voiding ShipStation label...', 'info');
+
+  try {
+    const data = await fetchShippingJson(`/api/pick-list/shipping/labels/${encodeURIComponent(labelId)}/void`, {
+      method: 'POST',
+      body: JSON.stringify({}),
+    });
+    setShippingPanelState({
+      status: 'shipment_found',
+      actionLoading: '',
+      label: data.label || { ...shippingPanelState.label, status: 'voided' },
+      reusedExistingLabel: false,
+      rates: [],
+      selectedQuoteId: '',
+      expiresAt: '',
+      noRateReason: '',
+    });
+    setStatus('ShipStation label voided. Check rates again before buying a replacement label.', 'success');
+  } catch (err) {
+    setShippingPanelState({
+      actionLoading: '',
+      error: err.message || 'Failed to void shipping label',
+      label: err.data?.label || shippingPanelState.label,
+    });
+    setStatus(`Void error: ${err.message}`, 'error');
+  } finally {
+    renderVerifyShippingModal();
+    renderCurrentOrderSection();
+  }
+}
+
+function appendShippingDetail(container, label, value) {
+  if (!value) return;
+  const item = document.createElement('div');
+  item.className = 'pick-shipping-detail';
+
+  const labelEl = document.createElement('span');
+  labelEl.textContent = label;
+
+  const valueEl = document.createElement('strong');
+  valueEl.textContent = value;
+
+  item.appendChild(labelEl);
+  item.appendChild(valueEl);
+  container.appendChild(item);
+}
+
+function renderShippingShipmentDetails(container) {
+  const shipment = shippingPanelState.shipment;
+  if (!shipment) return;
+
+  const details = document.createElement('div');
+  details.className = 'pick-shipping-details';
+  appendShippingDetail(details, 'Selected Service', formatShippingServiceCode(shipment.serviceCode));
+  appendShippingDetail(details, 'Requested Service', formatRequestedShippingService(shipment));
+  appendShippingDetail(details, 'Confirmation', formatShippingConfirmation(shipment.confirmation));
+  appendShippingDetail(details, 'Insurance', formatShippingInsurance(shipment));
+  container.appendChild(details);
+}
+
+function renderShippingRateControls(container) {
+  const form = document.createElement('div');
+  form.className = 'pick-shipping-rate-form';
+  let rateCheckButton = null;
+
+  const syncRateCheckButtonState = () => {
+    if (!rateCheckButton) {
+      return;
+    }
+    const canCheckRates = hasRequiredShippingRateInputs();
+    rateCheckButton.disabled = loading || Boolean(shippingPanelState.actionLoading) || !canCheckRates;
+    rateCheckButton.title = canCheckRates
+      ? ''
+      : 'Enter package weight and package size first.';
+  };
+
+  const packageEntry = document.createElement('div');
+  packageEntry.className = 'pick-shipping-package-entry';
+
+  const packageLabel = document.createElement('label');
+  packageLabel.className = 'pick-shipping-package-label';
+  packageLabel.textContent = 'Package size';
+
+  const packageSelect = document.createElement('select');
+  packageSelect.className = 'pick-shipping-package-select';
+  packageSelect.value = shippingPanelState.packagePresetKey || 'custom';
+  SHIPPING_PACKAGE_PRESETS.forEach((preset) => {
+    const option = document.createElement('option');
+    option.value = preset.key;
+    option.textContent = formatShippingPresetOptionLabel(preset);
+    packageSelect.appendChild(option);
+  });
+  packageSelect.value = shippingPanelState.packagePresetKey || 'custom';
+  packageSelect.addEventListener('change', () => {
+    const selectedKey = packageSelect.value;
+    const presetDimensions = getPresetDimensions(selectedKey);
+    const currentDimensions = getSelectedShippingPackageDimensions() || shippingPanelState.packageDimensions || {};
+    setShippingPanelState({
+      packagePresetKey: selectedKey,
+      packageDimensions: presetDimensions || {
+        length: normalizeShippingDimension(currentDimensions.length),
+        width: normalizeShippingDimension(currentDimensions.width),
+        height: normalizeShippingDimension(currentDimensions.height),
+        unit: currentDimensions.unit || SHIPPING_PACKAGE_DIMENSION_UNIT,
+      },
+      status: 'shipment_found',
+      rates: [],
+      selectedQuoteId: '',
+      expiresAt: '',
+      noRateReason: '',
+      error: '',
+      rateInputSignature: '',
+    });
+    renderVerifyShippingModal();
+    queueVerifyShippingRateRefresh({ force: true, delay: 0 });
+  });
+  packageLabel.appendChild(packageSelect);
+  packageEntry.appendChild(packageLabel);
+
+  if ((shippingPanelState.packagePresetKey || 'custom') === 'custom') {
+    const customGrid = document.createElement('div');
+    customGrid.className = 'pick-shipping-custom-dimensions';
+    [
+      ['length', 'Length'],
+      ['width', 'Width'],
+      ['height', 'Height'],
+    ].forEach(([dimensionKey, dimensionLabel]) => {
+      const dimensionField = document.createElement('label');
+      dimensionField.textContent = dimensionLabel;
+
+      const dimensionInput = document.createElement('input');
+      dimensionInput.type = 'text';
+      dimensionInput.inputMode = 'decimal';
+      dimensionInput.value = shippingPanelState.packageDimensions?.[dimensionKey] || '';
+      dimensionInput.placeholder = '0';
+      dimensionInput.addEventListener('input', () => {
+        const value = normalizeShippingDimension(dimensionInput.value);
+        setShippingPanelState({
+          packagePresetKey: 'custom',
+          packageDimensions: {
+            ...(shippingPanelState.packageDimensions || {}),
+            [dimensionKey]: value,
+            unit: SHIPPING_PACKAGE_DIMENSION_UNIT,
+          },
+          status: 'shipment_found',
+          rates: [],
+          selectedQuoteId: '',
+          expiresAt: '',
+          noRateReason: '',
+          error: '',
+          rateInputSignature: '',
+        });
+        dimensionInput.value = value;
+        syncRateCheckButtonState();
+        queueVerifyShippingRateRefresh({ force: true, delay: 600 });
+      });
+      dimensionField.appendChild(dimensionInput);
+      customGrid.appendChild(dimensionField);
+    });
+
+    const unit = document.createElement('span');
+    unit.className = 'pick-shipping-dimension-unit';
+    unit.textContent = 'centimetres';
+    customGrid.appendChild(unit);
+    packageEntry.appendChild(customGrid);
+  }
+
+  const entry = document.createElement('div');
+  entry.className = 'pick-shipping-weight-entry';
+
+  const label = document.createElement('label');
+  label.className = 'pick-shipping-weight-label';
+  label.textContent = 'Package weight';
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.inputMode = 'numeric';
+  input.pattern = '[0-9]*';
+  input.value = shippingPanelState.weightGrams || '';
+  input.placeholder = '0';
+  label.appendChild(input);
+  const unit = document.createElement('span');
+  unit.className = 'pick-shipping-weight-unit';
+  unit.textContent = 'grams';
+  label.appendChild(unit);
+  entry.appendChild(label);
+
+  const keypad = document.createElement('div');
+  keypad.className = 'pick-shipping-keypad';
+  keypad.hidden = true;
+
+  const showWeightKeypad = () => {
+    keypad.hidden = false;
+  };
+  const hideWeightKeypad = () => {
+    keypad.hidden = true;
+    if (Math.floor(Number(shippingPanelState.weightGrams || 0)) > 0) {
+      queueVerifyShippingRateRefresh({ force: true, delay: 0 });
+    }
+  };
+  const focusWeightInput = () => {
+    try {
+      input.focus({ preventScroll: true });
+    } catch (err) {
+      input.focus();
+    }
+  };
+
+  const setWeightValue = (value) => {
+    const previousWeight = String(shippingPanelState.weightGrams || '');
+    const digits = String(value || '').replace(/\D/g, '').replace(/^0+(?=\d)/, '').slice(0, 6);
+    const shouldClearRates = digits !== previousWeight && (shippingPanelState.status === 'rates' || shippingPanelState.error);
+    setShippingPanelState({
+      weightGrams: digits,
+      ...(shouldClearRates
+        ? { status: 'shipment_found', rates: [], selectedQuoteId: '', expiresAt: '', noRateReason: '', error: '', rateInputSignature: '' }
+        : {}),
+    });
+    input.value = digits;
+    if (shouldClearRates && !digits) {
+      renderVerifyShippingModal();
+    } else {
+      syncRateCheckButtonState();
+    }
+  };
+
+  input.addEventListener('input', () => {
+    setWeightValue(input.value);
+  });
+  input.addEventListener('focus', () => {
+    showWeightKeypad();
+    input.select();
+  });
+  input.addEventListener('blur', () => {
+    window.setTimeout(() => {
+      if (document.activeElement !== input && !keypad.contains(document.activeElement)) {
+        hideWeightKeypad();
+      }
+    }, 0);
+  });
+
+  ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'Clear', '0', 'Del'].forEach((key) => {
+    const keyButton = document.createElement('button');
+    keyButton.type = 'button';
+    keyButton.className = `pick-shipping-keypad__key${key === 'Clear' || key === 'Del' ? ' pick-shipping-keypad__key--utility' : ''}`;
+    keyButton.textContent = key;
+    keyButton.addEventListener('pointerdown', (event) => {
+      event.preventDefault();
+      focusWeightInput();
+      showWeightKeypad();
+    });
+    keyButton.addEventListener('click', () => {
+      if (key === 'Clear') {
+        setWeightValue('');
+        return;
+      }
+      if (key === 'Del') {
+        setWeightValue(String(shippingPanelState.weightGrams || '').slice(0, -1));
+        return;
+      }
+      setWeightValue(`${shippingPanelState.weightGrams || ''}${key}`);
+    });
+    keypad.appendChild(keyButton);
+  });
+  entry.appendChild(keypad);
+
+  if (shippingPanelState.status !== 'rates' || shippingPanelState.actionLoading === 'rates') {
+    rateCheckButton = document.createElement('button');
+    rateCheckButton.type = 'button';
+    rateCheckButton.className = 'pick-shipping-rate-check';
+    rateCheckButton.classList.toggle('is-loading', shippingPanelState.actionLoading === 'rates');
+    rateCheckButton.textContent = shippingPanelState.actionLoading === 'rates'
+      ? 'Checking Rates...'
+      : 'Check Rates';
+    syncRateCheckButtonState();
+    rateCheckButton.addEventListener('click', () => rateVerifyShippingShipment({ force: true }));
+  }
+
+  form.appendChild(packageEntry);
+  form.appendChild(entry);
+  if (rateCheckButton) {
+    form.appendChild(rateCheckButton);
+  }
+  container.appendChild(form);
+}
+
+function renderShippingRates(container) {
+  const rates = Array.isArray(shippingPanelState.rates) ? shippingPanelState.rates : [];
+  if (!rates.length) {
+    if (shippingPanelState.noRateReason) {
+      const noRate = document.createElement('div');
+      noRate.className = 'pick-shipping-no-rate';
+      noRate.textContent = shippingPanelState.noRateReason;
+      container.appendChild(noRate);
+    }
+    return;
+  }
+
+  const list = document.createElement('div');
+  list.className = 'pick-shipping-rates';
+
+  rates.forEach((rate, index) => {
+    const option = document.createElement('label');
+    option.className = 'pick-shipping-rate';
+
+    const radio = document.createElement('input');
+    radio.type = 'radio';
+    radio.name = 'pickShippingRate';
+    radio.value = rate.quoteId;
+    radio.checked = shippingPanelState.selectedQuoteId
+      ? shippingPanelState.selectedQuoteId === rate.quoteId
+      : index === 0;
+    radio.addEventListener('change', () => {
+      setShippingPanelState({ selectedQuoteId: rate.quoteId });
+      renderCurrentOrderSection();
+    });
+
+    const body = document.createElement('span');
+    body.className = 'pick-shipping-rate__body';
+
+    const service = document.createElement('strong');
+    service.textContent = formatShippingService(rate);
+
+    const meta = document.createElement('span');
+    const delivery = rate.deliveryDays ? `${rate.deliveryDays} day${rate.deliveryDays === 1 ? '' : 's'}` : '';
+    meta.textContent = [rate.serviceCode, delivery].filter(Boolean).join(' | ');
+
+    const price = document.createElement('b');
+    if (rate.priceUnavailable) {
+      price.className = 'pick-shipping-rate__no-price';
+      price.textContent = rate.priceUnavailableReason || 'No quote';
+    } else {
+      price.textContent = formatShippingMoney(rate.priceAmount, rate.priceCurrency);
+    }
+
+    body.appendChild(service);
+    if (meta.textContent) body.appendChild(meta);
+    option.appendChild(radio);
+    option.appendChild(body);
+    option.appendChild(price);
+    list.appendChild(option);
+  });
+
+  const buyButton = document.createElement('button');
+  buyButton.type = 'button';
+  buyButton.className = 'pick-shipping-buy-btn';
+  buyButton.classList.toggle('is-loading', shippingPanelState.actionLoading === 'buy');
+  buyButton.textContent = shippingPanelState.actionLoading === 'buy' ? 'Buying...' : 'Buy Label & Print';
+  buyButton.disabled = loading || Boolean(shippingPanelState.actionLoading) || !getSelectedShippingRate();
+  buyButton.addEventListener('click', buyVerifyShippingLabel);
+
+  container.appendChild(list);
+  container.appendChild(buyButton);
+}
+
+function renderPurchasedShippingLabel(container) {
+  const label = shippingPanelState.label;
+  if (!label?.labelId) return;
+  const voided = isShippingLabelVoided(label);
+
+  const panel = document.createElement('div');
+  panel.className = `pick-shipping-label${label.printStatus === 'error' ? ' has-print-error' : ''}${voided ? ' is-voided' : ''}`;
+
+  const title = document.createElement('strong');
+  title.textContent = voided
+    ? 'Label voided'
+    : (shippingPanelState.reusedExistingLabel ? 'Existing label found' : 'Label purchased');
+  panel.appendChild(title);
+
+  const tracking = document.createElement('p');
+  tracking.textContent = label.trackingNumber
+    ? `Tracking: ${label.trackingNumber}`
+    : 'Tracking not returned yet.';
+  panel.appendChild(tracking);
+
+  const print = document.createElement('p');
+  if (voided) {
+    print.textContent = 'This label was voided. Check rates and buy a replacement label if needed.';
+  } else if (label.printStatus === 'submitted') {
+    print.textContent = label.printNodeJobId
+      ? `PrintNode job: ${label.printNodeJobId}`
+      : 'Sent to PrintNode.';
+  } else if (label.printStatus === 'already_submitted') {
+    print.textContent = 'PrintNode already received this label.';
+  } else if (label.printStatus === 'error') {
+    print.textContent = `Print failed: ${label.printError || 'PrintNode error'}`;
+  } else {
+    print.textContent = 'Ready to print.';
+  }
+  panel.appendChild(print);
+
+  const actions = document.createElement('div');
+  actions.className = 'pick-shipping-label-actions';
+
+  const downloadUrl = getShippingLabelDownloadUrl(label);
+  if (downloadUrl && !voided) {
+    const download = document.createElement('a');
+    download.href = downloadUrl;
+    download.textContent = 'Download PDF';
+    download.target = '_blank';
+    download.rel = 'noopener';
+    actions.appendChild(download);
+  }
+
+  if (!voided) {
+    const printButton = document.createElement('button');
+    printButton.type = 'button';
+    printButton.textContent = label.printStatus === 'error' ? 'Retry Print' : 'Print Again';
+    printButton.disabled = loading || Boolean(shippingPanelState.actionLoading);
+    printButton.addEventListener('click', retryVerifyShippingLabelPrint);
+    actions.appendChild(printButton);
+
+    const voidButton = document.createElement('button');
+    voidButton.type = 'button';
+    voidButton.className = 'pick-shipping-label-void-btn';
+    voidButton.textContent = shippingPanelState.actionLoading === 'void' ? 'Voiding...' : 'Void Label';
+    voidButton.disabled = loading || Boolean(shippingPanelState.actionLoading);
+    voidButton.addEventListener('click', voidVerifyShippingLabel);
+    actions.appendChild(voidButton);
+  }
+
+  if (actions.childElementCount) {
+    panel.appendChild(actions);
+  }
+  container.appendChild(panel);
+}
+
+function renderVerifyShippingPanel(card, { includeHeader = true } = {}) {
+  if (!card) return;
+  card.innerHTML = '';
+
+  if (includeHeader) {
+    const header = document.createElement('header');
+    header.className = 'pick-list-card-header';
+
+    const title = document.createElement('h3');
+    title.textContent = getVerifyShippingModalTitle();
+
+    const subtitle = document.createElement('p');
+    subtitle.textContent = 'ShipStation V2 + PrintNode';
+
+    header.appendChild(title);
+    header.appendChild(subtitle);
+    card.appendChild(header);
+  }
+
+  if (shippingPanelState.actionLoading) {
+    const loadingText = document.createElement('div');
+    loadingText.className = 'pick-shipping-loading';
+    const message = {
+      lookup: 'Loading ShipStation shipment...',
+      rates: 'Checking rates...',
+      buy: 'Buying label...',
+      print: 'Sending to PrintNode...',
+      void: 'Voiding label...',
+    }[shippingPanelState.actionLoading] || 'Working...';
+    loadingText.innerHTML = `<span></span><strong>${message}</strong>`;
+    card.appendChild(loadingText);
+  }
+
+  if (shippingPanelState.status === 'payment_blocked') {
+    const blocker = document.createElement('div');
+    blocker.className = 'pick-shipping-blocker';
+    blocker.textContent = shippingPanelState.payment?.message || 'Payment is pending. Ask the customer to pay in Shopify before dispatch.';
+    card.appendChild(blocker);
+    return;
+  }
+
+  if (shippingPanelState.status === 'error') {
+    const error = document.createElement('div');
+    error.className = 'pick-shipping-blocker';
+    error.textContent = shippingPanelState.error || 'Shipping details could not be loaded.';
+    card.appendChild(error);
+
+    const retry = document.createElement('button');
+    retry.type = 'button';
+    retry.className = 'pick-shipping-secondary-btn';
+    retry.textContent = 'Retry Shipping Lookup';
+    retry.addEventListener('click', () => {
+      resetShippingPanelState(currentOrderBarcode);
+      renderCurrentOrderSection();
+      loadVerifyShippingLookup();
+    });
+    card.appendChild(retry);
+    return;
+  }
+
+  if (shippingPanelState.status === 'loading_lookup' || shippingPanelState.status === 'idle') {
+    if (shippingPanelState.actionLoading === 'lookup') return;
+    const loadingMessage = document.createElement('p');
+    loadingMessage.className = 'pick-shipping-state';
+    loadingMessage.textContent = 'Loading ShipStation shipment...';
+    card.appendChild(loadingMessage);
+    return;
+  }
+
+  if (shippingPanelState.status === 'no_shipment') {
+    const missing = document.createElement('div');
+    missing.className = 'pick-shipping-blocker pick-shipping-blocker--warn';
+    missing.textContent = 'No ShipStation shipment was found for this order.';
+    card.appendChild(missing);
+
+    const attempted = Array.isArray(shippingPanelState.attemptedIdentifiers)
+      ? shippingPanelState.attemptedIdentifiers
+      : [];
+    if (attempted.length) {
+      const list = document.createElement('p');
+      list.className = 'pick-shipping-state';
+      list.textContent = `Tried: ${attempted.join(', ')}`;
+      card.appendChild(list);
+    }
+    return;
+  }
+
+  renderShippingShipmentDetails(card);
+
+  if (shippingPanelState.status === 'purchased') {
+    renderPurchasedShippingLabel(card);
+    return;
+  }
+  if (shippingPanelState.label?.labelId) {
+    renderPurchasedShippingLabel(card);
+  }
+
+  renderShippingRateControls(card);
+  renderShippingRates(card);
+
+  if (shippingPanelState.error) {
+    const error = document.createElement('div');
+    error.className = 'pick-shipping-rate-error';
+    const title = document.createElement('strong');
+    title.textContent = 'Rate could not be generated';
+    const guidance = document.createElement('span');
+    guidance.textContent = 'Contact James, Caity or Taig and ask them to set better ShipStation defaults for this order.';
+    const message = document.createElement('span');
+    message.textContent = shippingPanelState.error;
+    error.appendChild(title);
+    error.appendChild(guidance);
+    error.appendChild(message);
+    card.appendChild(error);
+  }
+}
+
+function getVerifyShippingLaunchStatusText() {
+  if (shippingPanelState.label?.labelId) {
+    return shippingPanelState.label.printStatus === 'error'
+      ? 'Label ready, print needs attention'
+      : 'Label ready';
+  }
+  if (shippingPanelState.status === 'payment_blocked') {
+    return 'Payment needs attention before shipping';
+  }
+  if (shippingPanelState.status === 'rates') {
+    return 'Rates ready';
+  }
+  if (shippingPanelState.actionLoading === 'lookup' || shippingPanelState.status === 'loading_lookup') {
+    return 'Loading shipment';
+  }
+  if (shippingPanelState.status === 'shipment_found') {
+    return 'Shipment ready';
+  }
+  return 'Create shipping label';
+}
+
 function renderVerifyOrderCards() {
   const container = document.getElementById('pickListLineItems');
   if (!container) return;
@@ -1965,16 +3336,44 @@ function renderVerifyOrderCards() {
   }
 
   const totals = getVerifyTotals();
+  const canOpenShippingPanel = shouldShowVerifyShippingPanel(totals);
+  if (!canOpenShippingPanel && isVerifyShippingModalOpen()) {
+    closeVerifyShippingModal();
+  }
+  if (canOpenShippingPanel && shippingPanelState.barcode !== currentOrderBarcode) {
+    resetShippingPanelState(currentOrderBarcode);
+  }
 
   const summaryCard = document.createElement('article');
-  summaryCard.className = `pick-list-card pick-verify-summary${totals.isComplete ? ' is-complete' : ''}`;
+  const summaryTitle = canOpenShippingPanel
+    ? (totals.isComplete ? 'ORDER VERIFIED - TAP TO SHIP' : 'ORDER FULFILLED - TAP TO SHIP')
+    : getVerificationModeTitle();
+  const summarySubtitle = canOpenShippingPanel
+    ? getVerifyShippingLaunchStatusText()
+    : `${getVerificationVerb()} ${totals.scanned} of ${totals.required}${totals.isComplete ? ' - complete' : ''}`;
+  summaryCard.className = `pick-list-card pick-verify-summary${totals.isComplete ? ' is-complete' : ''}${canOpenShippingPanel ? ' is-shipping-launch' : ''}`;
   summaryCard.innerHTML = `
     <header class="pick-list-card-header">
-      <h3>${getVerificationModeTitle()}</h3>
-      <p>${getVerificationVerb()} ${totals.scanned} of ${totals.required}${totals.isComplete ? ' - complete' : ''}</p>
+      <h3>${summaryTitle}</h3>
+      <p>${summarySubtitle}</p>
     </header>
   `;
+  if (canOpenShippingPanel) {
+    summaryCard.setAttribute('role', 'button');
+    summaryCard.tabIndex = 0;
+    summaryCard.addEventListener('click', openVerifyShippingModal);
+    summaryCard.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter' || event.key === ' ') {
+        event.preventDefault();
+        openVerifyShippingModal();
+      }
+    });
+  }
   container.appendChild(summaryCard);
+
+  if (canOpenShippingPanel) {
+    queueVerifyShippingLookupPreload();
+  }
 
   const listCard = document.createElement('article');
   listCard.className = 'pick-list-card';
@@ -2244,6 +3643,7 @@ async function processVerifyTap(key) {
   row.scannedQty = wasComplete ? 0 : Math.min(requiredQty, Math.max(0, Number(row.scannedQty) || 0) + 1);
 
   renderVerifyOrderCards();
+  scheduleVerifyProgressSave();
 
   const totals = getVerifyTotals();
   if (wasComplete) {
@@ -2292,7 +3692,11 @@ async function processVerifyManual(key) {
   }
 
   renderVerifyOrderCards();
-  scheduleWholesaleProgressSave();
+  if (wholesaleModeEnabled) {
+    scheduleWholesaleProgressSave();
+  } else {
+    scheduleVerifyProgressSave();
+  }
   const totals = getVerifyTotals();
   if (totals.isComplete) {
     playVerifyCompleteSound();
@@ -2327,7 +3731,11 @@ function processVerifyUndo(key) {
   }
 
   renderVerifyOrderCards();
-  scheduleWholesaleProgressSave();
+  if (wholesaleModeEnabled) {
+    scheduleWholesaleProgressSave();
+  } else {
+    scheduleVerifyProgressSave();
+  }
   const totals = getVerifyTotals();
   setStatus(`Undo: ${getVerifyDisplayLabel(row)} (${row.scannedQty}/${row.requiredQty}).`, totals.isComplete ? 'success' : 'info');
 }
@@ -2383,7 +3791,11 @@ async function processVerifyScan(scannedCode) {
   }
 
   renderVerifyOrderCards();
-  scheduleWholesaleProgressSave();
+  if (wholesaleModeEnabled) {
+    scheduleWholesaleProgressSave();
+  } else {
+    scheduleVerifyProgressSave();
+  }
   const totals = getVerifyTotals();
 
   if (totals.isComplete) {
@@ -2834,6 +4246,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
   }
 
   await flushPendingPickedRowCountsSave();
+  await flushPendingVerifyProgressSave();
   scrollPickListToTop();
 
   setLoading(true);
@@ -2870,6 +4283,8 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
     currentOrderTimeline = Array.isArray(data.orderTimeline) ? data.orderTimeline : [];
+    currentOrderFinancialStatus = String(data.orderFinancialStatus || '').trim();
+    resetShippingPanelState(data.barcode);
     setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsItems) ? data.awaitingPartsItems : []);
     setOrderLookupInUrl(data.barcode || barcode);
     currentWorkflowBlock = data.workflowBlocked
@@ -2892,8 +4307,17 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
       data.wholesaleProgressByItemKey && typeof data.wholesaleProgressByItemKey === 'object'
         ? data.wholesaleProgressByItemKey
         : {};
+    lastVerifyProgressByItemKey =
+      data.verifyProgressByItemKey && typeof data.verifyProgressByItemKey === 'object'
+        ? data.verifyProgressByItemKey
+        : {};
     setPickedRowCountsFromPayload(data.pickedRowCounts);
-    buildVerifyState(lastOrderItems, wholesaleModeEnabled ? lastWholesaleProgressByItemKey : null);
+    buildVerifyState(
+      lastOrderItems,
+      wholesaleModeEnabled
+        ? lastWholesaleProgressByItemKey
+        : (verifyModeEnabled ? lastVerifyProgressByItemKey : null)
+    );
     hasRenderedPickList = true;
     prunePickedRowCountsToRenderedRows();
     renderCurrentOrderSection();
@@ -3003,6 +4427,7 @@ function setupHidScan() {
 function registerOrderActionReminderNavigationGuards() {
   window.addEventListener('beforeunload', (event) => {
     sendPickedRowCountsBeacon();
+    sendVerifyProgressBeacon();
     if (suppressNextActionReminderUnload) return;
     if (!shouldShowOrderActionReminder()) return;
 
@@ -3038,6 +4463,7 @@ function registerModalHandlers() {
   const qcFailModal = document.getElementById('qcFailModal');
   const onHoldModal = document.getElementById('onHoldModal');
   const orderActionReminderModal = document.getElementById('orderActionReminderModal');
+  const verifyShippingModal = document.getElementById('verifyShippingModal');
 
   const awaitingCancel = document.getElementById('awaitingPartsCancelBtn');
   const awaitingConfirm = document.getElementById('awaitingPartsConfirmBtn');
@@ -3048,6 +4474,7 @@ function registerModalHandlers() {
   const onHoldConfirm = document.getElementById('onHoldConfirmBtn');
   const reminderCancel = document.getElementById('orderActionReminderCancelBtn');
   const reminderContinue = document.getElementById('orderActionReminderContinueBtn');
+  const verifyShippingClose = document.getElementById('verifyShippingModalCloseBtn');
 
   if (awaitingCancel) awaitingCancel.addEventListener('click', cancelAwaitingPartsDialog);
   if (awaitingConfirm) awaitingConfirm.addEventListener('click', submitAwaitingParts);
@@ -3056,6 +4483,7 @@ function registerModalHandlers() {
   if (qcConfirm) qcConfirm.addEventListener('click', submitQcFail);
   if (onHoldCancel) onHoldCancel.addEventListener('click', closeOnHoldDialog);
   if (onHoldConfirm) onHoldConfirm.addEventListener('click', submitOnHold);
+  if (verifyShippingClose) verifyShippingClose.addEventListener('click', closeVerifyShippingModal);
   if (reminderCancel) reminderCancel.addEventListener('click', () => closeOrderActionReminderDialog());
   if (reminderContinue) {
     reminderContinue.addEventListener('click', () => {
@@ -3101,6 +4529,14 @@ function registerModalHandlers() {
     orderActionReminderModal.addEventListener('click', (event) => {
       if (event.target === event.currentTarget) {
         closeOrderActionReminderDialog();
+      }
+    });
+  }
+
+  if (verifyShippingModal) {
+    verifyShippingModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeVerifyShippingModal();
       }
     });
   }
@@ -3180,10 +4616,21 @@ document.addEventListener('DOMContentLoaded', () => {
 
   const syncVerificationStateForMode = () => {
     if (!hasRenderedPickList || !isVerificationStyleModeEnabled()) return;
-    buildVerifyState(lastOrderItems, wholesaleModeEnabled ? lastWholesaleProgressByItemKey : null);
+    buildVerifyState(
+      lastOrderItems,
+      wholesaleModeEnabled
+        ? lastWholesaleProgressByItemKey
+        : (verifyModeEnabled ? lastVerifyProgressByItemKey : null)
+    );
   };
 
   const applyModeState = () => {
+    if (!verifyModeEnabled && verifySaveTimeoutId) {
+      clearTimeout(verifySaveTimeoutId);
+      verifySaveTimeoutId = null;
+      flushVerifyProgressSave(true);
+    }
+
     if (!wholesaleModeEnabled && wholesaleSaveTimeoutId) {
       clearTimeout(wholesaleSaveTimeoutId);
       wholesaleSaveTimeoutId = null;

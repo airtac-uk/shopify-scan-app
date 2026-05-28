@@ -45,6 +45,19 @@ const {
   resolvePreformBuildArtifact,
   transformStlBufferOrientation,
 } = require('./preformBuildService');
+const {
+  getShipmentRates,
+  listLabelsForShipment,
+  lookupShipmentForOrder,
+  purchaseLabelForRate,
+  voidLabelById,
+  downloadLabelBuffer,
+  getLabelById,
+  updateShipmentWeight,
+} = require('./shipstationService');
+const {
+  printPdfLabel,
+} = require('./printNodeService');
 
 router.use(cookieParser());
 
@@ -272,8 +285,10 @@ const webhookRegistrationCheckedShops = new Set();
 const awaitingPartsSyncPromises = new Map();
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
 const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
+const SHIPPING_ALLOWED_FINANCIAL_STATUSES = new Set(['PAID', 'PARTIALLY_REFUNDED']);
 const ORDER_WORKFLOW_STATUS_FIELDS = `
               displayFulfillmentStatus
+              displayFinancialStatus
               cancelledAt
               cancelReason
 `;
@@ -573,6 +588,279 @@ function getOrderWorkflowBlock(order) {
   }
 
   return null;
+}
+
+function canManageShippingDespiteWorkflowBlock(workflowBlock) {
+  const status = String(workflowBlock?.status || workflowBlock?.code || '').trim().toUpperCase();
+  return status === 'FULFILLED' || status === 'PARTIALLY_FULFILLED';
+}
+
+function normalizeFinancialStatus(value) {
+  return String(value || '').trim().toUpperCase();
+}
+
+function getOrderPaymentState(order) {
+  const financialStatus = normalizeFinancialStatus(order?.displayFinancialStatus);
+  const canShip = SHIPPING_ALLOWED_FINANCIAL_STATUSES.has(financialStatus);
+  const label = financialStatus ? formatOrderStatusLabel(financialStatus) : 'unknown';
+  return {
+    financialStatus,
+    canShip,
+    message: canShip
+      ? ''
+      : `Order ${order?.name || ''} is payment ${label}. Ask the customer to pay in Shopify before buying a shipping label.`,
+  };
+}
+
+function getShippingOrderQuery() {
+  return `
+    query getOrderForShipping($query: String!) {
+      orders(first: 1, query: $query) {
+        edges {
+          node {
+            id
+            name
+            note
+            tags
+            ${ORDER_WORKFLOW_STATUS_FIELDS}
+          }
+        }
+      }
+    }
+  `;
+}
+
+async function findOrderForShipping({ client, barcode }) {
+  const normalizedBarcode = normalizeScanBarcode(barcode);
+  if (!normalizedBarcode) return null;
+
+  const response = await client.graphql(getShippingOrderQuery(), {
+    variables: {
+      query: `${normalizedBarcode} status:any`,
+    },
+  });
+
+  return response.data?.orders?.edges?.[0]?.node || null;
+}
+
+function buildShippingOrderIdentifiers({ order, barcode }) {
+  const values = [
+    barcode,
+    order?.name,
+    String(order?.name || '').replace(/^#/, ''),
+  ];
+
+  return Array.from(new Set(values
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)));
+}
+
+function summarizeShippingLabel(label) {
+  if (!label) return null;
+  return {
+    labelId: String(label.labelId || '').trim(),
+    shipmentId: String(label.shipmentId || '').trim(),
+    rateId: String(label.rateId || '').trim(),
+    trackingNumber: String(label.trackingNumber || '').trim(),
+    labelUrl: String(label.labelUrl || '').trim(),
+    status: String(label.status || '').trim(),
+    priceAmount: Number(label.priceAmount || label.shipmentCost?.amount || 0),
+    priceCurrency: String(label.priceCurrency || label.shipmentCost?.currency || '').trim().toUpperCase(),
+    printNodeJobId: String(label.printNodeJobId || '').trim(),
+    printStatus: String(label.printStatus || '').trim(),
+    printError: String(label.printError || '').trim(),
+    createdAt: label.createdAt || null,
+    updatedAt: label.updatedAt || null,
+    printedAt: label.printedAt || null,
+  };
+}
+
+function isReusableShippingLabel(label) {
+  const status = String(label?.status || '').trim().toLowerCase();
+  return Boolean(label?.labelId && status !== 'voided' && status !== 'error');
+}
+
+function isRoyalMailShippingEntity(entity) {
+  const haystack = [
+    entity?.carrierCode,
+    entity?.carrierName,
+    entity?.carrierFriendlyName,
+    entity?.serviceCode,
+    entity?.serviceName,
+    entity?.serviceType,
+    entity?.requestedShipmentService,
+    entity?.raw?.carrier_code,
+    entity?.raw?.carrier_friendly_name,
+    entity?.raw?.service_code,
+    entity?.raw?.service_type,
+    entity?.raw?.requested_shipment_service,
+  ].filter(Boolean).join(' ').toLowerCase();
+  return /\broyal\s*mail\b/.test(haystack) || /\broyal_mail\b/.test(haystack);
+}
+
+function summarizeShippingRate(rate, quote = null) {
+  if (!rate) return null;
+  const hidePrice = isRoyalMailShippingEntity(rate);
+  return {
+    quoteId: quote?.quoteId || '',
+    rateId: String(rate.rateId || '').trim(),
+    shipmentId: String(rate.shipmentId || '').trim(),
+    carrierCode: String(rate.carrierCode || '').trim(),
+    carrierName: String(rate.carrierName || '').trim(),
+    serviceCode: String(rate.serviceCode || '').trim(),
+    serviceName: String(rate.serviceName || '').trim(),
+    deliveryDays: rate.deliveryDays ?? null,
+    deliveryDate: rate.deliveryDate || '',
+    validationStatus: String(rate.validationStatus || '').trim(),
+    warningMessages: Array.isArray(rate.warningMessages) ? rate.warningMessages : [],
+    priceAmount: hidePrice ? null : Number(rate.totalAmount?.amount || 0),
+    priceCurrency: hidePrice ? '' : String(rate.totalAmount?.currency || '').trim().toUpperCase(),
+    priceUnavailable: hidePrice,
+    priceUnavailableReason: hidePrice ? 'Royal Mail does not return a quote through ShipStation.' : '',
+  };
+}
+
+function normalizeShippingPackageDimensionsInput(dimensions) {
+  if (!dimensions || typeof dimensions !== 'object') return null;
+  const length = Number(dimensions.length);
+  const width = Number(dimensions.width);
+  const height = Number(dimensions.height);
+  if (![length, width, height].every((value) => Number.isFinite(value) && value > 0)) {
+    return null;
+  }
+  return {
+    length,
+    width,
+    height,
+    unit: String(dimensions.unit || 'centimeter').trim() || 'centimeter',
+  };
+}
+
+async function upsertRemoteShippingLabels({ shop, barcode, orderNumber, labels = [], rate = null }) {
+  const records = [];
+  for (const label of labels) {
+    if (!label?.labelId || !label?.shipmentId) continue;
+    const record = sessionsStore.upsertShippingLabel({
+      shop,
+      barcode,
+      orderNumber,
+      label,
+      rate,
+    });
+    if (record) records.push(record);
+  }
+  return records;
+}
+
+async function getKnownShippingLabelsForShipment({
+  shop,
+  barcode,
+  orderNumber,
+  shipmentId,
+  requireRemote = false,
+  reusableOnly = true,
+} = {}) {
+  const localLabels = sessionsStore.getShippingLabelsForShipment({ shop, shipmentId });
+  let remoteRecords = [];
+  try {
+    const remoteLabels = await listLabelsForShipment(shipmentId);
+    remoteRecords = await upsertRemoteShippingLabels({
+      shop,
+      barcode,
+      orderNumber,
+      labels: remoteLabels,
+    });
+  } catch (err) {
+    console.error('Failed to list ShipStation labels for duplicate check:', err);
+    if (requireRemote) throw err;
+  }
+
+  const byLabelId = new Map();
+  [...localLabels, ...remoteRecords].forEach((label) => {
+    if (!label?.labelId) return;
+    byLabelId.set(label.labelId, label);
+  });
+
+  const labels = Array.from(byLabelId.values());
+  return (reusableOnly ? labels.filter(isReusableShippingLabel) : labels)
+    .sort((left, right) => String(right.createdAt || '').localeCompare(String(left.createdAt || '')));
+}
+
+async function refreshStoredShippingLabel({ shop, label }) {
+  const refreshedLabel = await getLabelById(label.labelId);
+  return sessionsStore.upsertShippingLabel({
+    shop,
+    barcode: label.barcode,
+    orderNumber: label.orderNumber,
+    quoteId: label.quoteId,
+    label: refreshedLabel,
+  }) || label;
+}
+
+async function downloadStoredShippingLabelPdf({ shop, label }) {
+  let currentLabel = label;
+  let labelUrl = String(currentLabel?.labelUrl || '').trim();
+  if (!labelUrl) {
+    currentLabel = await refreshStoredShippingLabel({ shop, label: currentLabel });
+    labelUrl = String(currentLabel?.labelUrl || '').trim();
+  }
+
+  try {
+    return {
+      label: currentLabel,
+      download: await downloadLabelBuffer(labelUrl),
+    };
+  } catch (err) {
+    const originalError = err;
+    currentLabel = await refreshStoredShippingLabel({ shop, label: currentLabel });
+    const refreshedUrl = String(currentLabel?.labelUrl || '').trim();
+    if (!refreshedUrl || refreshedUrl === labelUrl) {
+      throw originalError;
+    }
+
+    try {
+      return {
+        label: currentLabel,
+        download: await downloadLabelBuffer(refreshedUrl),
+      };
+    } catch (retryErr) {
+      retryErr.message = `${retryErr.message} Original label download error: ${originalError.message || originalError}`;
+      throw retryErr;
+    }
+  }
+}
+
+async function printStoredShippingLabel({ shop, label }) {
+  if (!label?.labelId) throw new Error('Missing purchased label.');
+  const { label: currentLabel, download } = await downloadStoredShippingLabelPdf({ shop, label });
+  const printResult = await printPdfLabel({
+    shop,
+    labelId: currentLabel.labelId,
+    orderNumber: currentLabel.orderNumber || currentLabel.barcode,
+    pdfBuffer: download.buffer,
+  });
+
+  return sessionsStore.updateShippingLabelPrintResult({
+    shop,
+    labelId: currentLabel.labelId,
+    printNodeJobId: printResult.printNodeJobId,
+    printStatus: printResult.printStatus,
+    printError: null,
+  });
+}
+
+async function tryPrintStoredShippingLabel({ shop, label }) {
+  try {
+    return await printStoredShippingLabel({ shop, label });
+  } catch (err) {
+    console.error('Failed to print shipping label:', err);
+    return sessionsStore.updateShippingLabelPrintResult({
+      shop,
+      labelId: label.labelId,
+      printStatus: 'error',
+      printError: err.message || 'PrintNode print failed',
+    }) || label;
+  }
 }
 
 function buildCurrentOrderLineItems(edges = []) {
@@ -3355,6 +3643,421 @@ router.post('/api/qc-fail', async (req, res) => {
   }
 });
 
+router.post('/api/pick-list/shipping/lookup', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const normalizedBarcode = normalizeScanBarcode(req.body?.barcode);
+    if (!normalizedBarcode) {
+      return res.status(400).json({ success: false, error: 'Missing barcode' });
+    }
+
+    const client = shopifyClient(auth.session);
+    const order = await findOrderForShipping({ client, barcode: normalizedBarcode });
+    if (!order) {
+      return res.status(404).json({ success: false, error: `Order ${normalizedBarcode} not found` });
+    }
+
+    const workflowBlock = getOrderWorkflowBlock(order);
+    const payment = getOrderPaymentState(order);
+    if ((workflowBlock && !canManageShippingDespiteWorkflowBlock(workflowBlock)) || !payment.canShip) {
+      return res.json({
+        success: true,
+        orderNumber: order.name,
+        payment,
+        workflowBlocked: Boolean(workflowBlock),
+        workflowWarning: workflowBlock?.message || '',
+        shipmentFound: false,
+        attemptedIdentifiers: buildShippingOrderIdentifiers({ order, barcode: normalizedBarcode }),
+        existingLabels: [],
+      });
+    }
+
+    const identifiers = buildShippingOrderIdentifiers({ order, barcode: normalizedBarcode });
+    const lookup = await lookupShipmentForOrder({ identifiers });
+    const shipment = lookup.shipment || null;
+    const existingLabels = shipment?.shipmentId
+      ? await getKnownShippingLabelsForShipment({
+          shop: auth.shop,
+          barcode: normalizedBarcode,
+          orderNumber: order.name,
+          shipmentId: shipment.shipmentId,
+          reusableOnly: false,
+        })
+      : [];
+
+    return res.json({
+      success: true,
+      orderNumber: order.name,
+      payment,
+      shipmentFound: Boolean(shipment),
+      shipment,
+      selectedAttemptLabel: lookup.selectedAttemptLabel || '',
+      attemptedIdentifiers: lookup.attemptedIdentifiers || identifiers,
+      attemptedQueries: lookup.attemptedQueries || [],
+      candidates: lookup.candidates || [],
+      existingLabels: existingLabels.map(summarizeShippingLabel),
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/shipping/lookup:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/pick-list/shipping/rates', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const normalizedBarcode = normalizeScanBarcode(req.body?.barcode);
+    const shipmentId = String(req.body?.shipmentId || '').trim();
+    const weightGrams = Math.floor(Number(req.body?.weightGrams) || 0);
+    const packageDimensions = normalizeShippingPackageDimensionsInput(req.body?.packageDimensions);
+    if (!normalizedBarcode || !shipmentId) {
+      return res.status(400).json({ success: false, error: 'Missing barcode or shipment id' });
+    }
+    if (!Number.isInteger(weightGrams) || weightGrams <= 0) {
+      return res.status(400).json({ success: false, error: 'Enter a valid package weight in grams.' });
+    }
+    if (!packageDimensions) {
+      return res.status(400).json({ success: false, error: 'Select a package size, or enter valid custom package dimensions.' });
+    }
+
+    console.log('[ShipStation rate check] Starting rate check', {
+      shop: auth.shop,
+      barcode: normalizedBarcode,
+      shipmentId,
+      weightGrams,
+      packageDimensions,
+    });
+
+    const client = shopifyClient(auth.session);
+    const order = await findOrderForShipping({ client, barcode: normalizedBarcode });
+    if (!order) {
+      return res.status(404).json({ success: false, error: `Order ${normalizedBarcode} not found` });
+    }
+
+    const workflowBlock = getOrderWorkflowBlock(order);
+    if (workflowBlock && !canManageShippingDespiteWorkflowBlock(workflowBlock)) {
+      return res.status(409).json({ success: false, error: workflowBlock.message, workflowBlocked: true });
+    }
+
+    const payment = getOrderPaymentState(order);
+    if (!payment.canShip) {
+      return res.status(409).json({ success: false, error: payment.message, payment });
+    }
+
+    console.log('[ShipStation rate check] Shopify order accepted for rating', {
+      barcode: normalizedBarcode,
+      orderNumber: order.name,
+      financialStatus: payment.financialStatus,
+      shipmentId,
+      weightGrams,
+      packageDimensions,
+    });
+
+    const updatedShipment = await updateShipmentWeight({ shipmentId, weightGrams, packageDimensions });
+    const rates = await getShipmentRates(shipmentId, {
+      carrierId: updatedShipment?.carrierId || '',
+      selectedServiceCode: updatedShipment?.serviceCode || '',
+      packageCode: updatedShipment?.packages?.[0]?.packageCode || updatedShipment?.packageCode || '',
+      preferredCurrency: 'GBP',
+    });
+    console.log('[ShipStation rate check] Rate check completed', {
+      barcode: normalizedBarcode,
+      orderNumber: order.name,
+      shipmentId,
+      updatedShipmentId: updatedShipment?.shipmentId || '',
+      rateCount: rates.length,
+      rates: rates.map((rate) => summarizeShippingRate(rate)),
+    });
+
+    if (!rates.length) {
+      if (isRoyalMailShippingEntity(updatedShipment)) {
+        return res.json({
+          success: true,
+          orderNumber: order.name,
+          payment,
+          shipment: updatedShipment,
+          expiresAt: null,
+          rates: [],
+          noRateReason: 'Royal Mail service is available, but ShipStation does not return a quote through the API.',
+        });
+      }
+
+      return res.status(422).json({
+        success: false,
+        error: 'ShipStation did not return any valid rates for this shipment.',
+        shipment: updatedShipment,
+        rateError: true,
+      });
+    }
+
+    const expiresAt = new Date(Date.now() + 10 * 60 * 1000).toISOString();
+    const quoteRecords = rates.map((rate) => sessionsStore.createShippingQuote({
+      shop: auth.shop,
+      barcode: normalizedBarcode,
+      orderNumber: order.name,
+      shipment: updatedShipment,
+      rate,
+      weightGrams,
+      expiresAt,
+    })).filter(Boolean);
+
+    const quoteByRateId = new Map(quoteRecords.map((quote) => [quote.rateId, quote]));
+
+    return res.json({
+      success: true,
+      orderNumber: order.name,
+      payment,
+      shipment: updatedShipment,
+      expiresAt,
+      rates: rates.map((rate) => summarizeShippingRate(rate, quoteByRateId.get(rate.rateId))),
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/shipping/rates:', {
+      error: err.message || String(err),
+      stack: err.stack,
+      barcode: req.body?.barcode,
+      shipmentId: req.body?.shipmentId,
+      weightGrams: req.body?.weightGrams,
+      packageDimensions: req.body?.packageDimensions,
+    });
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+      rateError: true,
+    });
+  }
+});
+
+router.post('/api/pick-list/shipping/labels', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const quoteId = String(req.body?.quoteId || '').trim();
+    if (!quoteId) {
+      return res.status(400).json({ success: false, error: 'Missing quote id' });
+    }
+
+    const quote = sessionsStore.getShippingQuote({ shop: auth.shop, quoteId });
+    if (!quote) {
+      return res.status(404).json({ success: false, error: 'Shipping quote not found. Rate the shipment again.' });
+    }
+    if (quote.isExpired) {
+      return res.status(409).json({ success: false, error: 'Shipping quote expired. Rate the shipment again.' });
+    }
+
+    const client = shopifyClient(auth.session);
+    const order = await findOrderForShipping({ client, barcode: quote.barcode });
+    if (!order) {
+      return res.status(404).json({ success: false, error: `Order ${quote.barcode} not found` });
+    }
+
+    const workflowBlock = getOrderWorkflowBlock(order);
+    if (workflowBlock && !canManageShippingDespiteWorkflowBlock(workflowBlock)) {
+      return res.status(409).json({ success: false, error: workflowBlock.message, workflowBlocked: true });
+    }
+
+    const payment = getOrderPaymentState(order);
+    if (!payment.canShip) {
+      return res.status(409).json({ success: false, error: payment.message, payment });
+    }
+
+    const knownLabels = await getKnownShippingLabelsForShipment({
+      shop: auth.shop,
+      barcode: quote.barcode,
+      orderNumber: order.name || quote.orderNumber,
+      shipmentId: quote.shipmentId,
+      requireRemote: true,
+    });
+    const existingLabel = knownLabels.find(isReusableShippingLabel);
+    if (existingLabel) {
+      sessionsStore.markShippingQuotePurchased({
+        shop: auth.shop,
+        quoteId,
+        labelId: existingLabel.labelId,
+      });
+      return res.json({
+        success: true,
+        reusedExistingLabel: true,
+        label: summarizeShippingLabel(existingLabel),
+        payment,
+      });
+    }
+
+    const purchasedLabel = await purchaseLabelForRate(quote.rateId);
+    if (!purchasedLabel?.labelId) {
+      throw new Error('ShipStation did not return a purchased label id.');
+    }
+
+    let labelRecord = sessionsStore.upsertShippingLabel({
+      shop: auth.shop,
+      barcode: quote.barcode,
+      orderNumber: order.name || quote.orderNumber,
+      quoteId,
+      label: purchasedLabel,
+      rate: quote.rate,
+    });
+    sessionsStore.markShippingQuotePurchased({
+      shop: auth.shop,
+      quoteId,
+      labelId: purchasedLabel.labelId,
+    });
+
+    labelRecord = await tryPrintStoredShippingLabel({
+      shop: auth.shop,
+      label: labelRecord,
+    });
+
+    return res.json({
+      success: true,
+      reusedExistingLabel: false,
+      label: summarizeShippingLabel(labelRecord),
+      payment,
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/shipping/labels:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/pick-list/shipping/labels/:labelId/print', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const labelId = String(req.params.labelId || '').trim();
+    const label = sessionsStore.getShippingLabel({ shop: auth.shop, labelId });
+    if (!label) {
+      return res.status(404).json({ success: false, error: 'Shipping label not found.' });
+    }
+    if (!isReusableShippingLabel(label)) {
+      return res.status(409).json({ success: false, error: 'This shipping label has been voided.' });
+    }
+
+    const updatedLabel = await printStoredShippingLabel({
+      shop: auth.shop,
+      label,
+    });
+
+    return res.json({
+      success: true,
+      label: summarizeShippingLabel(updatedLabel),
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/shipping/labels/:labelId/print:', err);
+    const labelId = String(req.params.labelId || '').trim();
+    const auth = req.cookies?.shop ? { shop: req.cookies.shop } : null;
+    if (auth?.shop && labelId) {
+      try {
+        const updatedLabel = sessionsStore.updateShippingLabelPrintResult({
+          shop: auth.shop,
+          labelId,
+          printStatus: 'error',
+          printError: err.message || 'PrintNode print failed',
+        });
+        return res.status(500).json({
+          success: false,
+          error: err.message || 'Server error',
+          label: summarizeShippingLabel(updatedLabel),
+        });
+      } catch (storeErr) {
+        console.error('Failed to store print error:', storeErr);
+      }
+    }
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/pick-list/shipping/labels/:labelId/void', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const labelId = String(req.params.labelId || '').trim();
+    const label = sessionsStore.getShippingLabel({ shop: auth.shop, labelId });
+    if (!label) {
+      return res.status(404).json({ success: false, error: 'Shipping label not found.' });
+    }
+    if (!isReusableShippingLabel(label)) {
+      return res.status(409).json({
+        success: false,
+        error: 'This shipping label has already been voided or cannot be voided.',
+        label: summarizeShippingLabel(label),
+      });
+    }
+
+    const result = await voidLabelById(labelId);
+    if (!result.approved) {
+      return res.status(409).json({
+        success: false,
+        error: result.message || 'ShipStation did not approve the label void.',
+        label: summarizeShippingLabel(label),
+      });
+    }
+
+    let updatedLabel = sessionsStore.updateShippingLabelStatus({
+      shop: auth.shop,
+      labelId,
+      status: 'voided',
+      label: {
+        ...(label.label || {}),
+        status: 'voided',
+        voidResult: result.raw,
+      },
+    }) || label;
+
+    try {
+      updatedLabel = await refreshStoredShippingLabel({ shop: auth.shop, label: updatedLabel });
+    } catch (refreshErr) {
+      console.error('Failed to refresh voided ShipStation label:', refreshErr);
+    }
+
+    return res.json({
+      success: true,
+      label: summarizeShippingLabel(updatedLabel),
+      voidResult: result,
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/shipping/labels/:labelId/void:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.get('/api/pick-list/shipping/labels/:labelId/download', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const labelId = String(req.params.labelId || '').trim();
+    const label = sessionsStore.getShippingLabel({ shop: auth.shop, labelId });
+    if (!label) {
+      return res.status(404).json({ success: false, error: 'Shipping label not found.' });
+    }
+    if (!isReusableShippingLabel(label)) {
+      return res.status(409).json({ success: false, error: 'This shipping label has been voided.' });
+    }
+
+    const { download } = await downloadStoredShippingLabelPdf({
+      shop: auth.shop,
+      label,
+    });
+    const fileName = `${String(label.orderNumber || label.barcode || label.labelId).replace(/[^A-Za-z0-9_-]+/g, '_')}-label.pdf`;
+    res.setHeader('Content-Type', download.contentType || 'application/pdf');
+    res.setHeader('Content-Disposition', `attachment; filename="${fileName}"`);
+    return res.send(download.buffer);
+  } catch (err) {
+    console.error('Error in /api/pick-list/shipping/labels/:labelId/download:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
 router.post('/api/wholesale-progress', async (req, res) => {
   try {
     const { barcode, progressByItemKey } = req.body || {};
@@ -3585,6 +4288,10 @@ router.post('/api/pick-list', async (req, res) => {
       shop,
       barcode: normalizedBarcode,
     });
+    const verifyProgressByItemKey = sessionsStore.getVerifyOrderProgress({
+      shop,
+      barcode: normalizedBarcode,
+    });
     const pickedRowCounts = sessionsStore.getPickListPickedProgress({
       shop,
       barcode: normalizedBarcode,
@@ -3611,6 +4318,7 @@ router.post('/api/pick-list', async (req, res) => {
       orderNumber: order.name,
       orderTags: normalizeOrderTags(order.tags),
       orderStatus: order.cancelledAt ? 'CANCELLED' : (order.displayFulfillmentStatus || ''),
+      orderFinancialStatus: order.displayFinancialStatus || '',
       currentStage: {
         key: currentTrackerStage.key,
         label: currentTrackerStage.label,
@@ -3632,6 +4340,7 @@ router.post('/api/pick-list', async (req, res) => {
       trackerToken: trackerInfo.trackerToken,
       trackerUrl: trackerInfo.trackerUrl,
       wholesaleProgressByItemKey,
+      verifyProgressByItemKey,
       pickedRowCounts,
       orderItems: orderLineItems,
       lineItems: pickListResult.lineItems,
@@ -3675,6 +4384,42 @@ router.post('/api/pick-list-picked-progress', async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error('Error in /api/pick-list-picked-progress:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/pick-list-verify-progress', async (req, res) => {
+  try {
+    const { barcode, progressByItemKey } = req.body || {};
+    const normalizedBarcode = normalizeScanBarcode(barcode);
+
+    if (!normalizedBarcode) {
+      return res.status(400).json({ success: false, error: 'Missing barcode' });
+    }
+
+    if (!progressByItemKey || typeof progressByItemKey !== 'object' || Array.isArray(progressByItemKey)) {
+      return res.status(400).json({ success: false, error: 'Missing progressByItemKey object' });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    sessionsStore.setVerifyOrderProgress({
+      shop,
+      barcode: normalizedBarcode,
+      progressByItemKey,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /api/pick-list-verify-progress:', err);
     return res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
 });

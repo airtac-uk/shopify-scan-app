@@ -82,6 +82,22 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE TABLE IF NOT EXISTS verify_order_progress (
+    shop TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    itemKey TEXT NOT NULL,
+    scannedQty INTEGER NOT NULL,
+    updatedAt TEXT NOT NULL,
+    PRIMARY KEY (shop, barcode, itemKey)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_verify_order_progress_shop_barcode
+  ON verify_order_progress (shop, barcode)
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS wholesale_build_events (
     shop TEXT NOT NULL,
     barcode TEXT NOT NULL,
@@ -301,6 +317,79 @@ db.prepare(`
   ON print_part_orientations (shop, updatedAt DESC)
 `).run();
 
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS shipping_label_quotes (
+    quoteId TEXT PRIMARY KEY,
+    shop TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    orderNumber TEXT,
+    shipmentId TEXT NOT NULL,
+    rateId TEXT NOT NULL,
+    weightGrams INTEGER NOT NULL,
+    serviceCode TEXT,
+    serviceName TEXT,
+    carrierCode TEXT,
+    carrierName TEXT,
+    priceAmount REAL,
+    priceCurrency TEXT,
+    rateJson TEXT NOT NULL,
+    shipmentJson TEXT,
+    createdAt TEXT NOT NULL,
+    expiresAt TEXT NOT NULL,
+    purchasedLabelId TEXT
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_shipping_label_quotes_shop_barcode
+  ON shipping_label_quotes (shop, barcode, createdAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_shipping_label_quotes_shop_shipment
+  ON shipping_label_quotes (shop, shipmentId, createdAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_shipping_label_quotes_expires
+  ON shipping_label_quotes (expiresAt)
+`).run();
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS shipping_labels (
+    shop TEXT NOT NULL,
+    labelId TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    orderNumber TEXT,
+    shipmentId TEXT NOT NULL,
+    rateId TEXT,
+    quoteId TEXT,
+    trackingNumber TEXT,
+    labelUrl TEXT,
+    status TEXT,
+    priceAmount REAL,
+    priceCurrency TEXT,
+    printNodeJobId TEXT,
+    printStatus TEXT,
+    printError TEXT,
+    labelJson TEXT,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    printedAt TEXT,
+    PRIMARY KEY (shop, labelId)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_shipping_labels_shop_shipment
+  ON shipping_labels (shop, shipmentId, createdAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_shipping_labels_shop_barcode
+  ON shipping_labels (shop, barcode, createdAt DESC)
+`).run();
+
 function normalizeBarcode(barcode) {
   return String(barcode || '').trim().toUpperCase();
 }
@@ -414,6 +503,73 @@ function normalizePrintPartOrientationRecord(row) {
     lockMode: String(row.lockMode || 'LOCKED_XY_ROTATION_FREE_TRANSLATION').trim() || 'LOCKED_XY_ROTATION_FREE_TRANSLATION',
     updatedBy: String(row.updatedBy || '').trim(),
     updatedAt: row.updatedAt || null,
+  };
+}
+
+function generateShippingQuoteId() {
+  return `ship_quote_${crypto.randomBytes(16).toString('hex')}`;
+}
+
+function normalizeShippingMoneyFromRate(rate) {
+  const total = rate?.totalAmount || rate?.shipmentCost || rate?.shipment_cost || {};
+  return {
+    amount: Number(total.amount || 0),
+    currency: String(total.currency || '').trim().toUpperCase(),
+  };
+}
+
+function normalizeShippingQuoteRecord(row) {
+  if (!row) return null;
+  const rate = safeJsonParse(row.rateJson || '{}', {});
+  const shipment = safeJsonParse(row.shipmentJson || '{}', {});
+
+  return {
+    quoteId: String(row.quoteId || '').trim(),
+    shop: String(row.shop || '').trim(),
+    barcode: normalizeBarcode(row.barcode),
+    orderNumber: String(row.orderNumber || '').trim(),
+    shipmentId: String(row.shipmentId || '').trim(),
+    rateId: String(row.rateId || '').trim(),
+    weightGrams: Math.max(1, Math.floor(Number(row.weightGrams) || 1)),
+    serviceCode: String(row.serviceCode || '').trim(),
+    serviceName: String(row.serviceName || '').trim(),
+    carrierCode: String(row.carrierCode || '').trim(),
+    carrierName: String(row.carrierName || '').trim(),
+    priceAmount: Number(row.priceAmount || 0),
+    priceCurrency: String(row.priceCurrency || '').trim().toUpperCase(),
+    rate,
+    shipment,
+    createdAt: row.createdAt || null,
+    expiresAt: row.expiresAt || null,
+    purchasedLabelId: String(row.purchasedLabelId || '').trim(),
+    isExpired: row.expiresAt ? new Date(row.expiresAt).getTime() <= Date.now() : true,
+  };
+}
+
+function normalizeShippingLabelRecord(row) {
+  if (!row) return null;
+  const label = safeJsonParse(row.labelJson || '{}', {});
+
+  return {
+    shop: String(row.shop || '').trim(),
+    labelId: String(row.labelId || '').trim(),
+    barcode: normalizeBarcode(row.barcode),
+    orderNumber: String(row.orderNumber || '').trim(),
+    shipmentId: String(row.shipmentId || '').trim(),
+    rateId: String(row.rateId || '').trim(),
+    quoteId: String(row.quoteId || '').trim(),
+    trackingNumber: String(row.trackingNumber || '').trim(),
+    labelUrl: String(row.labelUrl || '').trim(),
+    status: String(row.status || '').trim(),
+    priceAmount: Number(row.priceAmount || 0),
+    priceCurrency: String(row.priceCurrency || '').trim().toUpperCase(),
+    printNodeJobId: String(row.printNodeJobId || '').trim(),
+    printStatus: String(row.printStatus || '').trim(),
+    printError: String(row.printError || '').trim(),
+    label,
+    createdAt: row.createdAt || null,
+    updatedAt: row.updatedAt || null,
+    printedAt: row.printedAt || null,
   };
 }
 
@@ -602,6 +758,59 @@ module.exports = {
       deleteStmt.run(String(shop), normalizedBarcode);
       entries.forEach((entry) => {
         insertStmt.run(String(shop), normalizedBarcode, entry.rowKey, entry.pickedCount, nowIso);
+      });
+    });
+
+    tx();
+  },
+
+  getVerifyOrderProgress({ shop, barcode }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return {};
+
+    const rows = db.prepare(`
+      SELECT itemKey, scannedQty
+      FROM verify_order_progress
+      WHERE shop = ? AND barcode = ?
+    `).all(String(shop), normalizedBarcode);
+
+    const progressByItemKey = {};
+    rows.forEach((row) => {
+      if (!row?.itemKey) return;
+      const qty = Math.max(0, Number(row.scannedQty) || 0);
+      if (qty <= 0) return;
+      progressByItemKey[String(row.itemKey)] = qty;
+    });
+
+    return progressByItemKey;
+  },
+
+  setVerifyOrderProgress({ shop, barcode, progressByItemKey }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return;
+
+    const entries = Object.entries(progressByItemKey || {})
+      .map(([itemKey, scannedQty]) => ({
+        itemKey: String(itemKey || '').trim(),
+        scannedQty: Math.max(0, Math.floor(Number(scannedQty) || 0)),
+      }))
+      .filter((entry) => entry.itemKey && entry.scannedQty > 0);
+
+    const nowIso = new Date().toISOString();
+    const deleteStmt = db.prepare(`
+      DELETE FROM verify_order_progress
+      WHERE shop = ? AND barcode = ?
+    `);
+    const insertStmt = db.prepare(`
+      INSERT OR REPLACE INTO verify_order_progress
+      (shop, barcode, itemKey, scannedQty, updatedAt)
+      VALUES (?, ?, ?, ?, ?)
+    `);
+
+    const tx = db.transaction(() => {
+      deleteStmt.run(String(shop), normalizedBarcode);
+      entries.forEach((entry) => {
+        insertStmt.run(String(shop), normalizedBarcode, entry.itemKey, entry.scannedQty, nowIso);
       });
     });
 
@@ -1115,6 +1324,250 @@ module.exports = {
     );
 
     return this.getPrintPartOrientation({ shop: normalizedShop, sku: normalizedSku });
+  },
+
+  createShippingQuote({
+    shop,
+    barcode,
+    orderNumber = null,
+    shipment = null,
+    rate = null,
+    weightGrams,
+    expiresAt = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedBarcode = normalizeBarcode(barcode);
+    const normalizedShipmentId = String(shipment?.shipmentId || rate?.shipmentId || '').trim();
+    const normalizedRateId = String(rate?.rateId || '').trim();
+    const safeWeightGrams = Math.max(1, Math.floor(Number(weightGrams) || 0));
+    if (!normalizedShop || !normalizedBarcode || !normalizedShipmentId || !normalizedRateId || !safeWeightGrams) {
+      return null;
+    }
+
+    const money = normalizeShippingMoneyFromRate(rate);
+    const quoteId = generateShippingQuoteId();
+    const nowIso = new Date().toISOString();
+    const expiresIso = expiresAt || new Date(Date.now() + 10 * 60 * 1000).toISOString();
+
+    db.prepare(`
+      INSERT INTO shipping_label_quotes (
+        quoteId, shop, barcode, orderNumber, shipmentId, rateId, weightGrams,
+        serviceCode, serviceName, carrierCode, carrierName, priceAmount, priceCurrency,
+        rateJson, shipmentJson, createdAt, expiresAt, purchasedLabelId
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
+    `).run(
+      quoteId,
+      normalizedShop,
+      normalizedBarcode,
+      orderNumber ? String(orderNumber).trim() : null,
+      normalizedShipmentId,
+      normalizedRateId,
+      safeWeightGrams,
+      String(rate?.serviceCode || '').trim() || null,
+      String(rate?.serviceName || '').trim() || null,
+      String(rate?.carrierCode || '').trim() || null,
+      String(rate?.carrierName || '').trim() || null,
+      Number(money.amount || 0),
+      money.currency || null,
+      JSON.stringify(rate || {}),
+      JSON.stringify(shipment || {}),
+      nowIso,
+      expiresIso
+    );
+
+    return this.getShippingQuote({ shop: normalizedShop, quoteId });
+  },
+
+  getShippingQuote({ shop, quoteId } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedQuoteId = String(quoteId || '').trim();
+    if (!normalizedShop || !normalizedQuoteId) return null;
+
+    const row = db.prepare(`
+      SELECT *
+      FROM shipping_label_quotes
+      WHERE shop = ?
+        AND quoteId = ?
+      LIMIT 1
+    `).get(normalizedShop, normalizedQuoteId);
+
+    return normalizeShippingQuoteRecord(row);
+  },
+
+  markShippingQuotePurchased({ shop, quoteId, labelId } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedQuoteId = String(quoteId || '').trim();
+    const normalizedLabelId = String(labelId || '').trim();
+    if (!normalizedShop || !normalizedQuoteId || !normalizedLabelId) return false;
+
+    const result = db.prepare(`
+      UPDATE shipping_label_quotes
+      SET purchasedLabelId = ?
+      WHERE shop = ?
+        AND quoteId = ?
+    `).run(normalizedLabelId, normalizedShop, normalizedQuoteId);
+
+    return Number(result?.changes || 0) > 0;
+  },
+
+  upsertShippingLabel({
+    shop,
+    barcode,
+    orderNumber = null,
+    quoteId = null,
+    label = null,
+    rate = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedBarcode = normalizeBarcode(barcode);
+    const normalizedLabelId = String(label?.labelId || '').trim();
+    const normalizedShipmentId = String(label?.shipmentId || rate?.shipmentId || '').trim();
+    if (!normalizedShop || !normalizedBarcode || !normalizedLabelId || !normalizedShipmentId) {
+      return null;
+    }
+
+    const money = normalizeShippingMoneyFromRate(label?.shipmentCost ? { totalAmount: label.shipmentCost } : rate);
+    const nowIso = new Date().toISOString();
+    db.prepare(`
+      INSERT INTO shipping_labels (
+        shop, labelId, barcode, orderNumber, shipmentId, rateId, quoteId,
+        trackingNumber, labelUrl, status, priceAmount, priceCurrency,
+        printNodeJobId, printStatus, printError, labelJson, createdAt, updatedAt, printedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, NULL, ?, ?, ?, NULL)
+      ON CONFLICT(shop, labelId) DO UPDATE SET
+        barcode = excluded.barcode,
+        orderNumber = COALESCE(excluded.orderNumber, shipping_labels.orderNumber),
+        shipmentId = excluded.shipmentId,
+        rateId = COALESCE(excluded.rateId, shipping_labels.rateId),
+        quoteId = COALESCE(excluded.quoteId, shipping_labels.quoteId),
+        trackingNumber = COALESCE(excluded.trackingNumber, shipping_labels.trackingNumber),
+        labelUrl = COALESCE(excluded.labelUrl, shipping_labels.labelUrl),
+        status = COALESCE(excluded.status, shipping_labels.status),
+        priceAmount = CASE WHEN excluded.priceAmount > 0 THEN excluded.priceAmount ELSE shipping_labels.priceAmount END,
+        priceCurrency = COALESCE(excluded.priceCurrency, shipping_labels.priceCurrency),
+        labelJson = excluded.labelJson,
+        updatedAt = excluded.updatedAt
+    `).run(
+      normalizedShop,
+      normalizedLabelId,
+      normalizedBarcode,
+      orderNumber ? String(orderNumber).trim() : null,
+      normalizedShipmentId,
+      String(label?.rateId || rate?.rateId || '').trim() || null,
+      quoteId ? String(quoteId).trim() : null,
+      String(label?.trackingNumber || '').trim() || null,
+      String(label?.labelUrl || '').trim() || null,
+      String(label?.status || '').trim() || null,
+      Number(money.amount || 0),
+      money.currency || null,
+      JSON.stringify(label || {}),
+      nowIso,
+      nowIso
+    );
+
+    return this.getShippingLabel({ shop: normalizedShop, labelId: normalizedLabelId });
+  },
+
+  getShippingLabel({ shop, labelId } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedLabelId = String(labelId || '').trim();
+    if (!normalizedShop || !normalizedLabelId) return null;
+
+    const row = db.prepare(`
+      SELECT *
+      FROM shipping_labels
+      WHERE shop = ?
+        AND labelId = ?
+      LIMIT 1
+    `).get(normalizedShop, normalizedLabelId);
+
+    return normalizeShippingLabelRecord(row);
+  },
+
+  getShippingLabelsForShipment({ shop, shipmentId } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedShipmentId = String(shipmentId || '').trim();
+    if (!normalizedShop || !normalizedShipmentId) return [];
+
+    return db.prepare(`
+      SELECT *
+      FROM shipping_labels
+      WHERE shop = ?
+        AND shipmentId = ?
+      ORDER BY createdAt DESC
+    `).all(normalizedShop, normalizedShipmentId)
+      .map(normalizeShippingLabelRecord)
+      .filter(Boolean);
+  },
+
+  updateShippingLabelPrintResult({
+    shop,
+    labelId,
+    printNodeJobId = null,
+    printStatus = null,
+    printError = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedLabelId = String(labelId || '').trim();
+    if (!normalizedShop || !normalizedLabelId) return null;
+
+    const normalizedPrintStatus = String(printStatus || '').trim() || null;
+    const normalizedPrintError = String(printError || '').trim() || null;
+    const nowIso = new Date().toISOString();
+    const printedAt = normalizedPrintStatus === 'submitted' || normalizedPrintStatus === 'already_submitted'
+      ? nowIso
+      : null;
+
+    db.prepare(`
+      UPDATE shipping_labels
+      SET printNodeJobId = ?,
+          printStatus = ?,
+          printError = ?,
+          printedAt = COALESCE(?, printedAt),
+          updatedAt = ?
+      WHERE shop = ?
+        AND labelId = ?
+    `).run(
+      printNodeJobId ? String(printNodeJobId).trim() : null,
+      normalizedPrintStatus,
+      normalizedPrintError,
+      printedAt,
+      nowIso,
+      normalizedShop,
+      normalizedLabelId
+    );
+
+    return this.getShippingLabel({ shop: normalizedShop, labelId: normalizedLabelId });
+  },
+
+  updateShippingLabelStatus({
+    shop,
+    labelId,
+    status,
+    label = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedLabelId = String(labelId || '').trim();
+    const normalizedStatus = String(status || '').trim() || null;
+    if (!normalizedShop || !normalizedLabelId || !normalizedStatus) return null;
+
+    const nowIso = new Date().toISOString();
+    db.prepare(`
+      UPDATE shipping_labels
+      SET status = ?,
+          labelJson = COALESCE(?, labelJson),
+          updatedAt = ?
+      WHERE shop = ?
+        AND labelId = ?
+    `).run(
+      normalizedStatus,
+      label ? JSON.stringify(label) : null,
+      nowIso,
+      normalizedShop,
+      normalizedLabelId
+    );
+
+    return this.getShippingLabel({ shop: normalizedShop, labelId: normalizedLabelId });
   },
 
   getOpenAwaitingPartsItemsForSkus({ shop, skus = [] } = {}) {
