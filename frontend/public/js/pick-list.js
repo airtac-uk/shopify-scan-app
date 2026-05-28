@@ -2936,9 +2936,11 @@ function renderShippingRateControls(container) {
   label.className = 'pick-shipping-weight-label';
   label.textContent = 'Package weight';
   const input = document.createElement('input');
-  input.type = 'text';
+  input.type = 'tel';
   input.inputMode = 'numeric';
   input.pattern = '[0-9]*';
+  input.autocomplete = 'off';
+  input.enterKeyHint = 'done';
   input.value = shippingPanelState.weightGrams || '';
   input.placeholder = '0';
   label.appendChild(input);
@@ -2947,27 +2949,6 @@ function renderShippingRateControls(container) {
   unit.textContent = 'grams';
   label.appendChild(unit);
   entry.appendChild(label);
-
-  const keypad = document.createElement('div');
-  keypad.className = 'pick-shipping-keypad';
-  keypad.hidden = true;
-
-  const showWeightKeypad = () => {
-    keypad.hidden = false;
-  };
-  const hideWeightKeypad = () => {
-    keypad.hidden = true;
-    if (Math.floor(Number(shippingPanelState.weightGrams || 0)) > 0) {
-      queueVerifyShippingRateRefresh({ force: true, delay: 0 });
-    }
-  };
-  const focusWeightInput = () => {
-    try {
-      input.focus({ preventScroll: true });
-    } catch (err) {
-      input.focus();
-    }
-  };
 
   const setWeightValue = (value) => {
     const previousWeight = String(shippingPanelState.weightGrams || '');
@@ -2991,41 +2972,13 @@ function renderShippingRateControls(container) {
     setWeightValue(input.value);
   });
   input.addEventListener('focus', () => {
-    showWeightKeypad();
     input.select();
   });
   input.addEventListener('blur', () => {
-    window.setTimeout(() => {
-      if (document.activeElement !== input && !keypad.contains(document.activeElement)) {
-        hideWeightKeypad();
-      }
-    }, 0);
+    if (Math.floor(Number(shippingPanelState.weightGrams || 0)) > 0) {
+      queueVerifyShippingRateRefresh({ force: true, delay: 0 });
+    }
   });
-
-  ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'Clear', '0', 'Del'].forEach((key) => {
-    const keyButton = document.createElement('button');
-    keyButton.type = 'button';
-    keyButton.className = `pick-shipping-keypad__key${key === 'Clear' || key === 'Del' ? ' pick-shipping-keypad__key--utility' : ''}`;
-    keyButton.textContent = key;
-    keyButton.addEventListener('pointerdown', (event) => {
-      event.preventDefault();
-      focusWeightInput();
-      showWeightKeypad();
-    });
-    keyButton.addEventListener('click', () => {
-      if (key === 'Clear') {
-        setWeightValue('');
-        return;
-      }
-      if (key === 'Del') {
-        setWeightValue(String(shippingPanelState.weightGrams || '').slice(0, -1));
-        return;
-      }
-      setWeightValue(`${shippingPanelState.weightGrams || ''}${key}`);
-    });
-    keypad.appendChild(keyButton);
-  });
-  entry.appendChild(keypad);
 
   if (shippingPanelState.status !== 'rates' || shippingPanelState.actionLoading === 'rates') {
     rateCheckButton = document.createElement('button');
@@ -3120,14 +3073,13 @@ function renderPurchasedShippingLabel(container) {
   const label = shippingPanelState.label;
   if (!label?.labelId) return;
   const voided = isShippingLabelVoided(label);
+  if (voided) return;
 
   const panel = document.createElement('div');
-  panel.className = `pick-shipping-label${label.printStatus === 'error' ? ' has-print-error' : ''}${voided ? ' is-voided' : ''}`;
+  panel.className = `pick-shipping-label${label.printStatus === 'error' ? ' has-print-error' : ''}`;
 
   const title = document.createElement('strong');
-  title.textContent = voided
-    ? 'Label voided'
-    : (shippingPanelState.reusedExistingLabel ? 'Existing label found' : 'Label purchased');
+  title.textContent = shippingPanelState.reusedExistingLabel ? 'Existing label found' : 'Label purchased';
   panel.appendChild(title);
 
   const tracking = document.createElement('p');
@@ -3137,9 +3089,7 @@ function renderPurchasedShippingLabel(container) {
   panel.appendChild(tracking);
 
   const print = document.createElement('p');
-  if (voided) {
-    print.textContent = 'This label was voided. Check rates and buy a replacement label if needed.';
-  } else if (label.printStatus === 'submitted') {
+  if (label.printStatus === 'submitted') {
     print.textContent = label.printNodeJobId
       ? `PrintNode job: ${label.printNodeJobId}`
       : 'Sent to PrintNode.';
@@ -3156,7 +3106,7 @@ function renderPurchasedShippingLabel(container) {
   actions.className = 'pick-shipping-label-actions';
 
   const downloadUrl = getShippingLabelDownloadUrl(label);
-  if (downloadUrl && !voided) {
+  if (downloadUrl) {
     const download = document.createElement('a');
     download.href = downloadUrl;
     download.textContent = 'Download PDF';
@@ -3165,22 +3115,20 @@ function renderPurchasedShippingLabel(container) {
     actions.appendChild(download);
   }
 
-  if (!voided) {
-    const printButton = document.createElement('button');
-    printButton.type = 'button';
-    printButton.textContent = label.printStatus === 'error' ? 'Retry Print' : 'Print Again';
-    printButton.disabled = loading || Boolean(shippingPanelState.actionLoading);
-    printButton.addEventListener('click', retryVerifyShippingLabelPrint);
-    actions.appendChild(printButton);
+  const printButton = document.createElement('button');
+  printButton.type = 'button';
+  printButton.textContent = label.printStatus === 'error' ? 'Retry Print' : 'Print Again';
+  printButton.disabled = loading || Boolean(shippingPanelState.actionLoading);
+  printButton.addEventListener('click', retryVerifyShippingLabelPrint);
+  actions.appendChild(printButton);
 
-    const voidButton = document.createElement('button');
-    voidButton.type = 'button';
-    voidButton.className = 'pick-shipping-label-void-btn';
-    voidButton.textContent = shippingPanelState.actionLoading === 'void' ? 'Voiding...' : 'Void Label';
-    voidButton.disabled = loading || Boolean(shippingPanelState.actionLoading);
-    voidButton.addEventListener('click', voidVerifyShippingLabel);
-    actions.appendChild(voidButton);
-  }
+  const voidButton = document.createElement('button');
+  voidButton.type = 'button';
+  voidButton.className = 'pick-shipping-label-void-btn';
+  voidButton.textContent = shippingPanelState.actionLoading === 'void' ? 'Voiding...' : 'Void Label';
+  voidButton.disabled = loading || Boolean(shippingPanelState.actionLoading);
+  voidButton.addEventListener('click', voidVerifyShippingLabel);
+  actions.appendChild(voidButton);
 
   if (actions.childElementCount) {
     panel.appendChild(actions);
@@ -3199,11 +3147,7 @@ function renderVerifyShippingPanel(card, { includeHeader = true } = {}) {
     const title = document.createElement('h3');
     title.textContent = getVerifyShippingModalTitle();
 
-    const subtitle = document.createElement('p');
-    subtitle.textContent = 'ShipStation V2 + PrintNode';
-
     header.appendChild(title);
-    header.appendChild(subtitle);
     card.appendChild(header);
   }
 

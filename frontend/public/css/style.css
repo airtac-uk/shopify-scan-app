@@ -920,32 +920,6 @@ button:hover { background: #0056b3; }
   text-transform: uppercase;
 }
 
-.pick-shipping-keypad {
-  display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 8px;
-}
-
-.pick-shipping-keypad[hidden] {
-  display: none;
-}
-
-.pick-shipping-keypad__key {
-  min-height: 64px;
-  border: 1px solid #354961;
-  border-radius: 8px;
-  background: #1f2f43;
-  color: #f2f7fb;
-  font-size: 28px;
-  font-weight: 900;
-}
-
-.pick-shipping-keypad__key--utility {
-  background: #273547;
-  color: #cfe0ef;
-  font-size: 18px;
-}
-
 .pick-shipping-rate-check,
 .pick-shipping-buy-btn,
 .pick-shipping-secondary-btn,
@@ -5237,17 +5211,6 @@ html.theme-light .pick-shipping-dimension-unit {
 
 html.theme-light .pick-shipping-weight-unit {
   color: #60758b;
-}
-
-html.theme-light .pick-shipping-keypad__key {
-  background: #e8f1fb;
-  border-color: #b7cadf;
-  color: #1b2f43;
-}
-
-html.theme-light .pick-shipping-keypad__key--utility {
-  background: #dbe8f5;
-  color: #2b425a;
 }
 
 html.theme-light .pick-shipping-no-rate {
