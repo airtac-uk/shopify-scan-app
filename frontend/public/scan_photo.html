@@ -7,13 +7,15 @@
   <script src="/js/theme-secret.js" defer></script>
   <script src="https://unpkg.com/html5-qrcode"></script>
 </head>
-<body data-enable-hid-scan="true" data-enable-camera-scan="false">
+<body data-enable-hid-scan="false" data-enable-camera-scan="true">
     <div style="text-align: center; margin: 12px 0;">
-      <a href="/scan_photo.html" style="font-size: 28px; color: #4fc3f7;">Photo Fallback</a>
+      <a href="/scan.html" style="font-size: 28px; color: #4fc3f7;">USB Scanner Mode</a>
       <span style="color:#8ab4c9; font-size: 28px; margin: 0 10px;">|</span>
       <a href="/pick_list.html" style="font-size: 28px; color: #7cc8ff;">Pick List Mode</a>
       <span style="color:#8ab4c9; font-size: 28px; margin: 0 10px;">|</span>
       <a href="/putting_away.html" style="font-size: 28px; color: #9fd1ff;">Putting Away</a>
+      <span style="color:#8ab4c9; font-size: 28px; margin: 0 10px;">|</span>
+      <a href="/awaiting_parts.html" style="font-size: 28px; color: #9fd1ff;">Awaiting Parts Queue</a>
       <span style="color:#8ab4c9; font-size: 28px; margin: 0 10px;">|</span>
       <a href="/print_queue.html" style="font-size: 28px; color: #9fd1ff;">Print Queue</a>
     </div>
@@ -27,10 +29,10 @@
       <option value="packaged">Packaged</option>
       <option value="on_hold">On Hold</option>
     </select>
-   <p style="text-align:center; font-size: 28px; margin-top: 20px;">
-    USB scanner ready. Scan a QR/barcode with your HID reader.
-   </p>
-
+     <div id="cameraScanner" style="margin-top:20px; margin-bottom: 20px; ">
+      <div id="reader" style="width:100%;"></div>
+    </div>
+   
     <div style="width: 100%; display: flex; align-items: center;  justify-content: center;">
     <span id="spinner" class="loader" style="display: none;"></span>
     </div>

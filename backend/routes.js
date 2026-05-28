@@ -53,7 +53,7 @@ const {
   voidLabelById,
   downloadLabelBuffer,
   getLabelById,
-  updateShipmentWeight,
+  updateShipmentPackages,
 } = require('./shipstationService');
 const {
   getBagLabelPrinterCapabilities,
@@ -662,6 +662,9 @@ function buildShippingOrderIdentifiers({ order, barcode }) {
 
 function summarizeShippingLabel(label) {
   if (!label) return null;
+  const packages = Array.isArray(label.packages)
+    ? label.packages
+    : (Array.isArray(label.label?.packages) ? label.label.packages : []);
   return {
     labelId: String(label.labelId || '').trim(),
     shipmentId: String(label.shipmentId || '').trim(),
@@ -674,6 +677,13 @@ function summarizeShippingLabel(label) {
     printNodeJobId: String(label.printNodeJobId || '').trim(),
     printStatus: String(label.printStatus || '').trim(),
     printError: String(label.printError || '').trim(),
+    packages: packages.map((pkg, index) => ({
+      sequence: Number(pkg.sequence || index + 1),
+      trackingNumber: String(pkg.trackingNumber || pkg.tracking_number || '').trim(),
+      weight: pkg.weight || null,
+      dimensions: pkg.dimensions || null,
+    })),
+    packageCount: packages.length || 1,
     createdAt: label.createdAt || null,
     updatedAt: label.updatedAt || null,
     printedAt: label.printedAt || null,
@@ -739,6 +749,38 @@ function normalizeShippingPackageDimensionsInput(dimensions) {
     height,
     unit: String(dimensions.unit || 'centimeter').trim() || 'centimeter',
   };
+}
+
+function normalizeShippingPackagesInput(packages, fallbackPackage = {}) {
+  const rawPackages = Array.isArray(packages) && packages.length > 0
+    ? packages
+    : [{
+        weightGrams: fallbackPackage.weightGrams,
+        packageDimensions: fallbackPackage.packageDimensions,
+      }];
+
+  return rawPackages
+    .map((pkg) => {
+      const weightGrams = Math.floor(Number(pkg?.weightGrams) || 0);
+      const dimensions = normalizeShippingPackageDimensionsInput(pkg?.packageDimensions || pkg?.dimensions);
+      const hasInsuredValue = Object.prototype.hasOwnProperty.call(pkg || {}, 'insuredValueAmount')
+        || Object.prototype.hasOwnProperty.call(pkg || {}, 'insuranceValueAmount');
+      const insuredValueAmount = Number(pkg?.insuredValueAmount ?? pkg?.insuranceValueAmount ?? 0);
+      const insuredValueCurrency = String(pkg?.insuredValueCurrency || pkg?.insuranceValueCurrency || 'GBP').trim().toUpperCase();
+      if (!Number.isInteger(weightGrams) || weightGrams <= 0 || !dimensions) return null;
+      const normalizedPackage = {
+        weightGrams,
+        dimensions,
+      };
+      if (hasInsuredValue && Number.isFinite(insuredValueAmount) && insuredValueAmount > 0) {
+        normalizedPackage.insuredValueAmount = Number.isFinite(insuredValueAmount) && insuredValueAmount > 0
+          ? Number(insuredValueAmount.toFixed(2))
+          : 0;
+        normalizedPackage.insuredValueCurrency = insuredValueCurrency || 'GBP';
+      }
+      return normalizedPackage;
+    })
+    .filter(Boolean);
 }
 
 async function upsertRemoteShippingLabels({ shop, barcode, orderNumber, labels = [], rate = null }) {
@@ -868,6 +910,19 @@ async function tryPrintStoredShippingLabel({ shop, label }) {
   }
 }
 
+function normalizeShopifyLineItemMoney(node = {}) {
+  const money = node.discountedTotalSet?.shopMoney
+    || node.discountedTotalSet?.presentmentMoney
+    || node.originalTotalSet?.shopMoney
+    || node.originalTotalSet?.presentmentMoney
+    || null;
+  const amount = Number(money?.amount || 0);
+  return {
+    amount: Number.isFinite(amount) && amount > 0 ? amount : 0,
+    currency: String(money?.currencyCode || money?.currency || '').trim().toUpperCase(),
+  };
+}
+
 function buildCurrentOrderLineItems(edges = []) {
   return (edges || [])
     .map((edge, index) => {
@@ -882,6 +937,7 @@ function buildCurrentOrderLineItems(edges = []) {
         return null;
       }
 
+      const lineMoney = normalizeShopifyLineItemMoney(node);
       const bundleGroup = node.lineItemGroup
         ? {
             id: String(node.lineItemGroup.id || '').trim(),
@@ -898,6 +954,11 @@ function buildCurrentOrderLineItems(edges = []) {
         variantTitle: node.variantTitle || '',
         upc: node.variant?.barcode || '',
         bundleGroup,
+        priceAmount: lineMoney.amount,
+        priceCurrency: lineMoney.currency,
+        unitPriceAmount: quantity > 0 && lineMoney.amount > 0
+          ? Number((lineMoney.amount / quantity).toFixed(4))
+          : 0,
       };
     })
     .filter(Boolean);
@@ -1289,6 +1350,18 @@ async function fetchOrderForTrackerById({ client, orderId }) {
               sku
               quantity
               currentQuantity
+              discountedTotalSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
+              originalTotalSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
               variantTitle
               variant {
                 barcode
@@ -1869,6 +1942,18 @@ function getPickListOrderQuery({ includeBundleGroup }) {
                     sku
                     quantity
                     currentQuantity
+                    discountedTotalSet {
+                      shopMoney {
+                        amount
+                        currencyCode
+                      }
+                    }
+                    originalTotalSet {
+                      shopMoney {
+                        amount
+                        currencyCode
+                      }
+                    }
                     variantTitle
                     variant {
                       barcode
@@ -1992,6 +2077,18 @@ router.post('/api/tag-order', async (req, res) => {
                     sku
                     quantity
                     currentQuantity
+                    discountedTotalSet {
+                      shopMoney {
+                        amount
+                        currencyCode
+                      }
+                    }
+                    originalTotalSet {
+                      shopMoney {
+                        amount
+                        currencyCode
+                      }
+                    }
                     variantTitle
                     variant {
                       id
@@ -3766,22 +3863,23 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
     const shipmentId = String(req.body?.shipmentId || '').trim();
     const weightGrams = Math.floor(Number(req.body?.weightGrams) || 0);
     const packageDimensions = normalizeShippingPackageDimensionsInput(req.body?.packageDimensions);
+    const shippingPackages = normalizeShippingPackagesInput(req.body?.packages, {
+      weightGrams,
+      packageDimensions,
+    });
     if (!normalizedBarcode || !shipmentId) {
       return res.status(400).json({ success: false, error: 'Missing barcode or shipment id' });
     }
-    if (!Number.isInteger(weightGrams) || weightGrams <= 0) {
-      return res.status(400).json({ success: false, error: 'Enter a valid package weight in grams.' });
-    }
-    if (!packageDimensions) {
-      return res.status(400).json({ success: false, error: 'Select a package size, or enter valid custom package dimensions.' });
+    if (!shippingPackages.length) {
+      return res.status(400).json({ success: false, error: 'Enter valid package weights and package sizes.' });
     }
 
     console.log('[ShipStation rate check] Starting rate check', {
       shop: auth.shop,
       barcode: normalizedBarcode,
       shipmentId,
-      weightGrams,
-      packageDimensions,
+      packageCount: shippingPackages.length,
+      packages: shippingPackages,
     });
 
     const client = shopifyClient(auth.session);
@@ -3805,11 +3903,11 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       orderNumber: order.name,
       financialStatus: payment.financialStatus,
       shipmentId,
-      weightGrams,
-      packageDimensions,
+      packageCount: shippingPackages.length,
+      packages: shippingPackages,
     });
 
-    const updatedShipment = await updateShipmentWeight({ shipmentId, weightGrams, packageDimensions });
+    const updatedShipment = await updateShipmentPackages({ shipmentId, packages: shippingPackages });
     const rates = await getShipmentRates(shipmentId, {
       carrierId: updatedShipment?.carrierId || '',
       selectedServiceCode: updatedShipment?.serviceCode || '',
@@ -3821,6 +3919,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       orderNumber: order.name,
       shipmentId,
       updatedShipmentId: updatedShipment?.shipmentId || '',
+      packageCount: updatedShipment?.packages?.length || shippingPackages.length,
       rateCount: rates.length,
       rates: rates.map((rate) => summarizeShippingRate(rate)),
     });
@@ -3853,7 +3952,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       orderNumber: order.name,
       shipment: updatedShipment,
       rate,
-      weightGrams,
+      weightGrams: shippingPackages.reduce((sum, pkg) => sum + Math.max(1, Number(pkg.weightGrams) || 1), 0),
       expiresAt,
     })).filter(Boolean);
 
@@ -3875,6 +3974,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       shipmentId: req.body?.shipmentId,
       weightGrams: req.body?.weightGrams,
       packageDimensions: req.body?.packageDimensions,
+      packages: req.body?.packages,
     });
     return res.status(500).json({
       success: false,

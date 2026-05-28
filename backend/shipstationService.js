@@ -172,6 +172,32 @@ function normalizePackageDimensionsForWrite(dimensions) {
   };
 }
 
+function normalizePackageInsuredValueForWrite(pkg = {}) {
+  const hasExplicitAmount = Object.prototype.hasOwnProperty.call(pkg, 'insuredValueAmount')
+    || Object.prototype.hasOwnProperty.call(pkg, 'insuranceValueAmount');
+  const sourceValue = pkg.insuredValue || pkg.insured_value || null;
+  const hasExplicitObject = Boolean(sourceValue && typeof sourceValue === 'object');
+  if (!hasExplicitAmount && !hasExplicitObject) return undefined;
+
+  const rawAmount = hasExplicitAmount
+    ? (pkg.insuredValueAmount ?? pkg.insuranceValueAmount)
+    : sourceValue.amount;
+  const amount = Number(rawAmount);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+
+  const currency = normalizeId(
+    pkg.insuredValueCurrency
+    || pkg.insuranceValueCurrency
+    || sourceValue?.currency
+    || 'GBP'
+  ).toUpperCase() || 'GBP';
+
+  return {
+    amount: Number(amount.toFixed(2)),
+    currency,
+  };
+}
+
 function summarizeRateForLog(rate) {
   if (!rate) return null;
   return {
@@ -318,9 +344,21 @@ function pickExistingShipmentField(shipment, key) {
   return shipment[key] === undefined ? undefined : shipment[key];
 }
 
-function buildShipmentWeightUpdatePayload(existingShipment, weightGrams, packageDimensions = null) {
+function normalizePackageUpdateEntries(packages = []) {
+  return (Array.isArray(packages) ? packages : [])
+    .map((pkg) => {
+      const weightGrams = Math.max(1, Math.floor(Number(pkg?.weightGrams) || 0));
+      const dimensions = normalizePackageDimensionsForWrite(pkg?.dimensions || pkg?.packageDimensions);
+      const insuredValue = normalizePackageInsuredValueForWrite(pkg);
+      if (!weightGrams || !dimensions) return null;
+      return { weightGrams, dimensions, insuredValue };
+    })
+    .filter(Boolean);
+}
+
+function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
   const raw = existingShipment?.raw || existingShipment || {};
-  const normalizedPackageDimensions = normalizePackageDimensionsForWrite(packageDimensions);
+  const normalizedPackages = normalizePackageUpdateEntries(packages);
   const allowedFields = [
     'carrier_id',
     'service_code',
@@ -348,7 +386,10 @@ function buildShipmentWeightUpdatePayload(existingShipment, weightGrams, package
   const sourcePackages = Array.isArray(raw.packages) && raw.packages.length > 0
     ? raw.packages
     : [{}];
-  payload.packages = sourcePackages.map((pkg, index) => {
+  const packageCount = Math.max(1, normalizedPackages.length);
+  payload.packages = Array.from({ length: packageCount }, (_, index) => {
+    const pkg = sourcePackages[index] || sourcePackages[0] || {};
+    const packageUpdate = normalizedPackages[index] || normalizedPackages[0];
     const nextPackage = {};
     [
       'package_code',
@@ -362,32 +403,69 @@ function buildShipmentWeightUpdatePayload(existingShipment, weightGrams, package
         nextPackage[field] = pkg[field];
       }
     });
-    nextPackage.weight = index === 0
-      ? { value: weightGrams, unit: 'gram' }
-      : (pkg.weight || { value: 1, unit: 'gram' });
-    if (index === 0 && normalizedPackageDimensions) {
-      nextPackage.dimensions = normalizedPackageDimensions;
+    if (packageCount > 1) {
+      nextPackage.package_code = 'package';
+    }
+    nextPackage.weight = { value: packageUpdate.weightGrams, unit: 'gram' };
+    nextPackage.dimensions = packageUpdate.dimensions;
+    if (packageUpdate.insuredValue !== undefined) {
+      if (packageUpdate.insuredValue) {
+        nextPackage.insured_value = packageUpdate.insuredValue;
+      } else {
+        delete nextPackage.insured_value;
+      }
+    }
+    if (!nextPackage.external_package_id && packageCount > 1) {
+      nextPackage.external_package_id = `package-${index + 1}`;
     }
     return nextPackage;
   });
 
+  const hasExplicitInsuranceValues = normalizedPackages.some((pkg) => pkg.insuredValue !== undefined);
+  const hasPositiveInsuranceValue = normalizedPackages.some((pkg) => Boolean(pkg.insuredValue));
+  if (hasExplicitInsuranceValues) {
+    if (hasPositiveInsuranceValue) {
+      const currentProvider = normalizeId(raw.insurance_provider || raw.insuranceProvider).toLowerCase();
+      payload.insurance_provider = currentProvider && currentProvider !== 'none'
+        ? (raw.insurance_provider || raw.insuranceProvider)
+        : 'carrier';
+      const fallbackCurrency = normalizeId(
+        normalizedPackages.find((pkg) => pkg.insuredValue)?.insuredValue?.currency || 'GBP'
+      ).toUpperCase() || 'GBP';
+      payload.packages = payload.packages.map((pkg, index) => ({
+        ...pkg,
+        insured_value: normalizedPackages[index]?.insuredValue || {
+          amount: 0,
+          currency: fallbackCurrency,
+        },
+      }));
+    } else {
+      payload.insurance_provider = 'none';
+    }
+  }
+
   return payload;
 }
 
-async function updateShipmentWeight({ shipmentId, weightGrams, packageDimensions = null }) {
+function buildShipmentWeightUpdatePayload(existingShipment, weightGrams, packageDimensions = null) {
+  return buildShipmentPackagesUpdatePayload(existingShipment, [{
+    weightGrams,
+    dimensions: packageDimensions,
+  }]);
+}
+
+async function updateShipmentPackages({ shipmentId, packages = [] }) {
   const safeShipmentId = normalizeId(shipmentId);
-  const safeWeightGrams = Math.max(1, Math.floor(Number(weightGrams) || 0));
-  const normalizedPackageDimensions = normalizePackageDimensionsForWrite(packageDimensions);
+  const normalizedPackages = normalizePackageUpdateEntries(packages);
   if (!safeShipmentId) throw new Error('Missing ShipStation shipment id.');
-  if (!safeWeightGrams) throw new Error('Enter a valid package weight in grams.');
-  if (packageDimensions && !normalizedPackageDimensions) {
-    throw new Error('Enter valid package dimensions.');
+  if (!normalizedPackages.length) {
+    throw new Error('Enter valid package weights and dimensions.');
   }
 
   console.log('[ShipStation rate check] Loading shipment before package update', {
     shipmentId: safeShipmentId,
-    weightGrams: safeWeightGrams,
-    packageDimensions: normalizedPackageDimensions,
+    packageCount: normalizedPackages.length,
+    packages: normalizedPackages,
   });
   const existingShipment = await getShipmentById(safeShipmentId);
   console.log('[ShipStation rate check] Existing shipment summary', {
@@ -401,14 +479,17 @@ async function updateShipmentWeight({ shipmentId, weightGrams, packageDimensions
     packageCount: existingShipment?.packages?.length || 0,
   });
 
-  const payload = buildShipmentWeightUpdatePayload(existingShipment, safeWeightGrams, normalizedPackageDimensions);
-  console.log('[ShipStation rate check] Updating shipment package', {
+  const payload = buildShipmentPackagesUpdatePayload(existingShipment, normalizedPackages);
+  console.log('[ShipStation rate check] Updating shipment packages', {
     shipmentId: safeShipmentId,
-    weightGrams: safeWeightGrams,
-    packageDimensions: normalizedPackageDimensions,
     packageCount: payload.packages?.length || 0,
-    firstPackageCode: payload.packages?.[0]?.package_code || '',
-    firstPackageDimensions: payload.packages?.[0]?.dimensions || null,
+    packages: (payload.packages || []).map((pkg) => ({
+      packageCode: pkg.package_code || '',
+      weight: pkg.weight || null,
+      dimensions: pkg.dimensions || null,
+      insuredValue: pkg.insured_value || null,
+      externalPackageId: pkg.external_package_id || '',
+    })),
     carrierIdPresent: Boolean(payload.carrier_id),
     serviceCode: payload.service_code || '',
     requestedShipmentService: payload.requested_shipment_service || '',
@@ -427,9 +508,30 @@ async function updateShipmentWeight({ shipmentId, weightGrams, packageDimensions
     packageCode: normalizedUpdated?.packageCode || '',
     packageWeights: (normalizedUpdated?.packages || []).map((pkg) => pkg.weight).filter(Boolean),
     packageDimensions: (normalizedUpdated?.packages || []).map((pkg) => pkg.dimensions).filter(Boolean),
+    packageInsuredValues: (normalizedUpdated?.packages || []).map((pkg) => pkg.insuredValue).filter(Boolean),
+    packageCount: normalizedUpdated?.packages?.length || 0,
   });
 
   return normalizedUpdated;
+}
+
+async function updateShipmentWeight({ shipmentId, weightGrams, packageDimensions = null }) {
+  const safeShipmentId = normalizeId(shipmentId);
+  const safeWeightGrams = Math.max(1, Math.floor(Number(weightGrams) || 0));
+  const normalizedPackageDimensions = normalizePackageDimensionsForWrite(packageDimensions);
+  if (!safeShipmentId) throw new Error('Missing ShipStation shipment id.');
+  if (!safeWeightGrams) throw new Error('Enter a valid package weight in grams.');
+  if (packageDimensions && !normalizedPackageDimensions) {
+    throw new Error('Enter valid package dimensions.');
+  }
+
+  return updateShipmentPackages({
+    shipmentId: safeShipmentId,
+    packages: [{
+      weightGrams: safeWeightGrams,
+      dimensions: normalizedPackageDimensions,
+    }],
+  });
 }
 
 function normalizeMoney(value) {
@@ -617,6 +719,18 @@ function normalizeLabel(label) {
     labelLayout: normalizeId(label.label_layout || label.labelLayout),
     labelUrl: getLabelDownloadUrl(label),
     shipmentCost,
+    packages: Array.isArray(label.packages)
+      ? label.packages.map((pkg, index) => ({
+          packageId: normalizeId(pkg.package_id || pkg.packageId || pkg.id),
+          packageCode: normalizeId(pkg.package_code || pkg.packageCode),
+          sequence: Number(pkg.sequence || index + 1),
+          trackingNumber: normalizeId(pkg.tracking_number || pkg.trackingNumber),
+          weight: normalizePackageWeight(pkg.weight),
+          dimensions: normalizePackageDimensions(pkg.dimensions),
+          insuredValue: normalizeMoney(pkg.insured_value || pkg.insuredValue),
+          labelUrl: getLabelDownloadUrl(pkg),
+        }))
+      : [],
     raw: label,
   };
 }
@@ -682,5 +796,6 @@ module.exports = {
   voidLabelById,
   downloadLabelBuffer,
   getLabelById,
+  updateShipmentPackages,
   updateShipmentWeight,
 };
