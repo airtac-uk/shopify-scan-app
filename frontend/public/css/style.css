@@ -1119,6 +1119,75 @@ button:hover { background: #0056b3; }
   background: #7e3a2d;
 }
 
+.pick-bag-labels-modal {
+  width: min(900px, 100%);
+}
+
+.pick-bag-labels-list {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
+}
+
+.pick-bag-label-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 96px auto;
+  gap: 10px;
+  align-items: end;
+  padding: 10px;
+  border: 1px solid #293545;
+  border-radius: 8px;
+  background: #0f141b;
+}
+
+.pick-bag-label-row label {
+  display: grid;
+  gap: 5px;
+  color: #9fb2c8;
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.pick-bag-label-row input {
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  border: 1px solid #304054;
+  border-radius: 8px;
+  background: #111923;
+  color: #e6edf3;
+  padding: 10px 12px;
+  font-size: 16px;
+}
+
+.pick-bag-label-row__remove,
+.pick-bag-labels-add {
+  width: auto;
+  min-height: 42px;
+  margin: 0;
+  border-radius: 8px;
+  padding: 8px 12px;
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.pick-bag-label-row__remove {
+  background: #7e3a2d;
+}
+
+.pick-bag-labels-add {
+  margin-top: 12px;
+  background: #234163;
+}
+
+.pick-bag-labels-empty {
+  margin: 0;
+  padding: 12px;
+  border: 1px dashed #33465d;
+  border-radius: 8px;
+  color: #9fb2c8;
+}
+
 .awaiting-parts-layout {
   max-width: 1280px;
 }
@@ -4642,6 +4711,10 @@ button:hover { background: #0056b3; }
     text-align: left;
   }
 
+  .pick-bag-label-row {
+    grid-template-columns: 1fr;
+  }
+
   .tracker-shell {
     padding: 18px 12px 32px;
   }
@@ -5251,6 +5324,26 @@ html.theme-light .pick-shipping-label-actions a {
   background: #eef5fc;
   border-color: #b9ccdf;
   color: #23415e !important;
+}
+
+html.theme-light .pick-bag-label-row {
+  background: #f6f9fc;
+  border-color: #c7d8ea;
+}
+
+html.theme-light .pick-bag-label-row label,
+html.theme-light .pick-bag-labels-empty {
+  color: #60758b;
+}
+
+html.theme-light .pick-bag-label-row input {
+  background: #ffffff;
+  border-color: #b7cadf;
+  color: #1b2f43;
+}
+
+html.theme-light .pick-bag-labels-empty {
+  border-color: #b7cadf;
 }
 
 html.theme-light .pick-modal-item {

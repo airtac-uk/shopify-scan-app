@@ -64,6 +64,7 @@
             <button type="button" class="pick-list-action-btn" data-order-action="qc_passed" data-picker-visible="false" data-verify-visible="false">QC Passed</button>
             <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="qc_fail" data-picker-visible="false" data-verify-visible="false">QC Fail</button>
             <button type="button" class="pick-list-action-btn" data-order-action="packaged" data-picker-visible="true" data-verify-visible="true">Packaged</button>
+            <button id="bagLabelsOpenBtn" type="button" class="pick-list-action-btn" data-picker-visible="true" data-verify-visible="true">Bag Labels</button>
             <button type="button" class="pick-list-action-btn pick-list-action-btn--hold" data-order-action="on_hold" data-picker-visible="false" data-verify-visible="false">On Hold</button>
           </div>
         </section>
@@ -139,6 +140,19 @@
         <button id="verifyShippingModalCloseBtn" class="pick-shipping-modal__close" type="button" aria-label="Close shipping label popup">Close</button>
       </div>
       <div id="verifyShippingModalBody" class="pick-shipping-modal__body"></div>
+    </div>
+  </div>
+
+  <div id="bagLabelsModal" class="pick-modal" aria-hidden="true">
+    <div class="pick-modal__panel pick-bag-labels-modal" role="dialog" aria-modal="true" aria-labelledby="bagLabelsTitle">
+      <h3 id="bagLabelsTitle">Bag Labels</h3>
+      <div id="bagLabelsList" class="pick-bag-labels-list"></div>
+      <button id="bagLabelsAddBtn" class="pick-bag-labels-add" type="button">Add Label</button>
+      <div class="pick-modal-actions">
+        <button id="bagLabelsCancelBtn" class="pick-modal-btn pick-modal-btn--danger" type="button">Cancel</button>
+        <button id="bagLabelsPreviewBtn" class="pick-modal-btn" type="button">Preview PDF</button>
+        <button id="bagLabelsPrintBtn" class="pick-modal-btn pick-modal-btn--confirm" type="button">Print Labels</button>
+      </div>
     </div>
   </div>
 

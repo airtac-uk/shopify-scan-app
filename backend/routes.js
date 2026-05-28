@@ -56,8 +56,13 @@ const {
   updateShipmentWeight,
 } = require('./shipstationService');
 const {
+  getBagLabelPrinterCapabilities,
+  printBagLabelsPdf,
   printPdfLabel,
 } = require('./printNodeService');
+const {
+  buildBagLabelsPdf,
+} = require('./bagLabelService');
 
 router.use(cookieParser());
 
@@ -4349,6 +4354,135 @@ router.post('/api/pick-list', async (req, res) => {
   } catch (err) {
     console.error('Error in /api/pick-list:', err);
     return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/pick-list/bag-labels/print', async (req, res) => {
+  try {
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const labels = Array.isArray(req.body?.labels) ? req.body.labels : [];
+    const {
+      pdfBuffer,
+      labels: normalizedLabels,
+      labelCount,
+      pageSize,
+      rotatedText,
+    } = buildBagLabelsPdf(labels);
+    const orderNumber = String(req.body?.orderNumber || req.body?.barcode || '').trim();
+    console.info('[Bag labels] built PDF for PrintNode', {
+      orderNumber,
+      labelCount,
+      pageSize,
+      rotatedText,
+      pdfBytes: pdfBuffer.length,
+    });
+    const printResult = await printBagLabelsPdf({
+      orderNumber,
+      pdfBuffer,
+    });
+
+    return res.json({
+      success: true,
+      labelCount,
+      labels: normalizedLabels,
+      printNodeJobId: printResult.printNodeJobId,
+      printStatus: printResult.printStatus,
+      printOptions: printResult.printOptions,
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/bag-labels/print:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Failed to print bag labels' });
+  }
+});
+
+router.post('/api/pick-list/bag-labels/pdf', async (req, res) => {
+  try {
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const labels = Array.isArray(req.body?.labels) ? req.body.labels : [];
+    const {
+      pdfBuffer,
+      labelCount,
+      pageSize,
+      rotatedText,
+    } = buildBagLabelsPdf(labels);
+    const orderNumber = String(req.body?.orderNumber || req.body?.barcode || 'bag-labels')
+      .trim()
+      .replace(/[^\w.-]+/g, '-')
+      .replace(/^-+|-+$/g, '') || 'bag-labels';
+    console.info('[Bag labels] built preview PDF', {
+      orderNumber,
+      labelCount,
+      pageSize,
+      rotatedText,
+      pdfBytes: pdfBuffer.length,
+    });
+
+    res.setHeader('Content-Type', 'application/pdf');
+    res.setHeader('Content-Disposition', `inline; filename="${orderNumber}-bag-labels.pdf"`);
+    res.setHeader('Cache-Control', 'no-store');
+    res.setHeader('X-Bag-Label-Count', String(labelCount));
+    res.setHeader('X-Bag-Label-Width-Mm', String(pageSize.widthMm));
+    res.setHeader('X-Bag-Label-Height-Mm', String(pageSize.heightMm));
+    return res.send(pdfBuffer);
+  } catch (err) {
+    console.error('Error in /api/pick-list/bag-labels/pdf:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Failed to build bag label PDF' });
+  }
+});
+
+router.get('/api/pick-list/bag-labels/printer-capabilities', async (req, res) => {
+  try {
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const printer = await getBagLabelPrinterCapabilities();
+    const configuredMedia = String(process.env.PRINTNODE_BAG_LABEL_MEDIA || '').trim();
+    const configuredPaper = String(process.env.PRINTNODE_BAG_LABEL_PAPER || '').trim();
+    console.info('[PrintNode bag labels] loaded printer capabilities', {
+      printerId: printer.printerId,
+      name: printer.name,
+      configuredMedia,
+      configuredPaper,
+      medias: printer.capabilities.medias,
+      papers: Object.keys(printer.capabilities.papers || {}),
+      bins: printer.capabilities.bins,
+      dpis: printer.capabilities.dpis,
+      nup: printer.capabilities.nup,
+    });
+    return res.json({
+      success: true,
+      printer,
+      configuredMedia,
+      configuredPaper,
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/bag-labels/printer-capabilities:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Failed to load bag label printer capabilities' });
   }
 });
 

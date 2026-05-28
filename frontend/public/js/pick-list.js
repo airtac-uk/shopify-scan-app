@@ -45,6 +45,8 @@ let shippingLookupInFlight = false;
 let shippingRequestToken = 0;
 let verifyShippingPreloadTimeoutId = null;
 let verifyShippingAutoRateTimeoutId = null;
+let bagLabelRows = [];
+let bagLabelActionLoading = '';
 
 const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
@@ -1028,6 +1030,7 @@ function setLoading(isLoading) {
   syncVerifyButtonDisabledState();
   syncAwaitingToggleDisabledState();
   syncShippingPanelDisabledState();
+  syncBagLabelsDialogDisabledState();
 }
 
 function normalizeTypeKey(type) {
@@ -1325,12 +1328,269 @@ function handleOrderActionReminderScan(scannedCode) {
   return true;
 }
 
+function makeBagLabelRow(text = '', quantity = 1) {
+  const id = window.crypto?.randomUUID
+    ? window.crypto.randomUUID()
+    : `bag-label-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  return {
+    id,
+    text: String(text || '').trim(),
+    quantity: Math.max(1, Math.floor(Number(quantity) || 1)),
+  };
+}
+
+function getBagLabelTextForOrderItem(item) {
+  return String(item?.title || item?.sku || '').trim();
+}
+
+function buildSuggestedBagLabels(orderItems = lastOrderItems) {
+  const rows = [];
+  const bundleRows = new Map();
+  const productRows = new Map();
+
+  (orderItems || []).forEach((item) => {
+    const quantity = Math.max(1, Math.floor(Number(item?.quantity) || 1));
+    const bundleGroupId = String(item?.bundleGroup?.id || '').trim();
+
+    if (bundleGroupId) {
+      const bundleText = String(item?.bundleGroup?.title || item?.title || item?.sku || '').trim();
+      if (!bundleText) return;
+      const bundleQuantity = Math.max(1, Math.floor(Number(item?.bundleGroup?.quantity) || quantity));
+      if (!bundleRows.has(bundleGroupId)) {
+        const row = makeBagLabelRow(bundleText, bundleQuantity);
+        bundleRows.set(bundleGroupId, row);
+        rows.push(row);
+      } else {
+        const row = bundleRows.get(bundleGroupId);
+        row.quantity = Math.max(row.quantity, bundleQuantity);
+      }
+      return;
+    }
+
+    const text = getBagLabelTextForOrderItem(item);
+    if (!text) return;
+    const key = text.toUpperCase();
+    if (productRows.has(key)) {
+      productRows.get(key).quantity += quantity;
+      return;
+    }
+    const row = makeBagLabelRow(text, quantity);
+    productRows.set(key, row);
+    rows.push(row);
+  });
+
+  return rows;
+}
+
+function closeBagLabelsDialog() {
+  const modal = document.getElementById('bagLabelsModal');
+  if (modal) modal.classList.remove('is-open');
+}
+
+function syncBagLabelsDialogDisabledState() {
+  const modal = document.getElementById('bagLabelsModal');
+  if (!modal?.classList.contains('is-open')) return;
+
+  const validRows = bagLabelRows.filter((row) => String(row.text || '').trim() && Number(row.quantity) > 0);
+  modal.querySelectorAll('input, button').forEach((control) => {
+    if (control.id === 'bagLabelsCancelBtn') {
+      control.disabled = false;
+      return;
+    }
+    control.disabled = loading;
+  });
+
+  const printButton = document.getElementById('bagLabelsPrintBtn');
+  if (printButton) {
+    printButton.disabled = loading || validRows.length === 0;
+    printButton.textContent = bagLabelActionLoading === 'print' ? 'Printing...' : 'Print Labels';
+  }
+
+  const previewButton = document.getElementById('bagLabelsPreviewBtn');
+  if (previewButton) {
+    previewButton.disabled = loading || validRows.length === 0;
+    previewButton.textContent = bagLabelActionLoading === 'preview' ? 'Preparing...' : 'Preview PDF';
+  }
+}
+
+function getBagLabelsForSubmission() {
+  return bagLabelRows
+    .map((row) => ({
+      text: String(row.text || '').trim(),
+      quantity: Math.max(1, Math.floor(Number(row.quantity) || 1)),
+    }))
+    .filter((row) => row.text && row.quantity > 0);
+}
+
+function renderBagLabelsDialog() {
+  const list = document.getElementById('bagLabelsList');
+  if (!list) return;
+  list.innerHTML = '';
+
+  if (!bagLabelRows.length) {
+    const empty = document.createElement('p');
+    empty.className = 'pick-bag-labels-empty';
+    empty.textContent = 'No labels selected. Add a label before printing.';
+    list.appendChild(empty);
+    syncBagLabelsDialogDisabledState();
+    return;
+  }
+
+  bagLabelRows.forEach((row, index) => {
+    const item = document.createElement('div');
+    item.className = 'pick-bag-label-row';
+
+    const textLabel = document.createElement('label');
+    textLabel.textContent = 'Label text';
+    const textInput = document.createElement('input');
+    textInput.type = 'text';
+    textInput.value = row.text;
+    textInput.addEventListener('input', () => {
+      row.text = textInput.value;
+      syncBagLabelsDialogDisabledState();
+    });
+    textLabel.appendChild(textInput);
+
+    const qtyLabel = document.createElement('label');
+    qtyLabel.textContent = 'Qty';
+    const qtyInput = document.createElement('input');
+    qtyInput.type = 'number';
+    qtyInput.min = '1';
+    qtyInput.max = '200';
+    qtyInput.step = '1';
+    qtyInput.inputMode = 'numeric';
+    qtyInput.value = String(row.quantity || 1);
+    qtyInput.addEventListener('input', () => {
+      row.quantity = Math.max(1, Math.floor(Number(qtyInput.value) || 1));
+      syncBagLabelsDialogDisabledState();
+    });
+    qtyLabel.appendChild(qtyInput);
+
+    const remove = document.createElement('button');
+    remove.type = 'button';
+    remove.className = 'pick-bag-label-row__remove';
+    remove.textContent = 'Remove';
+    remove.addEventListener('click', () => {
+      bagLabelRows.splice(index, 1);
+      renderBagLabelsDialog();
+    });
+
+    item.appendChild(textLabel);
+    item.appendChild(qtyLabel);
+    item.appendChild(remove);
+    list.appendChild(item);
+  });
+
+  syncBagLabelsDialogDisabledState();
+}
+
+function openBagLabelsDialog() {
+  if (!hasRenderedPickList || !lastOrderItems.length) {
+    setStatus('Load an order before printing bag labels.', 'error');
+    return;
+  }
+
+  bagLabelRows = buildSuggestedBagLabels(lastOrderItems);
+  const modal = document.getElementById('bagLabelsModal');
+  if (!modal) return;
+  renderBagLabelsDialog();
+  modal.classList.add('is-open');
+}
+
+function addBagLabelRow() {
+  bagLabelRows.push(makeBagLabelRow('', 1));
+  renderBagLabelsDialog();
+  const inputs = document.querySelectorAll('#bagLabelsList .pick-bag-label-row input[type="text"]');
+  const lastInput = inputs[inputs.length - 1];
+  if (lastInput) lastInput.focus();
+}
+
+async function submitBagLabels() {
+  const labels = getBagLabelsForSubmission();
+
+  if (!labels.length) {
+    setStatus('Add at least one bag label before printing.', 'error');
+    return;
+  }
+
+  bagLabelActionLoading = 'print';
+  setLoading(true);
+  syncBagLabelsDialogDisabledState();
+  try {
+    const data = await fetchShippingJson('/api/pick-list/bag-labels/print', {
+      method: 'POST',
+      body: JSON.stringify({
+        barcode: currentOrderBarcode,
+        orderNumber: currentOrderNumber,
+        labels,
+      }),
+    });
+    closeBagLabelsDialog();
+    const count = Number(data.labelCount) || labels.reduce((sum, row) => sum + row.quantity, 0);
+    setStatus(`Sent ${count} bag label${count === 1 ? '' : 's'} to PrintNode.`, 'success');
+  } catch (err) {
+    setStatus(`Bag label print failed: ${err.message || 'PrintNode error'}`, 'error');
+  } finally {
+    bagLabelActionLoading = '';
+    setLoading(false);
+    syncBagLabelsDialogDisabledState();
+  }
+}
+
+async function previewBagLabelsPdf() {
+  const labels = getBagLabelsForSubmission();
+
+  if (!labels.length) {
+    setStatus('Add at least one bag label before previewing.', 'error');
+    return;
+  }
+
+  const previewWindow = window.open('', '_blank');
+  bagLabelActionLoading = 'preview';
+  setLoading(true);
+  syncBagLabelsDialogDisabledState();
+
+  try {
+    const response = await fetch('/api/pick-list/bag-labels/pdf', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        barcode: currentOrderBarcode,
+        orderNumber: currentOrderNumber,
+        labels,
+      }),
+    });
+
+    if (!response.ok) {
+      const data = await response.json().catch(() => ({}));
+      throw new Error(data.error || 'Failed to build bag label PDF');
+    }
+
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    if (previewWindow) {
+      previewWindow.location.href = url;
+    } else {
+      window.open(url, '_blank');
+    }
+    setStatus('Bag label PDF preview ready.', 'success');
+  } catch (err) {
+    if (previewWindow) previewWindow.close();
+    setStatus(`Bag label preview failed: ${err.message || 'PDF error'}`, 'error');
+  } finally {
+    bagLabelActionLoading = '';
+    setLoading(false);
+    syncBagLabelsDialogDisabledState();
+  }
+}
+
 function isAnyDialogOpen() {
   const awaitingPartsModal = document.getElementById('awaitingPartsModal');
   const printQueueResultModal = document.getElementById('awaitingPrintQueueResultModal');
   const qcFailModal = document.getElementById('qcFailModal');
   const onHoldModal = document.getElementById('onHoldModal');
   const verifyShippingModal = document.getElementById('verifyShippingModal');
+  const bagLabelsModal = document.getElementById('bagLabelsModal');
 
   return Boolean(
     awaitingPartsModal?.classList.contains('is-open') ||
@@ -1338,6 +1598,7 @@ function isAnyDialogOpen() {
     qcFailModal?.classList.contains('is-open') ||
     onHoldModal?.classList.contains('is-open') ||
     verifyShippingModal?.classList.contains('is-open') ||
+    bagLabelsModal?.classList.contains('is-open') ||
     isOrderActionReminderDialogOpen()
   );
 }
@@ -4408,6 +4669,7 @@ function registerModalHandlers() {
   const onHoldModal = document.getElementById('onHoldModal');
   const orderActionReminderModal = document.getElementById('orderActionReminderModal');
   const verifyShippingModal = document.getElementById('verifyShippingModal');
+  const bagLabelsModal = document.getElementById('bagLabelsModal');
 
   const awaitingCancel = document.getElementById('awaitingPartsCancelBtn');
   const awaitingConfirm = document.getElementById('awaitingPartsConfirmBtn');
@@ -4419,6 +4681,10 @@ function registerModalHandlers() {
   const reminderCancel = document.getElementById('orderActionReminderCancelBtn');
   const reminderContinue = document.getElementById('orderActionReminderContinueBtn');
   const verifyShippingClose = document.getElementById('verifyShippingModalCloseBtn');
+  const bagLabelsCancel = document.getElementById('bagLabelsCancelBtn');
+  const bagLabelsPreview = document.getElementById('bagLabelsPreviewBtn');
+  const bagLabelsPrint = document.getElementById('bagLabelsPrintBtn');
+  const bagLabelsAdd = document.getElementById('bagLabelsAddBtn');
 
   if (awaitingCancel) awaitingCancel.addEventListener('click', cancelAwaitingPartsDialog);
   if (awaitingConfirm) awaitingConfirm.addEventListener('click', submitAwaitingParts);
@@ -4428,6 +4694,10 @@ function registerModalHandlers() {
   if (onHoldCancel) onHoldCancel.addEventListener('click', closeOnHoldDialog);
   if (onHoldConfirm) onHoldConfirm.addEventListener('click', submitOnHold);
   if (verifyShippingClose) verifyShippingClose.addEventListener('click', closeVerifyShippingModal);
+  if (bagLabelsCancel) bagLabelsCancel.addEventListener('click', closeBagLabelsDialog);
+  if (bagLabelsPreview) bagLabelsPreview.addEventListener('click', previewBagLabelsPdf);
+  if (bagLabelsPrint) bagLabelsPrint.addEventListener('click', submitBagLabels);
+  if (bagLabelsAdd) bagLabelsAdd.addEventListener('click', addBagLabelRow);
   if (reminderCancel) reminderCancel.addEventListener('click', () => closeOrderActionReminderDialog());
   if (reminderContinue) {
     reminderContinue.addEventListener('click', () => {
@@ -4484,6 +4754,14 @@ function registerModalHandlers() {
       }
     });
   }
+
+  if (bagLabelsModal) {
+    bagLabelsModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeBagLabelsDialog();
+      }
+    });
+  }
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -4498,6 +4776,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const pickerModeToggle = document.getElementById('pickerModeToggle');
   const verifyModeToggle = document.getElementById('verifyModeToggle');
   const wholesaleModeToggle = document.getElementById('wholesaleModeToggle');
+  const bagLabelsOpenBtn = document.getElementById('bagLabelsOpenBtn');
 
   actionButtons = Array.from(document.querySelectorAll('.pick-list-action-btn'));
   setActionButtonsEnabled(false);
@@ -4510,6 +4789,10 @@ document.addEventListener('DOMContentLoaded', () => {
       runOrderAction(tag);
     });
   });
+
+  if (bagLabelsOpenBtn) {
+    bagLabelsOpenBtn.addEventListener('click', openBagLabelsDialog);
+  }
 
   if (button) {
     button.addEventListener('click', () => fetchPickList(input?.value || ''));
