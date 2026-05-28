@@ -20,6 +20,10 @@ let draggedPrintItemId = '';
 let pendingPrintDeleteItemId = '';
 let expandedPrintChildItemIds = new Set();
 let activePutAwayItemId = '';
+let printQueueDiscoEnabled = false;
+let printQueueDiscoPressTimerId = null;
+let printQueueDiscoPressPointerId = null;
+let printQueueDiscoPressStart = null;
 let stlPreviewModelCache = new Map();
 let activeStlPreviewRenderers = [];
 let stlPreviewLibraryPromise = null;
@@ -1240,6 +1244,7 @@ function renderQueueCard(item) {
 function renderBoard() {
   const container = document.getElementById('printQueueBoard');
   if (!container) return;
+  container.classList.toggle('is-disco-mode', printQueueDiscoEnabled);
 
   const grouped = new Map(printQueueStages.map((stage) => [stage.key, []]));
   printQueueItems.forEach((item) => {
@@ -1771,7 +1776,58 @@ async function preparePreformBuild() {
   }
 }
 
+function clearPrintQueueDiscoPressTimer() {
+  if (printQueueDiscoPressTimerId) {
+    window.clearTimeout(printQueueDiscoPressTimerId);
+  }
+  printQueueDiscoPressTimerId = null;
+  printQueueDiscoPressPointerId = null;
+  printQueueDiscoPressStart = null;
+}
+
+function togglePrintQueueDiscoMode(board) {
+  printQueueDiscoEnabled = !printQueueDiscoEnabled;
+  board.classList.toggle('is-disco-mode', printQueueDiscoEnabled);
+}
+
 function bindBoardEvents(board) {
+  board.addEventListener('pointerdown', (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (!target || target.closest('button, a, input, select, textarea')) return;
+
+    const card = target.closest('.print-queue-card');
+    if (!card) return;
+
+    clearPrintQueueDiscoPressTimer();
+    printQueueDiscoPressPointerId = event.pointerId;
+    printQueueDiscoPressStart = {
+      x: event.clientX,
+      y: event.clientY,
+    };
+    printQueueDiscoPressTimerId = window.setTimeout(() => {
+      togglePrintQueueDiscoMode(board);
+      clearPrintQueueDiscoPressTimer();
+    }, 5000);
+  });
+
+  board.addEventListener('pointermove', (event) => {
+    if (!printQueueDiscoPressTimerId || event.pointerId !== printQueueDiscoPressPointerId) return;
+    const start = printQueueDiscoPressStart;
+    if (!start) return;
+    const distance = Math.hypot(event.clientX - start.x, event.clientY - start.y);
+    if (distance > 12) {
+      clearPrintQueueDiscoPressTimer();
+    }
+  });
+
+  ['pointerup', 'pointercancel', 'pointerleave'].forEach((eventName) => {
+    board.addEventListener(eventName, (event) => {
+      if (event.pointerId === printQueueDiscoPressPointerId) {
+        clearPrintQueueDiscoPressTimer();
+      }
+    });
+  });
+
   board.addEventListener('click', (event) => {
     const target = event.target instanceof Element ? event.target : null;
     const childrenToggle = target
@@ -1832,6 +1888,7 @@ function bindBoardEvents(board) {
   });
 
   board.addEventListener('dragstart', (event) => {
+    clearPrintQueueDiscoPressTimer();
     if (event.target instanceof Element && event.target.closest('button, a')) {
       event.preventDefault();
       return;
