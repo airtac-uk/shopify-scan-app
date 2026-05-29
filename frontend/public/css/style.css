@@ -646,11 +646,16 @@ button:hover { background: #0056b3; }
   background: #121b26;
 }
 
-.pick-shipping-modal__panel {
+#verifyShippingModal .pick-shipping-modal__panel {
   width: min(980px, 100%);
-  min-height: calc(100vh - 8px);
+  height: calc(100vh - 8px);
+  height: calc(100dvh - 8px);
+  min-height: 0;
   max-height: calc(100vh - 8px);
-  padding: 10px 14px;
+  max-height: calc(100dvh - 8px);
+  box-sizing: border-box;
+  overflow: hidden;
+  padding: 10px 14px calc(14px + env(safe-area-inset-bottom, 0px));
   display: flex;
   flex-direction: column;
 }
@@ -675,6 +680,10 @@ button:hover { background: #0056b3; }
 
 #verifyShippingModal.pick-modal {
   align-items: stretch;
+  box-sizing: border-box;
+  height: 100vh;
+  height: 100dvh;
+  overflow: hidden;
   padding: 4px 10px;
 }
 
@@ -689,11 +698,15 @@ button:hover { background: #0056b3; }
 }
 
 .pick-shipping-modal__body.pick-shipping-panel {
+  flex: 1 1 auto;
   grid-column: auto;
   min-height: 0;
-  overflow: auto;
+  overflow-x: hidden;
+  overflow-y: auto;
+  padding-bottom: 24px;
   border: 0;
   background: transparent;
+  -webkit-overflow-scrolling: touch;
 }
 
 .pick-shipping-modal__body.pick-shipping-panel--payment_blocked,
