@@ -124,9 +124,11 @@ function extractShipments(payload) {
 
 function normalizeAddress(address) {
   if (!address || typeof address !== 'object') return null;
+  const companyName = normalizeId(address.company_name || address.companyName);
+  const name = normalizeId(address.name) || companyName;
   return {
-    name: normalizeId(address.name),
-    companyName: normalizeId(address.company_name || address.companyName),
+    name,
+    companyName,
     phone: normalizeId(address.phone),
     addressLine1: normalizeId(address.address_line1 || address.addressLine1),
     addressLine2: normalizeId(address.address_line2 || address.addressLine2),
@@ -135,6 +137,17 @@ function normalizeAddress(address) {
     postalCode: normalizeId(address.postal_code || address.postalCode),
     countryCode: normalizeId(address.country_code || address.countryCode),
     residential: Boolean(address.address_residential_indicator === 'yes' || address.residential),
+  };
+}
+
+function applyCompanyNameFallbackToAddress(address) {
+  if (!address || typeof address !== 'object') return address;
+  const name = normalizeId(address.name);
+  const companyName = normalizeId(address.company_name || address.companyName);
+  if (name || !companyName) return address;
+  return {
+    ...address,
+    name: companyName,
   };
 }
 
@@ -379,7 +392,9 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
   allowedFields.forEach((field) => {
     const value = pickExistingShipmentField(raw, field);
     if (value !== undefined && value !== null) {
-      payload[field] = value;
+      payload[field] = field === 'ship_to' || field === 'ship_from' || field === 'return_to'
+        ? applyCompanyNameFallbackToAddress(value)
+        : value;
     }
   });
 

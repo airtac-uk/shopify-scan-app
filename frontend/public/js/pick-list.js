@@ -45,6 +45,8 @@ let shippingLookupInFlight = false;
 let shippingRequestToken = 0;
 let verifyShippingPreloadTimeoutId = null;
 let verifyShippingAutoRateTimeoutId = null;
+let activeShippingWeightPackageIndex = null;
+let suppressShippingWeightBlurRefresh = false;
 let bagLabelRows = [];
 let bagLabelActionLoading = '';
 
@@ -278,6 +280,7 @@ function createShippingPanelInitialState(barcode = currentOrderBarcode) {
 function resetShippingPanelState(barcode = currentOrderBarcode) {
   shippingPanelState = createShippingPanelInitialState(barcode);
   shippingLookupInFlight = false;
+  activeShippingWeightPackageIndex = null;
   shippingRequestToken += 1;
   if (verifyShippingPreloadTimeoutId) {
     window.clearTimeout(verifyShippingPreloadTimeoutId);
@@ -946,6 +949,7 @@ function openVerifyShippingModal() {
 function closeVerifyShippingModal() {
   const modal = document.getElementById('verifyShippingModal');
   if (!modal) return;
+  activeShippingWeightPackageIndex = null;
   if (verifyShippingAutoRateTimeoutId) {
     window.clearTimeout(verifyShippingAutoRateTimeoutId);
     verifyShippingAutoRateTimeoutId = null;
@@ -3556,6 +3560,13 @@ function renderShippingRateControls(container) {
     }
   };
 
+  const updateWeightInputValue = (index, value) => {
+    const visibleInput = form.querySelector(`[data-shipping-weight-index="${index}"]`);
+    if (visibleInput) {
+      visibleInput.value = value;
+    }
+  };
+
   const packageList = document.createElement('div');
   packageList.className = 'pick-shipping-package-list';
 
@@ -3574,6 +3585,7 @@ function renderShippingRateControls(container) {
       removeButton.className = 'pick-shipping-package-remove';
       removeButton.textContent = 'Remove';
       removeButton.addEventListener('click', () => {
+        activeShippingWeightPackageIndex = null;
         const currentRows = getShippingPackageRows();
         const removedItemIds = normalizeShippingPackageItemUnitIds(currentRows[index]?.itemUnitIds);
         const rows = currentRows.filter((_, rowIndex) => rowIndex !== index);
@@ -3676,12 +3688,13 @@ function renderShippingRateControls(container) {
     weightLabel.textContent = 'Package weight';
     const input = document.createElement('input');
     input.type = 'tel';
-    input.inputMode = 'numeric';
+    input.inputMode = 'none';
     input.pattern = '[0-9]*';
     input.autocomplete = 'off';
     input.enterKeyHint = 'done';
     input.value = row.weightGrams || '';
     input.placeholder = '0';
+    input.dataset.shippingWeightIndex = String(index);
     weightLabel.appendChild(input);
     const unit = document.createElement('span');
     unit.className = 'pick-shipping-weight-unit';
@@ -3695,9 +3708,24 @@ function renderShippingRateControls(container) {
       input.value = digits;
     });
     input.addEventListener('focus', () => {
+      if (activeShippingWeightPackageIndex !== index) {
+        activeShippingWeightPackageIndex = index;
+        suppressShippingWeightBlurRefresh = true;
+        renderVerifyShippingModal();
+        window.requestAnimationFrame(() => {
+          const focusedInput = document.querySelector(`[data-shipping-weight-index="${index}"]`);
+          if (focusedInput instanceof HTMLInputElement) {
+            focusedInput.focus();
+            focusedInput.select();
+          }
+          suppressShippingWeightBlurRefresh = false;
+        });
+        return;
+      }
       input.select();
     });
     input.addEventListener('blur', () => {
+      if (suppressShippingWeightBlurRefresh) return;
       if (hasRequiredShippingRateInputs()) {
         queueVerifyShippingRateRefresh({ force: true, delay: 0 });
       }
@@ -3708,6 +3736,64 @@ function renderShippingRateControls(container) {
 
     packageList.appendChild(packageCard);
   });
+
+  const renderWeightKeypad = () => {
+    const index = Number(activeShippingWeightPackageIndex);
+    if (!Number.isInteger(index) || index < 0 || index >= packageRows.length) {
+      activeShippingWeightPackageIndex = null;
+      return null;
+    }
+
+    const keypad = document.createElement('div');
+    keypad.className = 'pick-shipping-weight-keypad';
+    keypad.setAttribute('aria-label', `Package ${index + 1} weight keypad`);
+
+    const setWeight = (value) => {
+      const digits = String(value || '').replace(/\D/g, '').replace(/^0+(?=\d)/, '').slice(0, 6);
+      updatePackageRow(index, { weightGrams: digits }, { rerender: false, refreshRates: false });
+      updateWeightInputValue(index, digits);
+    };
+
+    ['1', '2', '3', '4', '5', '6', '7', '8', '9', '0'].forEach((digit) => {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.className = 'pick-shipping-weight-keypad__key';
+      button.textContent = digit;
+      button.addEventListener('pointerdown', (event) => event.preventDefault());
+      button.addEventListener('click', () => {
+        const currentValue = getShippingPackageRows()[index]?.weightGrams || '';
+        setWeight(`${currentValue}${digit}`);
+      });
+      keypad.appendChild(button);
+    });
+
+    const backButton = document.createElement('button');
+    backButton.type = 'button';
+    backButton.className = 'pick-shipping-weight-keypad__key pick-shipping-weight-keypad__key--back';
+    backButton.textContent = 'Back';
+    backButton.addEventListener('pointerdown', (event) => event.preventDefault());
+    backButton.addEventListener('click', () => {
+      const currentValue = String(getShippingPackageRows()[index]?.weightGrams || '');
+      setWeight(currentValue.slice(0, -1));
+    });
+    keypad.appendChild(backButton);
+
+    const submitButton = document.createElement('button');
+    submitButton.type = 'button';
+    submitButton.className = 'pick-shipping-weight-keypad__key pick-shipping-weight-keypad__key--submit';
+    submitButton.textContent = 'Submit';
+    submitButton.addEventListener('pointerdown', (event) => event.preventDefault());
+    submitButton.addEventListener('click', () => {
+      activeShippingWeightPackageIndex = null;
+      renderVerifyShippingModal();
+      if (hasRequiredShippingRateInputs()) {
+        queueVerifyShippingRateRefresh({ force: true, delay: 0 });
+      }
+    });
+    keypad.appendChild(submitButton);
+
+    return keypad;
+  };
 
   const addPackageButton = document.createElement('button');
   addPackageButton.type = 'button';
@@ -3739,8 +3825,12 @@ function renderShippingRateControls(container) {
   }
 
   const allocationControls = renderShippingPackageAllocationControls(packageRows);
+  const weightKeypad = renderWeightKeypad();
 
   form.appendChild(packageList);
+  if (weightKeypad) {
+    form.appendChild(weightKeypad);
+  }
   if (allocationControls) {
     form.appendChild(allocationControls);
   }
