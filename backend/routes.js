@@ -291,6 +291,7 @@ const awaitingPartsSyncPromises = new Map();
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
 const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
 const SHIPPING_ALLOWED_FINANCIAL_STATUSES = new Set(['PAID', 'PARTIALLY_REFUNDED']);
+const SHIPPING_LABEL_PURCHASE_STAGE_KEYS = new Set(['packaged', 'fulfilled', 'partially_fulfilled']);
 const ORDER_WORKFLOW_STATUS_FIELDS = `
               displayFulfillmentStatus
               displayFinancialStatus
@@ -299,6 +300,7 @@ const ORDER_WORKFLOW_STATUS_FIELDS = `
 `;
 const TRACKER_METAFIELD_NAMESPACE = String(process.env.SHOPIFY_TRACKER_METAFIELD_NAMESPACE || 'airtac').trim();
 const TRACKER_METAFIELD_KEY = String(process.env.SHOPIFY_TRACKER_METAFIELD_KEY || 'tracker_token').trim();
+const HPA_TANK_REG_REMOVAL_SKUS = new Set(['T1P_TANK-1', 'T1P_TANK-2']);
 const ORDER_TRACKER_METAFIELD_FIELD = `
               trackerTokenMetafield: metafield(namespace: "${TRACKER_METAFIELD_NAMESPACE}", key: "${TRACKER_METAFIELD_KEY}") {
                 value
@@ -614,6 +616,32 @@ function getOrderPaymentState(order) {
     message: canShip
       ? ''
       : `Order ${order?.name || ''} is payment ${label}. Ask the customer to pay in Shopify before buying a shipping label.`,
+  };
+}
+
+function getOrderTrackerStageForShipping(order) {
+  return deriveTrackerStage({
+    explicitTag: '',
+    tags: order?.tags,
+    cancelledAt: order?.cancelledAt,
+    displayFulfillmentStatus: order?.displayFulfillmentStatus,
+    orderNote: order?.note,
+  });
+}
+
+function getShippingLabelPurchaseBlock(order) {
+  const trackerStage = getOrderTrackerStageForShipping(order);
+  if (SHIPPING_LABEL_PURCHASE_STAGE_KEYS.has(trackerStage.key)) {
+    return null;
+  }
+
+  return {
+    code: 'not_packaged',
+    currentStage: {
+      key: trackerStage.key,
+      label: trackerStage.label,
+    },
+    message: 'Mark this order as Packaged before buying a shipping label.',
   };
 }
 
@@ -962,6 +990,66 @@ function buildCurrentOrderLineItems(edges = []) {
       };
     })
     .filter(Boolean);
+}
+
+function normalizeOrderShippingDestination(order = {}) {
+  const address = order?.shippingAddress || order?.shipping_address || {};
+  return {
+    countryCode: String(address?.countryCodeV2 || address?.country_code || address?.countryCode || '').trim().toUpperCase(),
+    countryName: String(address?.country || address?.country_name || address?.countryName || '').trim(),
+  };
+}
+
+function isHpaTankLineItem(item = {}) {
+  return HPA_TANK_REG_REMOVAL_SKUS.has(normalizeSku(item.sku));
+}
+
+function buildHpaTankShippingWarning({ order, lineItems = [] } = {}) {
+  const destination = normalizeOrderShippingDestination(order);
+  const countryCode = destination.countryCode;
+  if (countryCode !== 'US' && countryCode !== 'CA') return null;
+
+  const tankItems = (Array.isArray(lineItems) ? lineItems : [])
+    .filter(isHpaTankLineItem)
+    .map((item) => ({
+      sku: String(item.sku || '').trim(),
+      title: String(item.title || '').trim(),
+      variantTitle: String(item.variantTitle || '').trim(),
+      quantity: Math.max(1, Number(item.quantity) || 1),
+    }));
+
+  if (!tankItems.length) return null;
+
+  const skus = Array.from(new Set(tankItems.map((item) => item.sku).filter(Boolean)));
+  const countryLabel = destination.countryName || (countryCode === 'US' ? 'United States' : 'Canada');
+
+  return {
+    active: true,
+    countryCode,
+    countryName: countryLabel,
+    message: 'Take to a team member to get reg removed',
+    skus,
+    items: tankItems,
+  };
+}
+
+function buildWholesaleOrderWarning(order = {}) {
+  const purchasingEntity = order?.purchasingEntity || null;
+  const purchasingEntityType = String(purchasingEntity?.__typename || '').trim();
+  const isNativeB2bOrder = purchasingEntityType === 'PurchasingCompany';
+  const companyName = String(purchasingEntity?.company?.name || '').trim();
+  const locationName = String(purchasingEntity?.location?.name || '').trim();
+
+  if (!isNativeB2bOrder) return null;
+
+  return {
+    active: true,
+    source: 'shopify_b2b',
+    companyName,
+    locationName,
+    title: 'Wholesale order',
+    message: 'Print bag topper labels before dispatch. A team member can help you apply them.',
+  };
 }
 
 function buildTypedAwaitingPartsItems({ skus, items, skuMap }) {
@@ -1921,7 +2009,18 @@ function includesMissingBundleFieldError(err) {
   return raw.includes('cannot query field') || raw.includes("doesn't exist");
 }
 
-function getPickListOrderQuery({ includeBundleGroup }) {
+function includesMissingPurchasingEntityFieldError(err) {
+  const raw = String(err?.message || '').toLowerCase();
+  if (!raw.includes('purchasingentity') && !raw.includes('purchasingcompany')) return false;
+  return raw.includes('cannot query field')
+    || raw.includes("doesn't exist")
+    || raw.includes('unknown type')
+    || raw.includes('no such type')
+    || raw.includes('access denied')
+    || raw.includes('required access');
+}
+
+function getPickListOrderQuery({ includeBundleGroup, includePurchasingEntity = false }) {
   return `
       query getOrderForPickList($query: String!) {
         orders(first: 1, query: $query) {
@@ -1934,6 +2033,24 @@ function getPickListOrderQuery({ includeBundleGroup }) {
               tags
               ${ORDER_WORKFLOW_STATUS_FIELDS}
               ${ORDER_TRACKER_METAFIELD_FIELD}
+              ${includePurchasingEntity ? `
+              purchasingEntity {
+                __typename
+                ... on PurchasingCompany {
+                  company {
+                    id
+                    name
+                  }
+                  location {
+                    id
+                    name
+                  }
+                }
+              }` : ''}
+              shippingAddress {
+                country
+                countryCodeV2
+              }
               lineItems(first: 200) {
                 edges {
                   node {
@@ -1972,6 +2089,48 @@ function getPickListOrderQuery({ includeBundleGroup }) {
         }
       }
     `;
+}
+
+async function fetchPickListOrderResponse({
+  client,
+  variables,
+  includePurchasingEntity = false,
+} = {}) {
+  let includeBundleGroup = true;
+  let usePurchasingEntity = Boolean(includePurchasingEntity);
+  let bundleMetadataSupported = true;
+  let purchasingEntitySupported = usePurchasingEntity;
+
+  while (true) {
+    try {
+      const response = await client.graphql(getPickListOrderQuery({
+        includeBundleGroup,
+        includePurchasingEntity: usePurchasingEntity,
+      }), {
+        variables,
+      });
+
+      return {
+        response,
+        bundleMetadataSupported,
+        purchasingEntitySupported,
+      };
+    } catch (err) {
+      if (includeBundleGroup && includesMissingBundleFieldError(err)) {
+        includeBundleGroup = false;
+        bundleMetadataSupported = false;
+        continue;
+      }
+
+      if (usePurchasingEntity && includesMissingPurchasingEntityFieldError(err)) {
+        usePurchasingEntity = false;
+        purchasingEntitySupported = false;
+        continue;
+      }
+
+      throw err;
+    }
+  }
 }
 
 async function ensureGeckoboardDataset({ authHeader, datasetId }) {
@@ -4018,6 +4177,17 @@ router.post('/api/pick-list/shipping/labels', async (req, res) => {
       return res.status(409).json({ success: false, error: payment.message, payment });
     }
 
+    const purchaseBlock = getShippingLabelPurchaseBlock(order);
+    if (purchaseBlock) {
+      return res.status(409).json({
+        success: false,
+        error: purchaseBlock.message,
+        purchaseBlocked: true,
+        currentStage: purchaseBlock.currentStage,
+        payment,
+      });
+    }
+
     const knownLabels = await getKnownShippingLabelsForShipment({
       shop: auth.shop,
       barcode: quote.barcode,
@@ -4374,23 +4544,15 @@ router.post('/api/pick-list', async (req, res) => {
       query: `${normalizedBarcode} status:any`,
     };
 
-    let bundleMetadataSupported = true;
-    let orderResponse;
-
-    try {
-      orderResponse = await client.graphql(getPickListOrderQuery({ includeBundleGroup: true }), {
-        variables: queryVariables,
-      });
-    } catch (err) {
-      if (!includesMissingBundleFieldError(err)) {
-        throw err;
-      }
-
-      bundleMetadataSupported = false;
-      orderResponse = await client.graphql(getPickListOrderQuery({ includeBundleGroup: false }), {
-        variables: queryVariables,
-      });
-    }
+    const {
+      response: orderResponse,
+      bundleMetadataSupported,
+      purchasingEntitySupported,
+    } = await fetchPickListOrderResponse({
+      client,
+      variables: queryVariables,
+      includePurchasingEntity: true,
+    });
 
     const orderEdge = orderResponse.data?.orders?.edges?.[0];
     if (!orderEdge) {
@@ -4404,6 +4566,11 @@ router.post('/api/pick-list', async (req, res) => {
     });
     const workflowBlock = getOrderWorkflowBlock(order);
     const orderLineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
+    const hpaTankShippingWarning = buildHpaTankShippingWarning({
+      order,
+      lineItems: orderLineItems,
+    });
+    const wholesaleOrderWarning = buildWholesaleOrderWarning(order);
     const currentTrackerStage = deriveTrackerStage({
       explicitTag: '',
       tags: order.tags,
@@ -4480,6 +4647,7 @@ router.post('/api/pick-list', async (req, res) => {
       notesLoaded: pickListSheet.notesLoaded || false,
       notesError: pickListSheet.notesError || null,
       bundleMetadataSupported,
+      purchasingEntitySupported,
       workflowBlocked: Boolean(workflowBlock),
       workflowBlockCode: workflowBlock?.code || null,
       workflowStatus: workflowBlock?.status || null,
@@ -4491,6 +4659,8 @@ router.post('/api/pick-list', async (req, res) => {
       wholesaleProgressByItemKey,
       verifyProgressByItemKey,
       pickedRowCounts,
+      hpaTankShippingWarning,
+      wholesaleOrderWarning,
       orderItems: orderLineItems,
       lineItems: pickListResult.lineItems,
       totals: pickListResult.totals,

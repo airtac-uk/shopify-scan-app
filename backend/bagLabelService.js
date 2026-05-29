@@ -47,6 +47,12 @@ function sanitizeLabelText(value) {
     .normalize('NFKD')
     .replace(/[\u0300-\u036f]/g, '')
     .replace(/[^\x20-\x7E]/g, '')
+    .replace(/\s*[\([{][^\])}]*[\])}]\s*/g, ' ')
+    .replace(/(?:[-\u2013\u2014]\s*)?2026\s+edition(?:\s*[-\u2013\u2014])?/gi, ' ')
+    .replace(/\bair\s*[- ]?\s*tac\b/gi, ' ')
+    .replace(/\bplug\s*(?:and|&|\+)?\s*play\b/gi, ' ')
+    .replace(/\binjection\s*[- ]?\s*mou?lded\b/gi, ' ')
+    .replace(/(?:^\s*-\s*)|(?:\s*-\s*$)/g, '')
     .replace(/\s+/g, ' ')
     .trim();
 }

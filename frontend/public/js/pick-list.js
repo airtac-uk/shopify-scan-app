@@ -18,7 +18,11 @@ let currentWorkflowBlock = null;
 let currentOrderTags = [];
 let currentOrderStatus = '';
 let currentOrderFinancialStatus = '';
+let currentOrderStageKey = '';
 let currentOrderStageLabel = '';
+let currentHpaTankShippingWarning = null;
+let currentWholesaleOrderWarning = null;
+let hpaTankRegRemovalAlertedKeys = new Set();
 let currentAwaitingPartsSkuMap = new Map();
 let currentAwaitingPartsCatalog = new Map();
 let currentPickedRowCounts = new Map();
@@ -54,6 +58,7 @@ const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
 const WHOLESALE_MODE_COOKIE = 'pick_list_wholesale_mode';
 const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built', 'on_hold']);
+const HPA_TANK_REG_REMOVAL_SKUS = new Set(['T1P_TANK-1', 'T1P_TANK-2']);
 const SHIPPING_PACKAGE_DIMENSION_UNIT = 'centimeter';
 const SHIPPING_PACKAGE_PRESETS = [
   { key: 'small', label: 'Small', length: 23, width: 16, height: 17 },
@@ -131,6 +136,63 @@ function setOrderLookupInUrl(value) {
 
 function normalizeDisplaySku(value) {
   return String(value || '').trim().toUpperCase();
+}
+
+function normalizeHpaTankWarning(warning) {
+  if (!warning || typeof warning !== 'object' || warning.active === false) return null;
+  const skus = Array.isArray(warning.skus)
+    ? Array.from(new Set(warning.skus.map(normalizeDisplaySku).filter(Boolean)))
+    : [];
+  const items = Array.isArray(warning.items) ? warning.items : [];
+  if (!skus.length && !items.length) return null;
+  return {
+    active: true,
+    countryCode: normalizeDisplaySku(warning.countryCode),
+    countryName: String(warning.countryName || '').trim(),
+    message: String(warning.message || 'Take to a team member to get reg removed').trim(),
+    skus,
+    items,
+  };
+}
+
+function setHpaTankShippingWarning(warning) {
+  currentHpaTankShippingWarning = normalizeHpaTankWarning(warning);
+  hpaTankRegRemovalAlertedKeys = new Set();
+}
+
+function normalizeWholesaleOrderWarning(warning) {
+  if (!warning || typeof warning !== 'object' || warning.active === false) return null;
+  return {
+    active: true,
+    source: String(warning.source || '').trim(),
+    companyName: String(warning.companyName || '').trim(),
+    locationName: String(warning.locationName || '').trim(),
+    title: String(warning.title || 'Wholesale order').trim(),
+    message: String(
+      warning.message || 'Print bag topper labels before dispatch. A team member can help you apply them.'
+    ).trim(),
+  };
+}
+
+function setWholesaleOrderWarning(warning) {
+  currentWholesaleOrderWarning = normalizeWholesaleOrderWarning(warning);
+}
+
+function hasHpaTankShippingWarning() {
+  return Boolean(currentHpaTankShippingWarning?.active);
+}
+
+function isHpaTankWarningSku(sku) {
+  const normalizedSku = normalizeDisplaySku(sku);
+  if (!normalizedSku) return false;
+  return HPA_TANK_REG_REMOVAL_SKUS.has(normalizedSku)
+    && hasHpaTankShippingWarning()
+    && currentHpaTankShippingWarning.skus.includes(normalizedSku);
+}
+
+function isHpaTankPickRow(row) {
+  if (!hasHpaTankShippingWarning() || !row) return false;
+  return isHpaTankWarningSku(row.sku);
 }
 
 function isAwaitingPartsSku(value) {
@@ -298,6 +360,21 @@ function setShippingPanelState(patch = {}) {
     ...patch,
     barcode: String(patch.barcode || shippingPanelState.barcode || currentOrderBarcode || '').trim().toUpperCase(),
   };
+}
+
+function getCurrentOrderStageKey() {
+  return String(currentOrderStageKey || '')
+    .trim()
+    .toLowerCase()
+    .replace(/[\s-]+/g, '_');
+}
+
+function canBuyShippingLabelForCurrentOrder() {
+  return ['packaged', 'fulfilled', 'partially_fulfilled'].includes(getCurrentOrderStageKey());
+}
+
+function getShippingPurchaseLockedMessage() {
+  return 'Mark this order as Packaged before buying a shipping label.';
 }
 
 function formatShippingMoney(amount, currency) {
@@ -946,6 +1023,19 @@ function openVerifyShippingModal() {
   queueVerifyShippingRateRefresh({ force: true, delay: 0 });
 }
 
+async function openVerifyShippingModalFromLaunch() {
+  if (loading || !shouldShowVerifyShippingPanel()) return;
+
+  if (!canBuyShippingLabelForCurrentOrder()) {
+    const packaged = await runOrderAction('packaged');
+    if (!packaged || !canBuyShippingLabelForCurrentOrder()) {
+      return;
+    }
+  }
+
+  openVerifyShippingModal();
+}
+
 function closeVerifyShippingModal() {
   const modal = document.getElementById('verifyShippingModal');
   if (!modal) return;
@@ -1072,6 +1162,45 @@ function closeAwaitingPrintQueueResultPopup() {
   modal.setAttribute('aria-hidden', 'true');
 }
 
+function openHpaTankRegRemovalPopup(row = null) {
+  const message = currentHpaTankShippingWarning?.message || 'Take to a team member to get reg removed';
+  const modal = document.getElementById('hpaTankRegRemovalModal');
+  const messageEl = document.getElementById('hpaTankRegRemovalMessage');
+  const detailEl = document.getElementById('hpaTankRegRemovalDetail');
+  const countryLabel = currentHpaTankShippingWarning?.countryName || currentHpaTankShippingWarning?.countryCode || '';
+  const itemLabel = row ? (row.sku || row.productName || row.title || '') : '';
+
+  if (!modal || !messageEl) {
+    window.alert(message);
+    return;
+  }
+
+  messageEl.textContent = message;
+  if (detailEl) {
+    detailEl.textContent = [
+      itemLabel ? `Item: ${itemLabel}` : '',
+      countryLabel ? `Destination: ${countryLabel}` : '',
+    ].filter(Boolean).join(' | ');
+  }
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+}
+
+function closeHpaTankRegRemovalPopup() {
+  const modal = document.getElementById('hpaTankRegRemovalModal');
+  if (!modal) return;
+  modal.classList.remove('is-open');
+  modal.setAttribute('aria-hidden', 'true');
+}
+
+function maybeShowHpaTankRegRemovalPopupForPickRow(row, rowKey, previousCount, nextCount) {
+  if (!isHpaTankPickRow(row) || nextCount <= previousCount) return;
+  const alertKey = rowKey || normalizeDisplaySku(row?.sku || row?.productName || row?.title);
+  if (alertKey && hpaTankRegRemovalAlertedKeys.has(alertKey)) return;
+  if (alertKey) hpaTankRegRemovalAlertedKeys.add(alertKey);
+  openHpaTankRegRemovalPopup(row);
+}
+
 function formatWorkflowStatusLabel(value) {
   const raw = String(value || '').trim();
   if (!raw) return '';
@@ -1141,7 +1270,10 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentOrderTags = [];
   currentOrderStatus = '';
   currentOrderFinancialStatus = '';
+  currentOrderStageKey = '';
   currentOrderStageLabel = '';
+  setHpaTankShippingWarning(null);
+  setWholesaleOrderWarning(null);
   currentAwaitingPartsSkuMap = new Map();
   currentAwaitingPartsCatalog = new Map();
   currentPickedRowCounts = new Map();
@@ -1429,6 +1561,7 @@ function applyOrderHeaderData(data, { fallbackTag = '' } = {}) {
 
   currentOrderStatus = String(data?.orderStatus || data?.workflowStatus || '').trim();
   currentOrderFinancialStatus = String(data?.orderFinancialStatus || currentOrderFinancialStatus || '').trim();
+  currentOrderStageKey = String(data?.currentStage?.key || '').trim();
   currentOrderStageLabel = String(data?.currentStage?.label || '').trim();
   renderOrderHeaderMeta();
 }
@@ -1663,13 +1796,25 @@ function makeBagLabelRow(text = '', quantity = 1) {
     : `bag-label-${Date.now()}-${Math.random().toString(16).slice(2)}`;
   return {
     id,
-    text: String(text || '').trim(),
+    text: cleanBagLabelText(text),
     quantity: Math.max(1, Math.floor(Number(quantity) || 1)),
   };
 }
 
+function cleanBagLabelText(value) {
+  return String(value || '')
+    .replace(/\s*[\([{][^\])}]*[\])}]\s*/g, ' ')
+    .replace(/(?:[-\u2013\u2014]\s*)?2026\s+edition(?:\s*[-\u2013\u2014])?/gi, ' ')
+    .replace(/\bair\s*[- ]?\s*tac\b/gi, ' ')
+    .replace(/\bplug\s*(?:and|&|\+)?\s*play\b/gi, ' ')
+    .replace(/\binjection\s*[- ]?\s*mou?lded\b/gi, ' ')
+    .replace(/(?:^\s*-\s*)|(?:\s*-\s*$)/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 function getBagLabelTextForOrderItem(item) {
-  return String(item?.title || item?.sku || '').trim();
+  return cleanBagLabelText(item?.title || item?.sku || '');
 }
 
 function buildSuggestedBagLabels(orderItems = lastOrderItems) {
@@ -1682,7 +1827,7 @@ function buildSuggestedBagLabels(orderItems = lastOrderItems) {
     const bundleGroupId = String(item?.bundleGroup?.id || '').trim();
 
     if (bundleGroupId) {
-      const bundleText = String(item?.bundleGroup?.title || item?.title || item?.sku || '').trim();
+      const bundleText = cleanBagLabelText(item?.bundleGroup?.title || item?.title || item?.sku || '');
       if (!bundleText) return;
       const bundleQuantity = Math.max(1, Math.floor(Number(item?.bundleGroup?.quantity) || quantity));
       if (!bundleRows.has(bundleGroupId)) {
@@ -1920,6 +2065,7 @@ function isAnyDialogOpen() {
   const onHoldModal = document.getElementById('onHoldModal');
   const verifyShippingModal = document.getElementById('verifyShippingModal');
   const bagLabelsModal = document.getElementById('bagLabelsModal');
+  const hpaTankRegRemovalModal = document.getElementById('hpaTankRegRemovalModal');
 
   return Boolean(
     awaitingPartsModal?.classList.contains('is-open') ||
@@ -1928,6 +2074,7 @@ function isAnyDialogOpen() {
     onHoldModal?.classList.contains('is-open') ||
     verifyShippingModal?.classList.contains('is-open') ||
     bagLabelsModal?.classList.contains('is-open') ||
+    hpaTankRegRemovalModal?.classList.contains('is-open') ||
     isOrderActionReminderDialogOpen()
   );
 }
@@ -2210,6 +2357,87 @@ function getPickRowKey(row, sectionTitle, rowIndex) {
   ].join('|');
 }
 
+function getPickRowsFromLineSummary(line) {
+  const rows = [];
+  [
+    ['Must Pick', line?.mustPick],
+    ['Desk Items', line?.deskItems],
+    ['Needs Review', line?.reviewItems],
+  ].forEach(([sectionTitle, sectionRows]) => {
+    (Array.isArray(sectionRows) ? sectionRows : []).forEach((row) => {
+      const sku = normalizeDisplaySku(row?.sku);
+      if (!sku) return;
+      rows.push({
+        sku,
+        quantity: Math.max(1, Number(row?.quantity) || 1),
+        location: String(row?.location || '').trim(),
+        note: String(row?.note || '').trim(),
+        type: String(row?.type || row?.typeRaw || '').trim(),
+        sectionTitle,
+      });
+    });
+  });
+  return rows;
+}
+
+function findPickRowsForOrderItem(orderItem = {}) {
+  const sku = normalizeDisplaySku(orderItem?.sku);
+  const bundleGroupId = String(orderItem?.bundleGroup?.id || '').trim();
+  if (!sku && !bundleGroupId) return [];
+
+  const matchedLines = (lastRenderedLineItems || []).filter((line) => {
+    const lineSku = normalizeDisplaySku(line?.sku);
+    const lineBundleGroupId = String(line?.bundleGroupId || '').trim();
+
+    if (bundleGroupId && lineBundleGroupId) {
+      return lineBundleGroupId === bundleGroupId && (!sku || !lineSku || lineSku === sku);
+    }
+    return sku && lineSku === sku;
+  });
+
+  const rowMap = new Map();
+  matchedLines.flatMap(getPickRowsFromLineSummary)
+    .filter((row) => normalizeDisplaySku(row?.sku) === sku)
+    .forEach((row) => {
+      const key = [
+        row.sku,
+        row.location,
+        row.note,
+        row.type,
+        row.sectionTitle,
+      ].join('|');
+      if (!rowMap.has(key)) {
+        rowMap.set(key, { ...row });
+        return;
+      }
+      const existing = rowMap.get(key);
+      existing.quantity += row.quantity;
+    });
+
+  return Array.from(rowMap.values()).sort(comparePickLocation);
+}
+
+function mergeVerifyPickRows(targetRow, pickRows = []) {
+  if (!targetRow || !Array.isArray(pickRows) || !pickRows.length) return;
+  const existingRows = Array.isArray(targetRow.pickRows) ? targetRow.pickRows : [];
+  const rowMap = new Map(existingRows.map((row) => ([
+    [row.sku, row.location, row.note, row.type, row.sectionTitle].join('|'),
+    { ...row },
+  ])));
+
+  pickRows.forEach((row) => {
+    const key = [row.sku, row.location, row.note, row.type, row.sectionTitle].join('|');
+    if (!rowMap.has(key)) {
+      rowMap.set(key, { ...row });
+      return;
+    }
+    const existing = rowMap.get(key);
+    existing.quantity += Math.max(1, Number(row.quantity) || 1);
+  });
+
+  targetRow.pickRows = Array.from(rowMap.values()).sort(comparePickLocation);
+}
+
 function getNoteQuantityMultiplier(noteText) {
   const note = String(noteText || '').trim().toUpperCase();
   if (!note) return 1;
@@ -2467,7 +2695,8 @@ function syncPickedRowState(rowKey, item, checkbox, progress, requiredCount) {
   setPickProgressValue(progress, pickedCount, requiredCount);
 }
 
-function setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, nextCount) {
+function setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, nextCount, row = null) {
+  const previousCount = Math.min(getPickedRowCount(rowKey), requiredCount);
   const normalizedCount = Math.max(0, Math.min(requiredCount, Number(nextCount) || 0));
 
   if (normalizedCount > 0) {
@@ -2478,15 +2707,16 @@ function setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, next
 
   syncPickedRowState(rowKey, item, checkbox, progress, requiredCount);
   schedulePickedRowCountsSave();
+  maybeShowHpaTankRegRemovalPopupForPickRow(row, rowKey, previousCount, normalizedCount);
 }
 
-function togglePickedRowState(rowKey, item, checkbox, progress, requiredCount) {
+function togglePickedRowState(rowKey, item, checkbox, progress, requiredCount, row = null) {
   const currentCount = getPickedRowCount(rowKey);
   const nextCount = currentCount >= requiredCount ? 0 : currentCount + 1;
-  setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, nextCount);
+  setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, nextCount, row);
 }
 
-function createPickedCheckbox(rowKey, sku, item, progress, requiredCount) {
+function createPickedCheckbox(rowKey, sku, item, progress, requiredCount, row = null) {
   const label = document.createElement('label');
   label.className = 'pick-list-picked-toggle';
   label.title = `Mark ${normalizeDisplaySku(sku)} as picked`;
@@ -2497,7 +2727,7 @@ function createPickedCheckbox(rowKey, sku, item, progress, requiredCount) {
   checkbox.setAttribute('aria-label', `Mark ${normalizeDisplaySku(sku)} as picked`);
   checkbox.addEventListener('click', (event) => {
     event.stopPropagation();
-    setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, checkbox.checked ? requiredCount : 0);
+    setPickedRowCount(rowKey, item, checkbox, progress, requiredCount, checkbox.checked ? requiredCount : 0, row);
   });
 
   label.appendChild(checkbox);
@@ -2558,6 +2788,9 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
     if (isAwaitingParts) {
       item.classList.add('pick-list-item--awaiting-parts');
     }
+    if (isHpaTankPickRow(row)) {
+      item.classList.add('pick-list-item--hpa-tank-warning');
+    }
 
     let pickedCheckbox = null;
     let pickProgress = null;
@@ -2569,7 +2802,7 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
         pickProgress = document.createElement('span');
         pickProgress.className = 'pick-list-pick-progress';
       }
-      const pickedControl = createPickedCheckbox(rowKey, row.sku, item, pickProgress, requiredPickCount);
+      const pickedControl = createPickedCheckbox(rowKey, row.sku, item, pickProgress, requiredPickCount, row);
       pickedCheckbox = pickedControl.checkbox;
       main.appendChild(pickedControl.label);
     }
@@ -2615,7 +2848,7 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
         if (event.target.closest('.pick-list-item-action, .pick-list-picked-toggle')) {
           return;
         }
-        togglePickedRowState(rowKey, item, pickedCheckbox, pickProgress, requiredPickCount);
+        togglePickedRowState(rowKey, item, pickedCheckbox, pickProgress, requiredPickCount, row);
       });
     }
 
@@ -2926,6 +3159,8 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const productName = variantTitle ? `${nameBase} - ${variantTitle}` : nameBase;
     const lineValueAmount = Number(item?.priceAmount || 0);
     const lineValueCurrency = String(item?.priceCurrency || '').trim().toUpperCase();
+    const requiresRegRemoval = isHpaTankWarningSku(sku);
+    const pickRows = findPickRowsForOrderItem(item);
 
     const normalizedSku = normalizeVerifyCode(sku);
     const normalizedUpc = normalizeVerifyCode(upc);
@@ -2963,10 +3198,14 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
         totalValueAmount: 0,
         unitValueAmount: 0,
         valueCurrency: lineValueCurrency || 'GBP',
+        requiresRegRemoval: false,
+        pickRows: [],
       });
     }
 
     const row = grouped.get(key);
+    row.requiresRegRemoval = row.requiresRegRemoval || requiresRegRemoval;
+    mergeVerifyPickRows(row, pickRows);
     row.sortIndex = Math.min(row.sortIndex, index);
     if (Number.isFinite(lineValueAmount) && lineValueAmount > 0) {
       row.totalValueAmount += lineValueAmount;
@@ -3270,6 +3509,10 @@ async function rateVerifyShippingShipment({ automatic = false, force = false } =
 
 async function buyVerifyShippingLabel() {
   if (shippingPanelState.actionLoading || loading) return;
+  if (!canBuyShippingLabelForCurrentOrder()) {
+    setStatus(getShippingPurchaseLockedMessage(), 'error');
+    return;
+  }
   const rate = getSelectedShippingRate();
   if (!rate?.quoteId) {
     setStatus('Select a shipping rate first.', 'error');
@@ -3898,6 +4141,15 @@ function renderShippingRates(container) {
     list.appendChild(option);
   });
 
+  if (!canBuyShippingLabelForCurrentOrder()) {
+    const blocker = document.createElement('div');
+    blocker.className = 'pick-shipping-blocker pick-shipping-blocker--warn';
+    blocker.textContent = getShippingPurchaseLockedMessage();
+    container.appendChild(list);
+    container.appendChild(blocker);
+    return;
+  }
+
   const buyButton = document.createElement('button');
   buyButton.type = 'button';
   buyButton.className = 'pick-shipping-buy-btn';
@@ -4112,6 +4364,9 @@ function getVerifyShippingLaunchStatusText() {
     return 'Payment needs attention before shipping';
   }
   if (shippingPanelState.status === 'rates') {
+    if (!canBuyShippingLabelForCurrentOrder()) {
+      return 'Mark Packaged before buying label';
+    }
     return 'Rates ready';
   }
   if (shippingPanelState.actionLoading === 'lookup' || shippingPanelState.status === 'loading_lookup') {
@@ -4121,6 +4376,94 @@ function getVerifyShippingLaunchStatusText() {
     return 'Shipment ready';
   }
   return 'Create shipping label';
+}
+
+function createHpaTankVerifyWarningCard() {
+  const warning = currentHpaTankShippingWarning;
+  if (!warning?.active) return null;
+
+  const card = document.createElement('article');
+  card.className = 'pick-list-card pick-hpa-tank-warning';
+
+  const headline = document.createElement('h2');
+  headline.textContent = 'HPA TANK - REMOVE REG BEFORE SHIPPING';
+  card.appendChild(headline);
+
+  const message = document.createElement('p');
+  message.textContent = warning.message || 'Take to a team member to get reg removed';
+  card.appendChild(message);
+
+  const detailParts = [
+    warning.countryName || warning.countryCode ? `Destination: ${warning.countryName || warning.countryCode}` : '',
+    warning.skus?.length ? `SKU: ${warning.skus.join(', ')}` : '',
+  ].filter(Boolean);
+  if (detailParts.length) {
+    const detail = document.createElement('span');
+    detail.textContent = detailParts.join(' | ');
+    card.appendChild(detail);
+  }
+
+  return card;
+}
+
+function createWholesaleVerifyWarningCard() {
+  const warning = currentWholesaleOrderWarning;
+  if (!verifyModeEnabled || wholesaleModeEnabled || !warning?.active) return null;
+
+  const card = document.createElement('article');
+  card.className = 'pick-list-card pick-wholesale-order-warning';
+
+  const headline = document.createElement('h2');
+  headline.textContent = 'WHOLESALE ORDER';
+  card.appendChild(headline);
+
+  const message = document.createElement('p');
+  message.textContent = warning.message || 'Print bag topper labels before dispatch. A team member can help you apply them.';
+  card.appendChild(message);
+
+  const detailParts = [
+    warning.companyName ? `Company: ${warning.companyName}` : '',
+    warning.locationName ? `Location: ${warning.locationName}` : '',
+  ].filter(Boolean);
+  if (detailParts.length) {
+    const detail = document.createElement('span');
+    detail.textContent = detailParts.join(' | ');
+    card.appendChild(detail);
+  }
+
+  return card;
+}
+
+function renderVerifyPickLocations(row) {
+  const pickRows = Array.isArray(row?.pickRows) ? row.pickRows : [];
+  const wrapper = document.createElement('div');
+  wrapper.className = 'pick-verify-item-locations';
+
+  const label = document.createElement('span');
+  label.className = 'pick-verify-item-locations__label';
+  label.textContent = 'Bay / Tray';
+  wrapper.appendChild(label);
+
+  const rows = pickRows.length
+    ? pickRows
+    : [{ sku: row?.sku || '', quantity: 1, location: '' }];
+
+  rows.forEach((pickRow) => {
+    const line = document.createElement('div');
+    line.className = 'pick-verify-location-row';
+
+    if (rows.length > 1 || normalizeDisplaySku(pickRow.sku) !== normalizeDisplaySku(row?.sku)) {
+      const sku = document.createElement('span');
+      sku.className = 'pick-verify-location-sku';
+      sku.textContent = pickRow.sku;
+      line.appendChild(sku);
+    }
+
+    line.appendChild(renderLocationCell(pickRow.location));
+    wrapper.appendChild(line);
+  });
+
+  return wrapper;
 }
 
 function renderVerifyOrderCards() {
@@ -4142,6 +4485,16 @@ function renderVerifyOrderCards() {
     resetShippingPanelState(currentOrderBarcode);
   }
 
+  const hpaTankWarningCard = createHpaTankVerifyWarningCard();
+  if (hpaTankWarningCard) {
+    container.appendChild(hpaTankWarningCard);
+  }
+
+  const wholesaleWarningCard = createWholesaleVerifyWarningCard();
+  if (wholesaleWarningCard) {
+    container.appendChild(wholesaleWarningCard);
+  }
+
   const summaryCard = document.createElement('article');
   const summaryTitle = canOpenShippingPanel
     ? (totals.isComplete ? 'ORDER VERIFIED - TAP TO SHIP' : 'ORDER FULFILLED - TAP TO SHIP')
@@ -4159,11 +4512,11 @@ function renderVerifyOrderCards() {
   if (canOpenShippingPanel) {
     summaryCard.setAttribute('role', 'button');
     summaryCard.tabIndex = 0;
-    summaryCard.addEventListener('click', openVerifyShippingModal);
+    summaryCard.addEventListener('click', openVerifyShippingModalFromLaunch);
     summaryCard.addEventListener('keydown', (event) => {
       if (event.key === 'Enter' || event.key === ' ') {
         event.preventDefault();
-        openVerifyShippingModal();
+        openVerifyShippingModalFromLaunch();
       }
     });
   }
@@ -4201,6 +4554,9 @@ function renderVerifyOrderCards() {
     item.className = `pick-verify-item${complete ? ' is-complete' : ''}`;
     if (row.isWholesaleBundle) {
       item.classList.add('pick-verify-item--bundle-build');
+    }
+    if (row.requiresRegRemoval) {
+      item.classList.add('pick-verify-item--hpa-tank-warning');
     }
     item.dataset.verifyKey = row.key;
     if (usePickStyleVerifyTap) {
@@ -4250,6 +4606,12 @@ function renderVerifyOrderCards() {
 
     info.appendChild(title);
     info.appendChild(meta);
+    if (row.requiresRegRemoval) {
+      const warningBadge = document.createElement('span');
+      warningBadge.className = 'pick-verify-hpa-tank-badge';
+      warningBadge.textContent = 'REG REMOVAL REQUIRED';
+      info.appendChild(warningBadge);
+    }
     if (row.isWholesaleBundle && Array.isArray(row.bundleParts) && row.bundleParts.length > 0) {
       const partsList = document.createElement('ul');
       partsList.className = 'pick-verify-bundle-parts';
@@ -4274,6 +4636,9 @@ function renderVerifyOrderCards() {
     progress.textContent = `${row.scannedQty} / ${row.requiredQty}`;
 
     item.appendChild(info);
+    if (verifyModeEnabled && !wholesaleModeEnabled) {
+      item.appendChild(renderVerifyPickLocations(row));
+    }
     item.appendChild(progress);
     if (!usePickStyleVerifyTap) {
       const actions = document.createElement('div');
@@ -5064,6 +5429,8 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
         clearLoadedOrderState({ preserveOrderLookup: true });
         currentOrderBarcode = barcode;
         currentOrderNumber = data.orderNumber || barcode;
+        setHpaTankShippingWarning(data.hpaTankShippingWarning);
+        setWholesaleOrderWarning(data.wholesaleOrderWarning);
         applyOrderHeaderData(data);
         playVerifyErrorSound();
         setStatus(data.error || 'This order cannot be picked or built.', 'error');
@@ -5082,6 +5449,8 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     currentOrderNote = data.orderNote || '';
     currentOrderTimeline = Array.isArray(data.orderTimeline) ? data.orderTimeline : [];
     currentOrderFinancialStatus = String(data.orderFinancialStatus || '').trim();
+    setHpaTankShippingWarning(data.hpaTankShippingWarning);
+    setWholesaleOrderWarning(data.wholesaleOrderWarning);
     resetShippingPanelState(data.barcode);
     setCurrentAwaitingPartsItems(Array.isArray(data.awaitingPartsItems) ? data.awaitingPartsItems : []);
     setOrderLookupInUrl(data.barcode || barcode);
@@ -5263,6 +5632,7 @@ function registerModalHandlers() {
   const orderActionReminderModal = document.getElementById('orderActionReminderModal');
   const verifyShippingModal = document.getElementById('verifyShippingModal');
   const bagLabelsModal = document.getElementById('bagLabelsModal');
+  const hpaTankRegRemovalModal = document.getElementById('hpaTankRegRemovalModal');
 
   const awaitingCancel = document.getElementById('awaitingPartsCancelBtn');
   const awaitingConfirm = document.getElementById('awaitingPartsConfirmBtn');
@@ -5278,6 +5648,7 @@ function registerModalHandlers() {
   const bagLabelsPreview = document.getElementById('bagLabelsPreviewBtn');
   const bagLabelsPrint = document.getElementById('bagLabelsPrintBtn');
   const bagLabelsAdd = document.getElementById('bagLabelsAddBtn');
+  const hpaTankRegRemovalClose = document.getElementById('hpaTankRegRemovalCloseBtn');
 
   if (awaitingCancel) awaitingCancel.addEventListener('click', cancelAwaitingPartsDialog);
   if (awaitingConfirm) awaitingConfirm.addEventListener('click', submitAwaitingParts);
@@ -5291,6 +5662,7 @@ function registerModalHandlers() {
   if (bagLabelsPreview) bagLabelsPreview.addEventListener('click', previewBagLabelsPdf);
   if (bagLabelsPrint) bagLabelsPrint.addEventListener('click', submitBagLabels);
   if (bagLabelsAdd) bagLabelsAdd.addEventListener('click', addBagLabelRow);
+  if (hpaTankRegRemovalClose) hpaTankRegRemovalClose.addEventListener('click', closeHpaTankRegRemovalPopup);
   if (reminderCancel) reminderCancel.addEventListener('click', () => closeOrderActionReminderDialog());
   if (reminderContinue) {
     reminderContinue.addEventListener('click', () => {
@@ -5352,6 +5724,14 @@ function registerModalHandlers() {
     bagLabelsModal.addEventListener('click', (event) => {
       if (event.target === event.currentTarget) {
         closeBagLabelsDialog();
+      }
+    });
+  }
+
+  if (hpaTankRegRemovalModal) {
+    hpaTankRegRemovalModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeHpaTankRegRemovalPopup();
       }
     });
   }
