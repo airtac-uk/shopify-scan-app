@@ -446,14 +446,14 @@ function buildInternalOrderTimeline({ trackerRecord, orderNote }) {
       const rightHasTime = Number.isFinite(rightTime);
 
       if (leftHasTime && rightHasTime && leftTime !== rightTime) {
-        return leftTime - rightTime;
+        return rightTime - leftTime;
       }
 
       if (leftHasTime !== rightHasTime) {
         return leftHasTime ? -1 : 1;
       }
 
-      return Number(left.sequence || 0) - Number(right.sequence || 0);
+      return Number(right.sequence || 0) - Number(left.sequence || 0);
     })
     .map((event, index) => ({
       id: event.id || `${event.source || 'timeline'}-${index}`,

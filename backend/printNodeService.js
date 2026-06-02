@@ -106,6 +106,7 @@ async function printPdfLabel({
   labelId,
   orderNumber = '',
   pdfBuffer,
+  useIdempotency = true,
 } = {}) {
   const { apiKey, printerId, baseUrl } = getPrintNodeConfig();
   const normalizedLabelId = String(labelId || '').trim();
@@ -114,13 +115,15 @@ async function printPdfLabel({
     throw new Error('Missing PDF data for PrintNode print job.');
   }
 
-  const idempotencyKey = buildPrintNodeIdempotencyKey({ shop, labelId: normalizedLabelId, printerId });
+  const idempotencyKey = useIdempotency
+    ? buildPrintNodeIdempotencyKey({ shop, labelId: normalizedLabelId, printerId })
+    : '';
   const response = await fetch(`${baseUrl}/printjobs`, {
     method: 'POST',
     headers: {
       Authorization: `Basic ${Buffer.from(`${apiKey}:`).toString('base64')}`,
       'Content-Type': 'application/json',
-      'X-Idempotency-Key': idempotencyKey,
+      ...(idempotencyKey ? { 'X-Idempotency-Key': idempotencyKey } : {}),
     },
     body: JSON.stringify({
       printerId,

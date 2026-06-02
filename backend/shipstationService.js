@@ -85,7 +85,12 @@ async function shipStationRequest(pathOrUrl, {
 
   if (!response.ok) {
     const message = data?.message || data?.error || data?.errors?.[0]?.message || text || response.statusText;
-    throw new Error(`ShipStation error ${response.status}: ${message}`);
+    const err = new Error(`ShipStation error ${response.status}: ${message}`);
+    err.status = response.status;
+    err.data = data;
+    err.url = url;
+    err.method = method;
+    throw err;
   }
 
   return data;
@@ -93,6 +98,53 @@ async function shipStationRequest(pathOrUrl, {
 
 function normalizeId(value) {
   return String(value || '').trim();
+}
+
+function getShipDateTimeZone() {
+  return normalizeId(process.env.SHIPSTATION_SHIP_DATE_TIME_ZONE) || 'Europe/London';
+}
+
+function formatDateInTimeZone(date, timeZone = getShipDateTimeZone()) {
+  try {
+    const parts = new Intl.DateTimeFormat('en-GB', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).formatToParts(date).reduce((acc, part) => {
+      if (part.type !== 'literal') acc[part.type] = part.value;
+      return acc;
+    }, {});
+
+    if (parts.year && parts.month && parts.day) {
+      return `${parts.year}-${parts.month}-${parts.day}`;
+    }
+  } catch (err) {
+    console.warn('[ShipStation] Invalid SHIPSTATION_SHIP_DATE_TIME_ZONE, falling back to UTC', {
+      timeZone,
+      error: err.message || String(err),
+    });
+  }
+
+  return date.toISOString().slice(0, 10);
+}
+
+function normalizeShipDateOnly(value) {
+  const raw = normalizeId(value);
+  if (!raw) return '';
+
+  const directMatch = raw.match(/^(\d{4}-\d{2}-\d{2})/);
+  if (directMatch) return directMatch[1];
+
+  const parsed = new Date(raw);
+  if (Number.isNaN(parsed.getTime())) return '';
+  return formatDateInTimeZone(parsed);
+}
+
+function getSafeShipmentShipDate(value) {
+  const today = formatDateInTimeZone(new Date());
+  const existingDate = normalizeShipDateOnly(value);
+  return existingDate && existingDate >= today ? existingDate : today;
 }
 
 function normalizeCompare(value) {
@@ -398,6 +450,8 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
     }
   });
 
+  payload.ship_date = getSafeShipmentShipDate(raw.ship_date || raw.shipDate || existingShipment?.shipDate);
+
   const sourcePackages = Array.isArray(raw.packages) && raw.packages.length > 0
     ? raw.packages
     : [{}];
@@ -491,12 +545,16 @@ async function updateShipmentPackages({ shipmentId, packages = [] }) {
     carrierCode: existingShipment?.carrierCode || '',
     serviceCode: existingShipment?.serviceCode || '',
     packageCode: existingShipment?.packageCode || '',
+    shipDate: existingShipment?.shipDate || '',
     packageCount: existingShipment?.packages?.length || 0,
   });
 
   const payload = buildShipmentPackagesUpdatePayload(existingShipment, normalizedPackages);
   console.log('[ShipStation rate check] Updating shipment packages', {
     shipmentId: safeShipmentId,
+    existingShipDate: existingShipment?.shipDate || '',
+    submittedShipDate: payload.ship_date || '',
+    shipDateTimeZone: getShipDateTimeZone(),
     packageCount: payload.packages?.length || 0,
     packages: (payload.packages || []).map((pkg) => ({
       packageCode: pkg.package_code || '',
@@ -521,6 +579,7 @@ async function updateShipmentPackages({ shipmentId, packages = [] }) {
     carrierCode: normalizedUpdated?.carrierCode || '',
     serviceCode: normalizedUpdated?.serviceCode || '',
     packageCode: normalizedUpdated?.packageCode || '',
+    shipDate: normalizedUpdated?.shipDate || '',
     packageWeights: (normalizedUpdated?.packages || []).map((pkg) => pkg.weight).filter(Boolean),
     packageDimensions: (normalizedUpdated?.packages || []).map((pkg) => pkg.dimensions).filter(Boolean),
     packageInsuredValues: (normalizedUpdated?.packages || []).map((pkg) => pkg.insuredValue).filter(Boolean),
@@ -614,7 +673,95 @@ function extractInvalidRates(payload) {
   return [];
 }
 
-async function getShipmentRates(shipmentId, {
+function normalizeDiagnosticMessageList(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap(normalizeDiagnosticMessageList).filter(Boolean);
+  }
+  if (typeof value === 'object') {
+    const message = normalizeId(value.message || value.error || value.detail || value.reason || value.code);
+    return message ? [message] : [JSON.stringify(value)];
+  }
+  return [normalizeId(value)].filter(Boolean);
+}
+
+function summarizeInvalidRateForDiagnostics(rate) {
+  if (!rate || typeof rate !== 'object') return { raw: rate };
+  return {
+    carrierCode: normalizeId(rate.carrier_code || rate.carrierCode),
+    carrierName: normalizeId(rate.carrier_friendly_name || rate.carrierFriendlyName || rate.carrier_nickname),
+    serviceCode: normalizeId(rate.service_code || rate.serviceCode),
+    serviceName: normalizeId(rate.service_type || rate.serviceType),
+    packageCode: normalizeId(rate.package_code || rate.packageCode),
+    validationStatus: normalizeId(rate.validation_status || rate.validationStatus),
+    errors: normalizeDiagnosticMessageList(rate.error_messages || rate.errors || rate.messages),
+    warnings: normalizeDiagnosticMessageList(rate.warning_messages || rate.warnings),
+    raw: rate,
+  };
+}
+
+function buildRateDiagnostics({
+  shipmentId,
+  carrierId,
+  selectedServiceCode,
+  packageCode,
+  preferredCurrency,
+  ratesPath,
+  ratesBody,
+  payload,
+  rawRates,
+  normalizedRates,
+  validRates,
+  invalidRates,
+}) {
+  const responseErrors = normalizeDiagnosticMessageList(payload?.errors || payload?.rate_response?.errors);
+  return {
+    request: {
+      method: 'POST',
+      url: buildShipStationUrl(ratesPath),
+      body: ratesBody,
+    },
+    context: {
+      shipmentId,
+      carrierId,
+      selectedServiceCode,
+      packageCode,
+      preferredCurrency,
+    },
+    response: {
+      rawResponseKeys: payload && typeof payload === 'object' ? Object.keys(payload) : [],
+      rateResponseStatus: normalizeId(payload?.rate_response?.status || payload?.status),
+      errors: responseErrors,
+      rawErrors: payload?.errors || payload?.rate_response?.errors || null,
+    },
+    counts: {
+      rawRateCount: rawRates.length,
+      normalizedRateCount: normalizedRates.length,
+      validRateCount: validRates.length,
+      invalidRateCount: invalidRates.length,
+    },
+    rates: normalizedRates.map(summarizeRateForLog),
+    invalidRates: invalidRates.map(summarizeInvalidRateForDiagnostics),
+  };
+}
+
+function buildShipStationErrorDiagnostics(err, fallback = {}) {
+  return {
+    request: {
+      method: err?.method || fallback.method || '',
+      url: err?.url || fallback.url || '',
+      body: fallback.body || null,
+    },
+    context: fallback.context || null,
+    response: {
+      status: err?.status || null,
+      errors: normalizeDiagnosticMessageList(err?.data?.errors || err?.data?.error || err?.data?.message || err?.message),
+      rawErrors: err?.data || null,
+    },
+  };
+}
+
+async function getShipmentRatesDetailed(shipmentId, {
   carrierId = '',
   selectedServiceCode = '',
   packageCode = '',
@@ -626,7 +773,20 @@ async function getShipmentRates(shipmentId, {
   const safePackageCode = normalizeId(packageCode);
   const safePreferredCurrency = normalizeId(preferredCurrency).toUpperCase() || 'GBP';
   if (!safeCarrierId) {
-    throw new Error('ShipStation shipment is missing carrier_id, so rates cannot be generated.');
+    const err = new Error('ShipStation shipment is missing carrier_id, so rates cannot be generated.');
+    err.rateDiagnostics = {
+      context: {
+        shipmentId: safeShipmentId,
+        carrierId: safeCarrierId,
+        selectedServiceCode: safeSelectedServiceCode,
+        packageCode: safePackageCode,
+        preferredCurrency: safePreferredCurrency,
+      },
+      response: {
+        errors: ['ShipStation shipment is missing carrier_id. Select a carrier/service in ShipStation or ask management to set better defaults.'],
+      },
+    };
+    throw err;
   }
 
   console.log('[ShipStation rate check] Requesting shipment rates', {
@@ -659,10 +819,27 @@ async function getShipmentRates(shipmentId, {
     body: ratesBody,
   });
 
-  const payload = await shipStationRequest(ratesPath, {
-    method: 'POST',
-    body: ratesBody,
-  });
+  let payload;
+  try {
+    payload = await shipStationRequest(ratesPath, {
+      method: 'POST',
+      body: ratesBody,
+    });
+  } catch (err) {
+    err.rateDiagnostics = buildShipStationErrorDiagnostics(err, {
+      method: 'POST',
+      url: buildShipStationUrl(ratesPath),
+      body: ratesBody,
+      context: {
+        shipmentId: safeShipmentId,
+        carrierId: safeCarrierId,
+        selectedServiceCode: safeSelectedServiceCode,
+        packageCode: safePackageCode,
+        preferredCurrency: safePreferredCurrency,
+      },
+    });
+    throw err;
+  }
   const selectedCode = normalizeCompare(safeSelectedServiceCode);
   const rawRates = extractRates(payload);
   const invalidRates = extractInvalidRates(payload);
@@ -675,6 +852,20 @@ async function getShipmentRates(shipmentId, {
       if (leftSelected !== rightSelected) return rightSelected - leftSelected;
       return Number(left.totalAmount.amount || 0) - Number(right.totalAmount.amount || 0);
     });
+  const diagnostics = buildRateDiagnostics({
+    shipmentId: safeShipmentId,
+    carrierId: safeCarrierId,
+    selectedServiceCode: safeSelectedServiceCode,
+    packageCode: safePackageCode,
+    preferredCurrency: safePreferredCurrency,
+    ratesPath,
+    ratesBody,
+    payload,
+    rawRates,
+    normalizedRates,
+    validRates,
+    invalidRates,
+  });
 
   console.log('[ShipStation rate check] Rates response summary', {
     shipmentId: safeShipmentId,
@@ -692,7 +883,15 @@ async function getShipmentRates(shipmentId, {
     invalidRates,
   });
 
-  return validRates;
+  return {
+    rates: validRates,
+    diagnostics,
+  };
+}
+
+async function getShipmentRates(shipmentId, options = {}) {
+  const result = await getShipmentRatesDetailed(shipmentId, options);
+  return result.rates;
 }
 
 function extractLabels(payload) {
@@ -708,7 +907,6 @@ function getLabelDownloadUrl(label) {
     download.pdf
     || download.label
     || download.url
-    || download.href
     || label?.label_url
     || label?.labelUrl
   );
@@ -763,7 +961,11 @@ async function listLabelsForShipment(shipmentId) {
 }
 
 async function getLabelById(labelId) {
-  const payload = await shipStationRequest(`/v2/labels/${encodeURIComponent(normalizeId(labelId))}`);
+  const payload = await shipStationRequest(`/v2/labels/${encodeURIComponent(normalizeId(labelId))}`, {
+    query: {
+      label_download_type: 'url',
+    },
+  });
   return normalizeLabel(payload?.label || payload);
 }
 
@@ -798,13 +1000,19 @@ async function voidLabelById(labelId) {
 async function downloadLabelBuffer(labelUrl) {
   const safeUrl = normalizeId(labelUrl);
   if (!safeUrl) throw new Error('ShipStation label download URL is missing.');
-  return shipStationRequest(safeUrl, { raw: true });
+  const download = await shipStationRequest(safeUrl, { raw: true });
+  const contentType = String(download.contentType || '').trim().toLowerCase();
+  if (contentType && !contentType.includes('pdf') && !contentType.includes('octet-stream')) {
+    throw new Error(`ShipStation label download returned ${contentType}, not a printable PDF.`);
+  }
+  return download;
 }
 
 module.exports = {
   buildOrderLookupIdentifiers,
   getShipmentById,
   getShipmentRates,
+  getShipmentRatesDetailed,
   listLabelsForShipment,
   lookupShipmentForOrder,
   purchaseLabelForRate,

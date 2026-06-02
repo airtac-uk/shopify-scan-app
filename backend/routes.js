@@ -46,7 +46,7 @@ const {
   transformStlBufferOrientation,
 } = require('./preformBuildService');
 const {
-  getShipmentRates,
+  getShipmentRatesDetailed,
   listLabelsForShipment,
   lookupShipmentForOrder,
   purchaseLabelForRate,
@@ -127,10 +127,29 @@ async function appendOrderNoteOrWarn(client, orderGid, appendText, context = {})
 // ---------------------
 // 1️⃣ /auth - start OAuth
 // ---------------------
+function getSafeAuthReturnTo(value) {
+  const raw = String(value || '').trim();
+  if (!raw || raw === '/') return '/scan.html';
+  if (!raw.startsWith('/')) return '/scan.html';
+  if (raw.startsWith('//')) return '/scan.html';
+  if (raw.startsWith('/auth')) return '/scan.html';
+  return raw;
+}
+
+function sendAuthRequired(res, error) {
+  return res.status(401).json({
+    success: false,
+    error,
+    authRequired: true,
+    loginUrl: '/',
+  });
+}
+
 router.get('/auth', async (req, res) => {
   try {
     const shop = req.query.shop;
     if (!shop) return res.status(400).send('Missing shop parameter');
+    const returnTo = getSafeAuthReturnTo(req.query.returnTo);
 
     console.log('Starting OAuth for shop:', shop);
 
@@ -140,6 +159,11 @@ router.get('/auth', async (req, res) => {
     const installUrl = `https://${shop}/admin/oauth/authorize?client_id=${process.env.SHOPIFY_API_KEY}&scope=${scopes}&redirect_uri=${redirectUri}&state=nonce&grant_options[]=per-user`;
 
     console.log('Redirecting to Shopify auth URL:', installUrl);
+    res.cookie('authReturnTo', returnTo, {
+      httpOnly: true,
+      sameSite: 'lax',
+      maxAge: 10 * 60 * 1000,
+    });
     res.redirect(installUrl);
 
   } catch (err) {
@@ -191,8 +215,11 @@ router.get('/auth/callback', async (req, res) => {
     res.cookie('userId', data.associated_user.first_name, { httpOnly: false, sameSite: 'lax' });
 
 
-    console.log('Session stored successfully, redirecting to scan page');
-    res.redirect('/scan.html');
+    const returnTo = getSafeAuthReturnTo(req.cookies?.authReturnTo);
+    res.clearCookie('authReturnTo', { sameSite: 'lax' });
+
+    console.log('Session stored successfully, redirecting to:', returnTo);
+    res.redirect(returnTo);
 
   } catch (err) {
     console.error('Error in /auth/callback:', err);
@@ -206,13 +233,13 @@ router.get('/api/auth/status', async (req, res) => {
   if (!shop) 
     {
       console.log("Cookie has no shop")
-      return res.status(401).json({ success: false, error: 'Not logged in' });
+      return sendAuthRequired(res, 'Not logged in');
     }
 
   const session = sessionsStore.get(shop);
   if (!session) {
     console.log("Cookie has no session")
-    return res.status(401).json({ success: false, error: 'No session found' });
+    return sendAuthRequired(res, 'No session found');
   }
 
   try {
@@ -332,19 +359,19 @@ function hasAwaitingPartsTag(tags) {
 function resolveAuthenticatedRequest(req, res, { requireUser = false } = {}) {
   const shop = req.cookies.shop;
   if (!shop) {
-    res.status(401).json({ success: false, error: 'Not logged in' });
+    sendAuthRequired(res, 'Not logged in');
     return null;
   }
 
   const session = sessionsStore.get(shop);
   if (!session) {
-    res.status(401).json({ success: false, error: 'No session found' });
+    sendAuthRequired(res, 'No session found');
     return null;
   }
 
   const userId = String(req.cookies.userId || '').trim();
   if (requireUser && !userId) {
-    res.status(401).json({ success: false, error: 'Username needs to be set' });
+    sendAuthRequired(res, 'Username needs to be set');
     return null;
   }
 
@@ -905,7 +932,7 @@ async function downloadStoredShippingLabelPdf({ shop, label }) {
   }
 }
 
-async function printStoredShippingLabel({ shop, label }) {
+async function printStoredShippingLabel({ shop, label, useIdempotency = true }) {
   if (!label?.labelId) throw new Error('Missing purchased label.');
   const { label: currentLabel, download } = await downloadStoredShippingLabelPdf({ shop, label });
   const printResult = await printPdfLabel({
@@ -913,6 +940,7 @@ async function printStoredShippingLabel({ shop, label }) {
     labelId: currentLabel.labelId,
     orderNumber: currentLabel.orderNumber || currentLabel.barcode,
     pdfBuffer: download.buffer,
+    useIdempotency,
   });
 
   return sessionsStore.updateShippingLabelPrintResult({
@@ -2527,6 +2555,14 @@ router.post('/api/tag-order', async (req, res) => {
         console.error('Failed to store wholesale_adapter_built event marker:', wholesaleEventStoreErr);
       }
     }
+    const qcBuilderStaff = tag == "waiting_qc"
+      ? staff
+      : resolveLatestWaitingQcStaff({
+          shop,
+          normalizedBarcode,
+          orderId: order.id,
+          orderNote: order.note || '',
+        });
 
     return res.json({
       success: true,
@@ -2539,6 +2575,7 @@ router.post('/api/tag-order', async (req, res) => {
       },
       lineItems: lineItemArray,
       staff: attributedStaff,
+      qcBuilderStaff,
       wholesaleAdapterBuiltCount,
       orderNoteWarning,
       geckoboardEventSent,
@@ -4067,12 +4104,34 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
     });
 
     const updatedShipment = await updateShipmentPackages({ shipmentId, packages: shippingPackages });
-    const rates = await getShipmentRates(shipmentId, {
+    const rateResult = await getShipmentRatesDetailed(shipmentId, {
       carrierId: updatedShipment?.carrierId || '',
       selectedServiceCode: updatedShipment?.serviceCode || '',
       packageCode: updatedShipment?.packages?.[0]?.packageCode || updatedShipment?.packageCode || '',
       preferredCurrency: 'GBP',
     });
+    const rates = Array.isArray(rateResult.rates) ? rateResult.rates : [];
+    const rateDiagnostics = {
+      ...(rateResult.diagnostics || {}),
+      shipment: {
+        shipmentId: updatedShipment?.shipmentId || '',
+        shipmentNumber: updatedShipment?.shipmentNumber || '',
+        status: updatedShipment?.status || '',
+        carrierCode: updatedShipment?.carrierCode || '',
+        carrierFriendlyName: updatedShipment?.carrierFriendlyName || '',
+        serviceCode: updatedShipment?.serviceCode || '',
+        serviceType: updatedShipment?.serviceType || '',
+        requestedShipmentService: updatedShipment?.requestedShipmentService || '',
+        packageCode: updatedShipment?.packageCode || '',
+        confirmation: updatedShipment?.confirmation || '',
+        insuranceProvider: updatedShipment?.insuranceProvider || '',
+        shipDate: updatedShipment?.shipDate || '',
+        shipTo: updatedShipment?.shipTo || null,
+        shipFrom: updatedShipment?.shipFrom || null,
+        packageCount: updatedShipment?.packages?.length || 0,
+      },
+      packages: shippingPackages,
+    };
     console.log('[ShipStation rate check] Rate check completed', {
       barcode: normalizedBarcode,
       orderNumber: order.name,
@@ -4093,6 +4152,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
           expiresAt: null,
           rates: [],
           noRateReason: 'Royal Mail service is available, but ShipStation does not return a quote through the API.',
+          rateDiagnostics,
         });
       }
 
@@ -4101,6 +4161,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
         error: 'ShipStation did not return any valid rates for this shipment.',
         shipment: updatedShipment,
         rateError: true,
+        rateDiagnostics,
       });
     }
 
@@ -4124,6 +4185,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       shipment: updatedShipment,
       expiresAt,
       rates: rates.map((rate) => summarizeShippingRate(rate, quoteByRateId.get(rate.rateId))),
+      rateDiagnostics,
     });
   } catch (err) {
     console.error('Error in /api/pick-list/shipping/rates:', {
@@ -4135,10 +4197,29 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       packageDimensions: req.body?.packageDimensions,
       packages: req.body?.packages,
     });
+    const rateDiagnostics = err.rateDiagnostics || {
+      request: {
+        method: err.method || '',
+        url: err.url || '',
+        body: {
+          barcode: req.body?.barcode,
+          shipmentId: req.body?.shipmentId,
+          weightGrams: req.body?.weightGrams,
+          packageDimensions: req.body?.packageDimensions,
+          packages: req.body?.packages,
+        },
+      },
+      response: {
+        status: err.status || null,
+        errors: [err.message || 'Server error'].filter(Boolean),
+        rawErrors: err.data || null,
+      },
+    };
     return res.status(500).json({
       success: false,
       error: err.message || 'Server error',
       rateError: true,
+      rateDiagnostics,
     });
   }
 });
@@ -4263,6 +4344,7 @@ router.post('/api/pick-list/shipping/labels/:labelId/print', async (req, res) =>
     const updatedLabel = await printStoredShippingLabel({
       shop: auth.shop,
       label,
+      useIdempotency: false,
     });
 
     return res.json({
@@ -4623,6 +4705,12 @@ router.post('/api/pick-list', async (req, res) => {
       appendEventIfStageChanged: true,
     });
     const trackerRecord = sessionsStore.getOrderTrackerByOrderId(order.id);
+    const qcBuilderStaff = resolveLatestWaitingQcStaff({
+      shop,
+      normalizedBarcode,
+      orderId: order.id,
+      orderNote: order.note || '',
+    });
     const orderTimeline = buildInternalOrderTimeline({
       trackerRecord,
       orderNote: order.note || '',
@@ -4641,6 +4729,7 @@ router.post('/api/pick-list', async (req, res) => {
       },
       orderNote: order.note || '',
       orderTimeline,
+      qcBuilderStaff,
       sheetFetchedAt: pickListSheet.fetchedAt,
       sheetSkuCount: pickListSheet.sourceRowCount,
       notesEnabled: pickListSheet.notesEnabled || false,

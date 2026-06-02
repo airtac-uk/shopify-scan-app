@@ -48,6 +48,12 @@
                 Wholesale
               </label>
             </div>
+            <div class="pick-list-toggle-row">
+              <label class="pick-list-toggle-label" for="qcModeToggle">
+                <input id="qcModeToggle" type="checkbox" />
+                QC
+              </label>
+            </div>
           </div>
           <div class="pick-list-status-row">
             <span id="pickListSpinner" class="loader" style="display:none;"></span>
@@ -57,15 +63,15 @@
 
         <section class="pick-list-actions" aria-label="Order actions">
           <div class="pick-list-action-grid">
-            <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false">Racked</button>
-            <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true">Awaiting Parts</button>
-            <button type="button" class="pick-list-action-btn" data-order-action="waiting_qc" data-picker-visible="false" data-verify-visible="false">Waiting QC</button>
-            <button type="button" class="pick-list-action-btn" data-order-action="wholesale_adapter_built" data-picker-visible="false" data-verify-visible="false">Wholesale Adapter</button>
-            <button type="button" class="pick-list-action-btn" data-order-action="qc_passed" data-picker-visible="false" data-verify-visible="false">QC Passed</button>
-            <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="qc_fail" data-picker-visible="false" data-verify-visible="false">QC Fail</button>
-            <button type="button" class="pick-list-action-btn" data-order-action="packaged" data-picker-visible="true" data-verify-visible="true">Packaged</button>
-            <button id="bagLabelsOpenBtn" type="button" class="pick-list-action-btn" data-picker-visible="true" data-verify-visible="true">Bag Labels</button>
-            <button type="button" class="pick-list-action-btn pick-list-action-btn--hold" data-order-action="on_hold" data-picker-visible="false" data-verify-visible="false">On Hold</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false" data-qc-visible="false">Racked</button>
+            <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true" data-qc-visible="false">Awaiting Parts</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="waiting_qc" data-picker-visible="false" data-verify-visible="false" data-qc-visible="false">Waiting QC</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="wholesale_adapter_built" data-picker-visible="false" data-verify-visible="false" data-qc-visible="false">Wholesale Adapter</button>
+            <button type="button" class="pick-list-action-btn pick-list-action-btn--qc-pass" data-order-action="qc_passed" data-picker-visible="false" data-verify-visible="false" data-qc-visible="true">QC PASS</button>
+            <button type="button" class="pick-list-action-btn pick-list-action-btn--warn pick-list-action-btn--qc-fail" data-order-action="qc_fail" data-picker-visible="false" data-verify-visible="false" data-qc-visible="true">QC FAIL</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="packaged" data-picker-visible="true" data-verify-visible="true" data-qc-visible="false">Packaged</button>
+            <button id="bagLabelsOpenBtn" type="button" class="pick-list-action-btn" data-picker-visible="true" data-verify-visible="true" data-qc-visible="false">Bag Labels</button>
+            <button type="button" class="pick-list-action-btn pick-list-action-btn--hold" data-order-action="on_hold" data-picker-visible="false" data-verify-visible="false" data-qc-visible="false">On Hold</button>
           </div>
         </section>
       </div>
@@ -196,6 +202,7 @@
     </div>
   </div>
 
+  <script src="/js/auth-guard.js"></script>
   <script src="js/pick-list.js"></script>
 </body>
 </html>

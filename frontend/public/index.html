@@ -30,7 +30,9 @@
       e.preventDefault();
       const shop = document.getElementById('shop').value.trim();
       if (!shop) return alert('Enter your Shopify store domain');
-      window.location.href = `/auth?shop=${encodeURIComponent(shop)}`;
+      const params = new URLSearchParams(window.location.search);
+      const returnTo = params.get('returnTo') || '/scan.html';
+      window.location.href = `/auth?shop=${encodeURIComponent(shop)}&returnTo=${encodeURIComponent(returnTo)}`;
     });
   </script>
 </div>

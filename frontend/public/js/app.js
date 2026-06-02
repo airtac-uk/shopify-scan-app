@@ -272,7 +272,11 @@ document.addEventListener('DOMContentLoaded', () => {
   const shopCookie = document.cookie.split('; ').find(c => c.startsWith('shop='));
   if (!shopCookie) {
     console.log('Shop cookie not found, redirecting to login...');
-    window.location.href = '/';
+    if (window.authGuard?.redirectToLogin) {
+      window.authGuard.redirectToLogin();
+    } else {
+      window.location.href = '/';
+    }
     return;
   }
 

@@ -5,6 +5,7 @@ let hidBufferTimeoutId = null;
 let pickerModeEnabled = false;
 let verifyModeEnabled = false;
 let wholesaleModeEnabled = false;
+let qcModeEnabled = false;
 let lastRenderedLineItems = [];
 let lastOrderItems = [];
 let lastWholesaleProgressByItemKey = {};
@@ -20,6 +21,7 @@ let currentOrderStatus = '';
 let currentOrderFinancialStatus = '';
 let currentOrderStageKey = '';
 let currentOrderStageLabel = '';
+let currentQcBuilderStaff = '';
 let currentHpaTankShippingWarning = null;
 let currentWholesaleOrderWarning = null;
 let hpaTankRegRemovalAlertedKeys = new Set();
@@ -57,6 +59,7 @@ let bagLabelActionLoading = '';
 const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
 const WHOLESALE_MODE_COOKIE = 'pick_list_wholesale_mode';
+const QC_MODE_COOKIE = 'pick_list_qc_mode';
 const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built', 'on_hold']);
 const HPA_TANK_REG_REMOVAL_SKUS = new Set(['T1P_TANK-1', 'T1P_TANK-2']);
 const SHIPPING_PACKAGE_DIMENSION_UNIT = 'centimeter';
@@ -96,13 +99,21 @@ function setCookieValue(name, value, maxAgeDays = 365) {
   document.cookie = `${name}=${encodeURIComponent(value)}; path=/; max-age=${maxAgeSeconds}; samesite=lax`;
 }
 
-function focusBarcodeInput({ selectAll = false } = {}) {
+function focusBarcodeInput({ selectAll = false, preventScroll = false } = {}) {
   const input = document.getElementById('pickListBarcode');
   if (!input) return;
-  input.focus();
+  try {
+    input.focus({ preventScroll });
+  } catch (_err) {
+    input.focus();
+  }
   if (selectAll) {
     input.select();
   }
+}
+
+function refocusBarcodeInputForScanner() {
+  window.setTimeout(() => focusBarcodeInput({ preventScroll: true }), 0);
 }
 
 function scrollPickListToTop() {
@@ -325,6 +336,7 @@ function createShippingPanelInitialState(barcode = currentOrderBarcode) {
     expiresAt: '',
     noRateReason: '',
     rateInputSignature: '',
+    rateDiagnostics: null,
     label: null,
     reusedExistingLabel: false,
     weightGrams: '',
@@ -1272,6 +1284,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentOrderFinancialStatus = '';
   currentOrderStageKey = '';
   currentOrderStageLabel = '';
+  currentQcBuilderStaff = '';
   setHpaTankShippingWarning(null);
   setWholesaleOrderWarning(null);
   currentAwaitingPartsSkuMap = new Map();
@@ -1360,6 +1373,12 @@ function syncActionVisibilityForModes() {
     const tag = button.dataset.orderAction || '';
     const isPickerVisible = button.dataset.pickerVisible === 'true';
     const isVerifyVisible = button.dataset.verifyVisible === 'true';
+    const isQcVisible = button.dataset.qcVisible === 'true';
+
+    if (qcModeEnabled) {
+      button.hidden = !isQcVisible;
+      return;
+    }
 
     if (wholesaleModeEnabled) {
       button.hidden = !isVerifyVisible;
@@ -1413,12 +1432,40 @@ function parseTimelineEvents(orderNoteText) {
   });
 }
 
+function getTimelineEventTime(event) {
+  const raw = String(event?.createdAt || event?.timestamp || '').trim();
+  if (!raw) return Number.NaN;
+  const normalized = raw.includes('T') ? raw : raw.replace(' ', 'T');
+  const parsed = Date.parse(normalized);
+  return Number.isFinite(parsed) ? parsed : Number.NaN;
+}
+
+function sortTimelineEventsNewestFirst(events) {
+  return (Array.isArray(events) ? events : [])
+    .map((event, index) => ({ event, index }))
+    .sort((left, right) => {
+      const leftTime = getTimelineEventTime(left.event);
+      const rightTime = getTimelineEventTime(right.event);
+      const leftHasTime = Number.isFinite(leftTime);
+      const rightHasTime = Number.isFinite(rightTime);
+
+      if (leftHasTime && rightHasTime && leftTime !== rightTime) {
+        return rightTime - leftTime;
+      }
+      if (leftHasTime !== rightHasTime) {
+        return leftHasTime ? -1 : 1;
+      }
+      return right.index - left.index;
+    })
+    .map((entry) => entry.event);
+}
+
 function renderOrderTimeline() {
   const section = document.getElementById('pickListTimelineSection');
   const container = document.getElementById('pickListTimelineCard');
   if (!section || !container) return;
 
-  if (!hasRenderedPickList || pickerModeEnabled || verifyModeEnabled || wholesaleModeEnabled) {
+  if (!hasRenderedPickList || pickerModeEnabled || verifyModeEnabled || wholesaleModeEnabled || qcModeEnabled) {
     section.hidden = true;
     container.innerHTML = '';
     return;
@@ -1427,9 +1474,11 @@ function renderOrderTimeline() {
   section.hidden = false;
   container.innerHTML = '';
 
-  const events = Array.isArray(currentOrderTimeline) && currentOrderTimeline.length > 0
-    ? currentOrderTimeline
-    : parseTimelineEvents(currentOrderNote);
+  const events = sortTimelineEventsNewestFirst(
+    Array.isArray(currentOrderTimeline) && currentOrderTimeline.length > 0
+      ? currentOrderTimeline
+      : parseTimelineEvents(currentOrderNote)
+  );
   if (!events.length) {
     const empty = document.createElement('p');
     empty.className = 'pick-list-empty';
@@ -1563,6 +1612,9 @@ function applyOrderHeaderData(data, { fallbackTag = '' } = {}) {
   currentOrderFinancialStatus = String(data?.orderFinancialStatus || currentOrderFinancialStatus || '').trim();
   currentOrderStageKey = String(data?.currentStage?.key || '').trim();
   currentOrderStageLabel = String(data?.currentStage?.label || '').trim();
+  if (Object.prototype.hasOwnProperty.call(data || {}, 'qcBuilderStaff')) {
+    currentQcBuilderStaff = String(data.qcBuilderStaff || '').trim();
+  }
   renderOrderHeaderMeta();
 }
 
@@ -1662,6 +1714,10 @@ function isActionRelevantForCurrentMode(button) {
 
   const tag = button.dataset.orderAction || '';
   if (!tag) return false;
+
+  if (qcModeEnabled) {
+    return button.dataset.qcVisible === 'true';
+  }
 
   if (wholesaleModeEnabled || verifyModeEnabled) {
     return button.dataset.verifyVisible === 'true';
@@ -2765,7 +2821,7 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
 
   const actionHeader = document.createElement('div');
   actionHeader.className = 'pick-list-cell pick-list-col-action';
-  actionHeader.textContent = 'Action';
+  actionHeader.textContent = qcModeEnabled ? '' : 'Action';
 
   headerItem.appendChild(skuHeader);
   headerItem.appendChild(locationHeader);
@@ -2832,10 +2888,12 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
 
     const action = document.createElement('div');
     action.className = 'pick-list-cell pick-list-col-action pick-list-item-action';
-    if (isPrintablePickListType(row.typeRaw || row.type)) {
-      action.appendChild(createGettingLowButton(row));
+    if (!qcModeEnabled) {
+      if (isPrintablePickListType(row.typeRaw || row.type)) {
+        action.appendChild(createGettingLowButton(row));
+      }
+      action.appendChild(createAwaitingToggleButton(row.sku));
     }
-    action.appendChild(createAwaitingToggleButton(row.sku));
 
     item.appendChild(main);
     item.appendChild(location);
@@ -3460,7 +3518,7 @@ async function rateVerifyShippingShipment({ automatic = false, force = false } =
   const weightGrams = packages.reduce((sum, pkg) => sum + Math.max(1, Number(pkg.weightGrams) || 1), 0);
   const packageDimensions = packages[0]?.packageDimensions || null;
 
-  setShippingPanelState({ actionLoading: 'rates', error: '' });
+  setShippingPanelState({ actionLoading: 'rates', error: '', rateDiagnostics: null });
   renderVerifyShippingModal();
   renderCurrentOrderSection();
 
@@ -3485,6 +3543,7 @@ async function rateVerifyShippingShipment({ automatic = false, force = false } =
       selectedQuoteId: rates[0]?.quoteId || '',
       expiresAt: data.expiresAt || '',
       noRateReason: data.noRateReason || '',
+      rateDiagnostics: data.rateDiagnostics || null,
       rateInputSignature,
     });
   } catch (err) {
@@ -3498,6 +3557,7 @@ async function rateVerifyShippingShipment({ automatic = false, force = false } =
       selectedQuoteId: '',
       expiresAt: '',
       noRateReason: '',
+      rateDiagnostics: err.data?.rateDiagnostics || null,
       rateInputSignature: '',
     });
     setStatus(`Shipping error: ${err.message}`, 'error');
@@ -4084,6 +4144,203 @@ function renderShippingRateControls(container) {
   container.appendChild(form);
 }
 
+function normalizeShippingDiagnosticMessages(value) {
+  if (!value) return [];
+  if (Array.isArray(value)) {
+    return value.flatMap(normalizeShippingDiagnosticMessages).filter(Boolean);
+  }
+  if (typeof value === 'object') {
+    const message = String(value.message || value.error || value.detail || value.reason || value.code || '').trim();
+    return message ? [message] : [JSON.stringify(value)];
+  }
+  return [String(value || '').trim()].filter(Boolean);
+}
+
+function appendShippingDiagnosticList(container, titleText, messages) {
+  const items = normalizeShippingDiagnosticMessages(messages);
+  if (!items.length) return;
+
+  const section = document.createElement('section');
+  section.className = 'pick-shipping-rate-diagnostics__section';
+
+  const title = document.createElement('strong');
+  title.textContent = titleText;
+  section.appendChild(title);
+
+  const list = document.createElement('ul');
+  items.forEach((message) => {
+    const item = document.createElement('li');
+    item.textContent = message;
+    list.appendChild(item);
+  });
+  section.appendChild(list);
+  container.appendChild(section);
+}
+
+function appendShippingDiagnosticDetails(container, titleText, value) {
+  if (!value) return;
+  const text = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
+  if (!String(text || '').trim()) return;
+
+  const details = document.createElement('details');
+  details.className = 'pick-shipping-rate-diagnostics__details';
+
+  const summary = document.createElement('summary');
+  summary.textContent = titleText;
+  details.appendChild(summary);
+
+  const pre = document.createElement('pre');
+  pre.textContent = text;
+  details.appendChild(pre);
+
+  container.appendChild(details);
+}
+
+function hasShippingDimensionSet(dimensions) {
+  if (!dimensions || typeof dimensions !== 'object') return false;
+  return ['length', 'width', 'height'].every((key) => Number(dimensions[key]) > 0);
+}
+
+function buildShippingDiagnosticReasonMessages(diagnostics) {
+  if (!diagnostics || typeof diagnostics !== 'object') return [];
+
+  const reasons = [];
+  const counts = diagnostics.counts || {};
+  const shipment = diagnostics.shipment || {};
+  const context = diagnostics.context || {};
+  const requestBody = diagnostics.request?.body || {};
+  const packages = Array.isArray(diagnostics.packages) ? diagnostics.packages : [];
+  const shipTo = shipment.shipTo || {};
+  const shipFrom = shipment.shipFrom || {};
+
+  if (Number(counts.rawRateCount || 0) === 0 && Number(counts.invalidRateCount || 0) === 0) {
+    reasons.push('ShipStation returned zero rates and zero invalid-rate explanations. This usually means the selected carrier/service/defaults cannot rate this shipment through the API.');
+  } else if (Number(counts.validRateCount || 0) === 0) {
+    reasons.push('ShipStation returned rate data, but every rate was rejected or missing a usable rate id.');
+  }
+
+  if (!context.carrierId && !shipment.carrierCode && !shipment.carrierFriendlyName) {
+    reasons.push('No carrier is selected on the ShipStation shipment.');
+  }
+  if (!shipment.serviceCode && !shipment.requestedShipmentService && !requestBody.rate_options?.service_codes?.length) {
+    reasons.push('No true shipping service is selected on the ShipStation shipment.');
+  }
+  if (!shipment.packageCode && !requestBody.rate_options?.package_types?.length) {
+    reasons.push('No ShipStation package type is selected. Use a known package type or set better defaults in ShipStation.');
+  }
+  if (!shipment.shipDate) {
+    reasons.push('Ship date is missing. ShipStation can reject labels or rates when the shipment date is absent or old.');
+  }
+
+  if (packages.length && packages.some((pkg) => !Number(pkg.weightGrams))) {
+    reasons.push('At least one package has no valid weight.');
+  }
+  if (packages.length && packages.some((pkg) => !hasShippingDimensionSet(pkg.packageDimensions || pkg.dimensions))) {
+    reasons.push('At least one package has missing package dimensions.');
+  }
+  if (packages.length > 1 && packages.some((pkg) => Number(pkg.insuredValueAmount || pkg.insuranceValueAmount || 0) < 0)) {
+    reasons.push('At least one package has an invalid insurance value.');
+  }
+
+  if (!shipTo.name) reasons.push('Destination name is missing. If the customer only has a company name, ShipStation needs that copied into name.');
+  if (!shipTo.addressLine1) reasons.push('Destination address line 1 is missing.');
+  if (!shipTo.city) reasons.push('Destination city is missing.');
+  if (!shipTo.postalCode) reasons.push('Destination postcode/ZIP is missing.');
+  if (!shipTo.countryCode) reasons.push('Destination country is missing.');
+  if (!shipFrom.addressLine1 || !shipFrom.postalCode || !shipFrom.countryCode) {
+    reasons.push('Ship-from address is incomplete in ShipStation.');
+  }
+
+  if (shipment.serviceCode || requestBody.rate_options?.service_codes?.length) {
+    reasons.push('The selected service may not be valid for the destination country, package size, weight, customs setup or carrier account.');
+  }
+  if (shipTo.countryCode && shipTo.countryCode !== 'GB') {
+    reasons.push('International shipments can fail rating if customs declarations, item values, HS codes, carrier terms or recipient phone/email details are missing in ShipStation.');
+  }
+  if (shipment.insuranceProvider && shipment.insuranceProvider !== 'none') {
+    reasons.push('Insurance can block rates if package values, currency or carrier insurance rules are not acceptable.');
+  }
+
+  return Array.from(new Set(reasons));
+}
+
+function renderShippingRateDiagnostics(container) {
+  const diagnostics = shippingPanelState.rateDiagnostics;
+  if (!diagnostics || typeof diagnostics !== 'object') return;
+
+  const panel = document.createElement('div');
+  panel.className = 'pick-shipping-rate-diagnostics';
+
+  const title = document.createElement('strong');
+  title.textContent = 'ShipStation diagnostic details';
+  panel.appendChild(title);
+
+  appendShippingDiagnosticList(panel, 'ShipStation response errors', diagnostics.response?.errors);
+  appendShippingDiagnosticList(panel, 'Possible reasons to check', buildShippingDiagnosticReasonMessages(diagnostics));
+
+  const invalidRates = Array.isArray(diagnostics.invalidRates) ? diagnostics.invalidRates : [];
+  if (invalidRates.length) {
+    const section = document.createElement('section');
+    section.className = 'pick-shipping-rate-diagnostics__section';
+    const heading = document.createElement('strong');
+    heading.textContent = 'Invalid rates returned';
+    section.appendChild(heading);
+
+    const list = document.createElement('ul');
+    invalidRates.forEach((rate, index) => {
+      const item = document.createElement('li');
+      const service = [
+        rate.carrierName || rate.carrierCode,
+        rate.serviceName || rate.serviceCode,
+        rate.packageCode,
+      ].filter(Boolean).join(' / ') || `Invalid rate ${index + 1}`;
+      const messages = [
+        ...normalizeShippingDiagnosticMessages(rate.errors),
+        ...normalizeShippingDiagnosticMessages(rate.warnings).map((warning) => `Warning: ${warning}`),
+      ];
+      item.textContent = messages.length ? `${service}: ${messages.join('; ')}` : service;
+      list.appendChild(item);
+    });
+    section.appendChild(list);
+    panel.appendChild(section);
+  }
+
+  const rejectedRates = (Array.isArray(diagnostics.rates) ? diagnostics.rates : [])
+    .filter((rate) => (
+      normalizeShippingDiagnosticMessages(rate.errorMessages).length > 0
+      || normalizeShippingDiagnosticMessages(rate.warningMessages).length > 0
+      || String(rate.validationStatus || '').trim()
+    ));
+  if (rejectedRates.length) {
+    const messages = rejectedRates.map((rate, index) => {
+      const service = [
+        rate.carrierName || rate.carrierCode,
+        rate.serviceName || rate.serviceCode,
+        rate.packageCode,
+      ].filter(Boolean).join(' / ') || `Rate ${index + 1}`;
+      const parts = [
+        rate.validationStatus ? `Status: ${rate.validationStatus}` : '',
+        ...normalizeShippingDiagnosticMessages(rate.errorMessages),
+        ...normalizeShippingDiagnosticMessages(rate.warningMessages).map((warning) => `Warning: ${warning}`),
+      ].filter(Boolean);
+      return parts.length ? `${service}: ${parts.join('; ')}` : service;
+    });
+    appendShippingDiagnosticList(panel, 'Rejected or warning rates', messages);
+  }
+
+  appendShippingDiagnosticDetails(panel, 'Request, shipment and package data', {
+    request: diagnostics.request || null,
+    context: diagnostics.context || null,
+    shipment: diagnostics.shipment || null,
+    packages: diagnostics.packages || null,
+    counts: diagnostics.counts || null,
+  });
+  appendShippingDiagnosticDetails(panel, 'Raw ShipStation errors', diagnostics.response?.rawErrors);
+  appendShippingDiagnosticDetails(panel, 'Raw invalid rate data', invalidRates);
+
+  container.appendChild(panel);
+}
+
 function renderShippingRates(container) {
   const rates = Array.isArray(shippingPanelState.rates) ? shippingPanelState.rates : [];
   if (!rates.length) {
@@ -4093,6 +4350,7 @@ function renderShippingRates(container) {
       noRate.textContent = shippingPanelState.noRateReason;
       container.appendChild(noRate);
     }
+    renderShippingRateDiagnostics(container);
     return;
   }
 
@@ -4351,6 +4609,7 @@ function renderVerifyShippingPanel(card, { includeHeader = true } = {}) {
     error.appendChild(guidance);
     error.appendChild(message);
     card.appendChild(error);
+    renderShippingRateDiagnostics(card);
   }
 }
 
@@ -4571,12 +4830,15 @@ function renderVerifyOrderCards() {
         const target = event.target instanceof Element ? event.target : null;
         if (target?.closest('button, a, input, select, textarea')) return;
         await processVerifyTap(row.key);
+        refocusBarcodeInputForScanner();
       });
       item.addEventListener('keydown', async (event) => {
         if (event.key !== 'Enter' && event.key !== ' ') return;
+        if (event.key === 'Enter' && hidBuffer.trim().length > 0) return;
         event.preventDefault();
         if (loading) return;
         await processVerifyTap(row.key);
+        refocusBarcodeInputForScanner();
       });
     }
 
@@ -4690,12 +4952,46 @@ function renderVerifyOrderCards() {
   setActionButtonsEnabled(actionButtonsUnlocked);
 }
 
+function createQcModePanel() {
+  const card = document.createElement('article');
+  card.className = 'pick-list-card pick-qc-mode-card';
+
+  const eyebrow = document.createElement('p');
+  eyebrow.className = 'pick-qc-mode-card__eyebrow';
+  eyebrow.textContent = 'BUILT BY';
+  card.appendChild(eyebrow);
+
+  const builder = document.createElement('h2');
+  builder.textContent = currentQcBuilderStaff || 'NO BUILDER RECORDED';
+  card.appendChild(builder);
+
+  const detail = document.createElement('p');
+  detail.className = 'pick-qc-mode-card__detail';
+  detail.textContent = currentQcBuilderStaff
+    ? 'Use QC PASS or QC FAIL after checking the adapter.'
+    : 'Mark the order as Waiting QC when the builder hands it over, then reload this order.';
+  card.appendChild(detail);
+
+  return card;
+}
+
+function renderQcOrderSection() {
+  renderLineCards(lastRenderedLineItems);
+  const container = document.getElementById('pickListLineItems');
+  if (!container) return;
+  container.prepend(createQcModePanel());
+}
+
 function renderCurrentOrderSection() {
   if (isVerificationStyleModeEnabled()) {
     renderVerifyOrderCards();
     return;
   }
   prunePickedRowCountsToRenderedRows();
+  if (qcModeEnabled) {
+    renderQcOrderSection();
+    return;
+  }
   renderLineCards(lastRenderedLineItems);
 }
 
@@ -5749,6 +6045,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const pickerModeToggle = document.getElementById('pickerModeToggle');
   const verifyModeToggle = document.getElementById('verifyModeToggle');
   const wholesaleModeToggle = document.getElementById('wholesaleModeToggle');
+  const qcModeToggle = document.getElementById('qcModeToggle');
   const bagLabelsOpenBtn = document.getElementById('bagLabelsOpenBtn');
 
   actionButtons = Array.from(document.querySelectorAll('.pick-list-action-btn'));
@@ -5805,10 +6102,16 @@ document.addEventListener('DOMContentLoaded', () => {
   pickerModeEnabled = getCookieValue(PICKER_MODE_COOKIE) === '1';
   verifyModeEnabled = getCookieValue(VERIFY_MODE_COOKIE) === '1';
   wholesaleModeEnabled = getCookieValue(WHOLESALE_MODE_COOKIE) === '1';
+  qcModeEnabled = getCookieValue(QC_MODE_COOKIE) === '1';
 
-  if (wholesaleModeEnabled) {
+  if (qcModeEnabled) {
     pickerModeEnabled = false;
     verifyModeEnabled = false;
+    wholesaleModeEnabled = false;
+  } else if (wholesaleModeEnabled) {
+    pickerModeEnabled = false;
+    verifyModeEnabled = false;
+    qcModeEnabled = false;
   } else if (pickerModeEnabled && verifyModeEnabled) {
     verifyModeEnabled = false;
     setCookieValue(VERIFY_MODE_COOKIE, '0');
@@ -5840,10 +6143,13 @@ document.addEventListener('DOMContentLoaded', () => {
     if (pickerModeToggle) pickerModeToggle.checked = pickerModeEnabled;
     if (verifyModeToggle) verifyModeToggle.checked = verifyModeEnabled;
     if (wholesaleModeToggle) wholesaleModeToggle.checked = wholesaleModeEnabled;
+    if (qcModeToggle) qcModeToggle.checked = qcModeEnabled;
+    document.body?.classList.toggle('pick-list-page--qc-mode', qcModeEnabled);
 
     setCookieValue(PICKER_MODE_COOKIE, pickerModeEnabled ? '1' : '0');
     setCookieValue(VERIFY_MODE_COOKIE, verifyModeEnabled ? '1' : '0');
     setCookieValue(WHOLESALE_MODE_COOKIE, wholesaleModeEnabled ? '1' : '0');
+    setCookieValue(QC_MODE_COOKIE, qcModeEnabled ? '1' : '0');
 
     syncActionVisibilityForModes();
     setActionButtonsEnabled(actionButtonsUnlocked);
@@ -5861,6 +6167,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (verifyModeEnabled) {
         pickerModeEnabled = false;
         wholesaleModeEnabled = false;
+        qcModeEnabled = false;
       }
       applyModeState();
     });
@@ -5873,6 +6180,20 @@ document.addEventListener('DOMContentLoaded', () => {
       if (wholesaleModeEnabled) {
         pickerModeEnabled = false;
         verifyModeEnabled = false;
+        qcModeEnabled = false;
+      }
+      applyModeState();
+    });
+  }
+
+  if (qcModeToggle) {
+    qcModeToggle.checked = qcModeEnabled;
+    qcModeToggle.addEventListener('change', () => {
+      qcModeEnabled = Boolean(qcModeToggle.checked);
+      if (qcModeEnabled) {
+        pickerModeEnabled = false;
+        verifyModeEnabled = false;
+        wholesaleModeEnabled = false;
       }
       applyModeState();
     });
@@ -5885,6 +6206,7 @@ document.addEventListener('DOMContentLoaded', () => {
       if (pickerModeEnabled) {
         verifyModeEnabled = false;
         wholesaleModeEnabled = false;
+        qcModeEnabled = false;
       }
       applyModeState();
     });
