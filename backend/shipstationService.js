@@ -153,6 +153,14 @@ function normalizeCompare(value) {
     .toUpperCase();
 }
 
+function normalizeSearchText(value) {
+  return normalizeId(value)
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
 function buildOrderLookupIdentifiers(values = []) {
   return Array.from(new Set((Array.isArray(values) ? values : [values])
     .map((value) => normalizeId(value))
@@ -263,6 +271,548 @@ function normalizePackageInsuredValueForWrite(pkg = {}) {
   };
 }
 
+function getPackageInsuranceSource(pkg = {}) {
+  return pkg?.insured_value
+    || pkg?.insuredValue
+    || pkg?.insured_amount
+    || pkg?.insuredAmount
+    || pkg?.insurance_amount
+    || pkg?.insuranceAmount
+    || null;
+}
+
+function getPackageInsuranceAmount(pkg = {}) {
+  const source = getPackageInsuranceSource(pkg);
+  if (source && typeof source === 'object') {
+    return Number(source.amount ?? source.value ?? 0);
+  }
+  return Number(source || 0);
+}
+
+function hasPositivePackageInsurance(pkg = {}) {
+  const amount = getPackageInsuranceAmount(pkg);
+  return Number.isFinite(amount) && amount > 0;
+}
+
+function normalizePackageInsuranceForPayload(pkg = {}) {
+  const source = getPackageInsuranceSource(pkg);
+  const amount = getPackageInsuranceAmount(pkg);
+  if (!Number.isFinite(amount) || amount <= 0) return null;
+  if (source && typeof source === 'object') {
+    return {
+      amount: Number(amount.toFixed(2)),
+      currency: normalizeId(source.currency || source.currency_code || source.currencyCode || 'GBP').toUpperCase() || 'GBP',
+    };
+  }
+  return {
+    amount: Number(amount.toFixed(2)),
+    currency: normalizeId(pkg.insuredValueCurrency || pkg.insuranceValueCurrency || 'GBP').toUpperCase() || 'GBP',
+  };
+}
+
+function normalizePackageType(pkg) {
+  if (!pkg || typeof pkg !== 'object') return null;
+  const packageCode = normalizeId(pkg.package_code || pkg.packageCode || pkg.code);
+  const name = normalizeId(pkg.name || pkg.package_name || pkg.packageName || pkg.description || packageCode);
+  if (!packageCode) return null;
+  return {
+    packageCode,
+    name: name || packageCode,
+    description: normalizeId(pkg.description),
+    raw: pkg,
+  };
+}
+
+function extractPackageTypes(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.packages)) return payload.packages;
+  if (Array.isArray(payload?.package_types)) return payload.package_types;
+  if (Array.isArray(payload?.packageTypes)) return payload.packageTypes;
+  return [];
+}
+
+function extractCarriers(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.carriers)) return payload.carriers;
+  if (Array.isArray(payload?.data)) return payload.data;
+  if (payload?.carrier_id || payload?.carrierId) return [payload];
+  return [];
+}
+
+function extractCarrierServices(carrier) {
+  if (Array.isArray(carrier?.services)) return carrier.services;
+  if (Array.isArray(carrier?.service_types)) return carrier.service_types;
+  if (Array.isArray(carrier?.serviceTypes)) return carrier.serviceTypes;
+  return [];
+}
+
+function normalizeCarrierService(service) {
+  if (!service || typeof service !== 'object') return null;
+  const serviceCode = normalizeId(service.service_code || service.serviceCode || service.code);
+  const name = normalizeId(service.name || service.service_name || service.serviceName || service.description || serviceCode);
+  if (!serviceCode && !name) return null;
+  return {
+    serviceCode,
+    name,
+    raw: service,
+  };
+}
+
+function normalizeCarrier(carrier) {
+  if (!carrier || typeof carrier !== 'object') return null;
+  const carrierId = normalizeId(carrier.carrier_id || carrier.carrierId || carrier.id);
+  return {
+    carrierId,
+    carrierCode: normalizeId(carrier.carrier_code || carrier.carrierCode || carrier.code),
+    name: normalizeId(carrier.friendly_name || carrier.friendlyName || carrier.name || carrier.nickname || carrier.carrier_name || carrier.carrierName),
+    packages: dedupePackageTypes(extractPackageTypes(carrier)),
+    services: extractCarrierServices(carrier).map(normalizeCarrierService).filter(Boolean),
+    raw: carrier,
+  };
+}
+
+function packageTypeDedupeKey(pkg) {
+  return normalizeCompare(pkg?.packageCode || pkg?.package_code || pkg?.code);
+}
+
+function dedupePackageTypes(packageTypes = []) {
+  const seen = new Set();
+  return (Array.isArray(packageTypes) ? packageTypes : [])
+    .map(normalizePackageType)
+    .filter(Boolean)
+    .filter((pkg) => {
+      const key = packageTypeDedupeKey(pkg);
+      if (!key || seen.has(key)) return false;
+      seen.add(key);
+      return true;
+    })
+    .sort((left, right) => left.name.localeCompare(right.name) || left.packageCode.localeCompare(right.packageCode));
+}
+
+async function listCarrierPackageTypes(carrierId) {
+  const safeCarrierId = normalizeId(carrierId);
+  if (!safeCarrierId) return [];
+  const packageTypes = [];
+  const errors = [];
+
+  try {
+    const payload = await shipStationRequest(`/v2/carriers/${encodeURIComponent(safeCarrierId)}/packages`);
+    packageTypes.push(...extractPackageTypes(payload));
+  } catch (err) {
+    errors.push(err.message || String(err));
+  }
+
+  try {
+    const carrierPayload = await shipStationRequest(`/v2/carriers/${encodeURIComponent(safeCarrierId)}`);
+    packageTypes.push(...extractPackageTypes(carrierPayload));
+  } catch (err) {
+    errors.push(err.message || String(err));
+  }
+
+  const normalizedPackageTypes = dedupePackageTypes(packageTypes);
+  if (!normalizedPackageTypes.length && errors.length) {
+    throw new Error(errors.join(' | '));
+  }
+  return normalizedPackageTypes;
+}
+
+async function listCarriers() {
+  const payload = await shipStationRequest('/v2/carriers', {
+    query: { page_size: 100 },
+  });
+  return extractCarriers(payload)
+    .map(normalizeCarrier)
+    .filter((carrier) => carrier?.carrierId);
+}
+
+async function listCustomPackageTypes() {
+  const payload = await shipStationRequest('/v2/packages');
+  return dedupePackageTypes(extractPackageTypes(payload));
+}
+
+function getCarrierLookupCandidates(shipment = {}) {
+  return Array.from(new Set([
+    shipment?.carrierId,
+    shipment?.raw?.carrier_id,
+    shipment?.raw?.carrierId,
+    shipment?.carrierCode,
+    shipment?.raw?.carrier_code,
+    shipment?.raw?.carrierCode,
+  ].map(normalizeId).filter(Boolean)));
+}
+
+function carrierMatchesShipment(carrier, shipment) {
+  if (!carrier || !shipment) return false;
+  const shipmentValues = [
+    shipment.carrierId,
+    shipment.raw?.carrier_id,
+    shipment.raw?.carrierId,
+    shipment.carrierCode,
+    shipment.raw?.carrier_code,
+    shipment.raw?.carrierCode,
+    shipment.carrierFriendlyName,
+    shipment.raw?.carrier_friendly_name,
+    shipment.raw?.carrierFriendlyName,
+    shipment.serviceCode,
+    shipment.raw?.service_code,
+    shipment.raw?.serviceCode,
+    shipment.serviceType,
+    shipment.raw?.service_type,
+    shipment.raw?.serviceType,
+    shipment.requestedShipmentService,
+    shipment.raw?.requested_shipment_service,
+    shipment.raw?.requestedShipmentService,
+  ].filter(Boolean);
+  const shipmentCodes = shipmentValues.map(normalizeCompare).filter(Boolean);
+  const carrierValues = [
+    carrier.carrierId,
+    carrier.carrierCode,
+    carrier.name,
+    carrier.raw?.nickname,
+    carrier.raw?.friendly_name,
+    carrier.raw?.friendlyName,
+    carrier.raw?.name,
+    carrier.raw?.carrier_name,
+    carrier.raw?.carrierName,
+  ].filter(Boolean);
+  const carrierCodes = carrierValues.map(normalizeCompare).filter(Boolean);
+  if (carrierCodes.some((code) => shipmentCodes.includes(code))) return true;
+
+  const shipmentTextValues = shipmentValues.map(normalizeSearchText).filter(Boolean);
+  const carrierTextValues = carrierValues.map(normalizeSearchText).filter(Boolean);
+  if (carrierTextValues.some((carrierText) => (
+    shipmentTextValues.some((shipmentText) => (
+      shipmentText === carrierText
+      || shipmentText.includes(carrierText)
+      || carrierText.includes(shipmentText)
+    ))
+  ))) {
+    return true;
+  }
+
+  const serviceValues = (carrier.services || []).flatMap((service) => [
+    service.serviceCode,
+    service.name,
+  ]).filter(Boolean);
+  const serviceCodes = serviceValues.map(normalizeCompare).filter(Boolean);
+  if (serviceCodes.some((code) => shipmentCodes.includes(code))) return true;
+
+  const serviceTextValues = serviceValues.map(normalizeSearchText).filter(Boolean);
+  return serviceTextValues.some((serviceText) => (
+    shipmentTextValues.some((shipmentText) => (
+      shipmentText === serviceText
+      || shipmentText.includes(serviceText)
+      || serviceText.includes(shipmentText)
+    ))
+  ));
+}
+
+async function listPackageTypesForShipment(shipment) {
+  if (!shipment) return { packageTypes: [], attempts: [] };
+  const attempts = [];
+  const collectedPackageTypes = [];
+
+  const addPackageTypes = (source, packageTypes, extra = {}) => {
+    const normalizedPackageTypes = dedupePackageTypes(packageTypes);
+    attempts.push({
+      source,
+      ok: true,
+      packageTypeCount: normalizedPackageTypes.length,
+      ...extra,
+    });
+    collectedPackageTypes.push(...normalizedPackageTypes);
+  };
+
+  for (const candidate of getCarrierLookupCandidates(shipment)) {
+    try {
+      const packageTypes = await listCarrierPackageTypes(candidate);
+      addPackageTypes('shipment_candidate', packageTypes, { carrier: candidate });
+    } catch (err) {
+      attempts.push({ source: 'shipment_candidate', carrier: candidate, ok: false, error: err.message || String(err) });
+    }
+  }
+
+  let carriers = [];
+  try {
+    carriers = await listCarriers();
+    attempts.push({ source: 'carriers', ok: true, carrierCount: carriers.length });
+  } catch (err) {
+    attempts.push({ source: 'carriers', ok: false, error: err.message || String(err) });
+  }
+
+  const matchedCarriers = carriers.filter((carrier) => carrierMatchesShipment(carrier, shipment));
+  matchedCarriers.forEach((carrier) => {
+    addPackageTypes('matched_carrier_embedded', carrier.packages || [], {
+      carrier: carrier.carrierId,
+      carrierCode: carrier.carrierCode,
+      carrierName: carrier.name,
+    });
+  });
+
+  for (const carrier of matchedCarriers) {
+    try {
+      const packageTypes = await listCarrierPackageTypes(carrier.carrierId);
+      addPackageTypes('matched_carrier_detail', packageTypes, {
+        carrier: carrier.carrierId,
+        carrierCode: carrier.carrierCode,
+        carrierName: carrier.name,
+      });
+    } catch (err) {
+      attempts.push({
+        source: 'matched_carrier_detail',
+        carrier: carrier.carrierId,
+        carrierCode: carrier.carrierCode,
+        carrierName: carrier.name,
+        ok: false,
+        error: err.message || String(err),
+      });
+    }
+  }
+
+  if (!dedupePackageTypes(collectedPackageTypes).length && carriers.length) {
+    const unmatchedCarriers = carriers.filter((carrier) => !matchedCarriers.some((matched) => matched.carrierId === carrier.carrierId));
+    attempts.push({
+      source: 'all_carriers_fallback',
+      ok: true,
+      carrierCount: unmatchedCarriers.length,
+    });
+
+    unmatchedCarriers.forEach((carrier) => {
+      addPackageTypes('all_carriers_embedded', carrier.packages || [], {
+        carrier: carrier.carrierId,
+        carrierCode: carrier.carrierCode,
+        carrierName: carrier.name,
+      });
+    });
+
+    for (const carrier of unmatchedCarriers) {
+      try {
+        const packageTypes = await listCarrierPackageTypes(carrier.carrierId);
+        addPackageTypes('all_carriers_detail', packageTypes, {
+          carrier: carrier.carrierId,
+          carrierCode: carrier.carrierCode,
+          carrierName: carrier.name,
+        });
+      } catch (err) {
+        attempts.push({
+          source: 'all_carriers_detail',
+          carrier: carrier.carrierId,
+          carrierCode: carrier.carrierCode,
+          carrierName: carrier.name,
+          ok: false,
+          error: err.message || String(err),
+        });
+      }
+    }
+  }
+
+  try {
+    const customPackageTypes = await listCustomPackageTypes();
+    addPackageTypes('custom_package_types', customPackageTypes);
+  } catch (err) {
+    attempts.push({ source: 'custom_package_types', ok: false, error: err.message || String(err) });
+  }
+
+  return { packageTypes: dedupePackageTypes(collectedPackageTypes), attempts };
+}
+
+function getMoneyCurrency(value, fallbackCurrency = '') {
+  if (value && typeof value === 'object') {
+    return normalizeId(value.currency || value.currency_code || value.currencyCode || fallbackCurrency).toUpperCase();
+  }
+  return normalizeId(fallbackCurrency).toUpperCase();
+}
+
+function parseMoneyAmount(value) {
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const direct = Number(value);
+  if (Number.isFinite(direct)) return direct;
+  const stripped = String(value || '').replace(/[^0-9.-]/g, '');
+  const parsed = Number(stripped);
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function normalizeMoneyLike(value, fallbackCurrency = '') {
+  if (value && typeof value === 'object') {
+    return {
+      amount: parseMoneyAmount(value.amount ?? value.value ?? 0),
+      currency: getMoneyCurrency(value, fallbackCurrency),
+    };
+  }
+  return {
+    amount: parseMoneyAmount(value),
+    currency: normalizeId(fallbackCurrency).toUpperCase(),
+  };
+}
+
+function firstMoneyLike(product, keys = [], fallbackCurrency = '') {
+  for (const key of keys) {
+    const value = product?.[key];
+    if (value !== undefined && value !== null && value !== '') {
+      return normalizeMoneyLike(value, fallbackCurrency);
+    }
+  }
+  return { amount: 0, currency: normalizeId(fallbackCurrency).toUpperCase() };
+}
+
+function sumMoneyLikes(product, keys = [], fallbackCurrency = '') {
+  let amount = 0;
+  let currency = normalizeId(fallbackCurrency).toUpperCase();
+  keys.forEach((key) => {
+    const value = product?.[key];
+    if (value === undefined || value === null || value === '') return;
+    const money = normalizeMoneyLike(value, currency || fallbackCurrency);
+    const nextAmount = Number(money.amount || 0);
+    if (Number.isFinite(nextAmount)) amount += nextAmount;
+    if (!currency && money.currency) currency = money.currency;
+  });
+  return {
+    amount,
+    currency: currency || normalizeId(fallbackCurrency).toUpperCase(),
+  };
+}
+
+function addMoneyLikeAmounts(base, addition, fallbackCurrency = '') {
+  const baseAmount = Number(base?.amount || 0);
+  const additionAmount = Number(addition?.amount || 0);
+  const amount = (Number.isFinite(baseAmount) ? baseAmount : 0)
+    + (Number.isFinite(additionAmount) ? additionAmount : 0);
+  const currency = normalizeId(
+    base?.currency
+    || addition?.currency
+    || fallbackCurrency
+  ).toUpperCase();
+  return {
+    amount,
+    currency,
+  };
+}
+
+function extractShipmentProductRows(shipment) {
+  const raw = shipment || {};
+  const packages = Array.isArray(raw.packages) ? raw.packages : [];
+  const candidates = [
+    raw.products,
+    raw.items,
+    raw.line_items,
+    raw.lineItems,
+    raw.order_items,
+    raw.orderItems,
+    raw.customs?.contents,
+    raw.customs?.items,
+    raw.customs?.customs_items,
+    ...packages.map((pkg) => pkg?.products),
+  ];
+  const seen = new Set();
+  return candidates
+    .flatMap((value) => (Array.isArray(value) ? value : []))
+    .filter((product) => {
+      if (!product || typeof product !== 'object' || seen.has(product)) return false;
+      seen.add(product);
+      return true;
+    });
+}
+
+function normalizeShipmentProduct(product) {
+  if (!product || typeof product !== 'object') return null;
+  const fallbackCurrency = normalizeId(
+    product.currency
+    || product.currency_code
+    || product.currencyCode
+    || product.total_paid?.currency
+    || product.totalPaid?.currency
+    || product.total?.currency
+    || 'GBP'
+  ).toUpperCase() || 'GBP';
+  const quantity = Math.max(1, Math.floor(Number(
+    product.quantity
+    ?? product.qty
+    ?? product.quantity_ordered
+    ?? product.quantityOrdered
+    ?? 1
+  ) || 1));
+  const totalPaid = firstMoneyLike(product, [
+    'total_paid',
+    'totalPaid',
+    'amount_paid',
+    'amountPaid',
+    'total_paid_amount',
+    'totalPaidAmount',
+  ], fallbackCurrency);
+  const total = firstMoneyLike(product, [
+    'total',
+    'total_amount',
+    'totalAmount',
+    'value',
+    'customs_value',
+    'customsValue',
+  ], totalPaid.currency || fallbackCurrency);
+  const generalTax = sumMoneyLikes(product, [
+    'tax',
+    'tax_amount',
+    'taxAmount',
+    'sales_tax',
+    'salesTax',
+    'sales_tax_amount',
+    'salesTaxAmount',
+    'vat',
+    'vat_amount',
+    'vatAmount',
+  ], totalPaid.currency || total.currency || fallbackCurrency);
+  const paidTax = sumMoneyLikes(product, [
+    'tax_paid',
+    'taxPaid',
+    'tax_paid_amount',
+    'taxPaidAmount',
+    'paid_tax',
+    'paidTax',
+    'paid_tax_amount',
+    'paidTaxAmount',
+  ], totalPaid.currency || generalTax.currency || fallbackCurrency);
+  const orderTax = sumMoneyLikes(product, [
+    'total_tax',
+    'totalTax',
+    'total_tax_amount',
+    'totalTaxAmount',
+  ], total.currency || generalTax.currency || fallbackCurrency);
+  const totalPaidTax = Number(paidTax.amount || 0) > 0 ? paidTax : generalTax;
+  const totalTax = Number(orderTax.amount || 0) > 0 ? orderTax : generalTax;
+  const totalPaidBaseAmount = Number(totalPaid.amount || 0);
+  const totalBaseAmount = Number(total.amount || 0);
+  const totalPaidWithTax = totalPaidBaseAmount > 0
+    ? addMoneyLikeAmounts(totalPaid, totalPaidTax, fallbackCurrency)
+    : { amount: 0, currency: normalizeId(totalPaid.currency || fallbackCurrency).toUpperCase() };
+  const totalWithTax = totalBaseAmount > 0
+    ? addMoneyLikeAmounts(total, totalTax, totalPaidWithTax.currency || fallbackCurrency)
+    : total;
+  const selected = totalPaidBaseAmount > 0 ? totalPaidWithTax : totalWithTax;
+  const amount = Number(selected.amount || 0);
+  const currency = normalizeId(selected.currency || totalPaidWithTax.currency || totalWithTax.currency || fallbackCurrency).toUpperCase() || 'GBP';
+
+  return {
+    sku: normalizeId(product.sku || product.product_sku || product.productSku || product.item_sku || product.itemSku || product.warehouse_sku || product.warehouseSku),
+    name: normalizeId(product.name || product.product_name || product.productName || product.description || product.title),
+    quantity,
+    totalPaid: {
+      amount: Number(totalPaidWithTax.amount || 0),
+      currency: normalizeId(totalPaidWithTax.currency || currency).toUpperCase() || currency,
+    },
+    total: {
+      amount: Number(totalWithTax.amount || 0),
+      currency: normalizeId(totalWithTax.currency || currency).toUpperCase() || currency,
+    },
+    tax: {
+      amount: Number(totalTax.amount || totalPaidTax.amount || 0),
+      currency: normalizeId(totalTax.currency || totalPaidTax.currency || currency).toUpperCase() || currency,
+    },
+    valueAmount: Number.isFinite(amount) && amount > 0 ? Number(amount.toFixed(2)) : 0,
+    unitValueAmount: Number.isFinite(amount) && amount > 0 ? Number((amount / quantity).toFixed(4)) : 0,
+    valueCurrency: currency,
+    valueSource: totalPaidBaseAmount > 0 ? 'total_paid_with_tax' : 'total_with_tax',
+    raw: product,
+  };
+}
+
 function summarizeRateForLog(rate) {
   if (!rate) return null;
   return {
@@ -294,6 +844,9 @@ function normalizeShipment(shipment) {
         insuredValue: normalizeMoney(pkg.insured_value || pkg.insuredValue),
       }))
     : [];
+  const products = extractShipmentProductRows(shipment)
+    .map(normalizeShipmentProduct)
+    .filter(Boolean);
 
   return {
     shipmentId: normalizeId(shipment.shipment_id || shipment.shipmentId),
@@ -316,6 +869,7 @@ function normalizeShipment(shipment) {
     shipTo: normalizeAddress(shipment.ship_to || shipment.shipTo),
     shipFrom: normalizeAddress(shipment.ship_from || shipment.shipFrom),
     packages,
+    products,
     raw: shipment,
   };
 }
@@ -415,8 +969,9 @@ function normalizePackageUpdateEntries(packages = []) {
       const weightGrams = Math.max(1, Math.floor(Number(pkg?.weightGrams) || 0));
       const dimensions = normalizePackageDimensionsForWrite(pkg?.dimensions || pkg?.packageDimensions);
       const insuredValue = normalizePackageInsuredValueForWrite(pkg);
+      const packageCode = normalizeId(pkg?.packageCode || pkg?.package_code);
       if (!weightGrams || !dimensions) return null;
-      return { weightGrams, dimensions, insuredValue };
+      return { weightGrams, dimensions, insuredValue, packageCode };
     })
     .filter(Boolean);
 }
@@ -472,12 +1027,19 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
         nextPackage[field] = pkg[field];
       }
     });
+    const existingInsuredValue = normalizePackageInsuranceForPayload(pkg);
+    if (existingInsuredValue && !hasPositivePackageInsurance(nextPackage)) {
+      nextPackage.insured_value = existingInsuredValue;
+    }
     if (packageCount > 1) {
       nextPackage.package_code = 'package';
     }
+    if (packageUpdate.packageCode) {
+      nextPackage.package_code = packageUpdate.packageCode;
+    }
     nextPackage.weight = { value: packageUpdate.weightGrams, unit: 'gram' };
     nextPackage.dimensions = packageUpdate.dimensions;
-    if (packageUpdate.insuredValue !== undefined) {
+    if (packageUpdate.insuredValue !== undefined && !hasPositivePackageInsurance(nextPackage)) {
       if (packageUpdate.insuredValue) {
         nextPackage.insured_value = packageUpdate.insuredValue;
       } else {
@@ -490,8 +1052,13 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
     return nextPackage;
   });
 
-  const hasExplicitInsuranceValues = normalizedPackages.some((pkg) => pkg.insuredValue !== undefined);
-  const hasPositiveInsuranceValue = normalizedPackages.some((pkg) => Boolean(pkg.insuredValue));
+  const missingInsurancePackageIndexes = payload.packages
+    .map((pkg, index) => (hasPositivePackageInsurance(pkg) ? -1 : index))
+    .filter((index) => index >= 0);
+  const hasExplicitInsuranceValues = missingInsurancePackageIndexes
+    .some((index) => normalizedPackages[index]?.insuredValue !== undefined);
+  const hasPositiveInsuranceValue = missingInsurancePackageIndexes
+    .some((index) => Boolean(normalizedPackages[index]?.insuredValue));
   if (hasExplicitInsuranceValues) {
     if (hasPositiveInsuranceValue) {
       const currentProvider = normalizeId(raw.insurance_provider || raw.insuranceProvider).toLowerCase();
@@ -503,10 +1070,14 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
       ).toUpperCase() || 'GBP';
       payload.packages = payload.packages.map((pkg, index) => ({
         ...pkg,
-        insured_value: normalizedPackages[index]?.insuredValue || {
-          amount: 0,
-          currency: fallbackCurrency,
-        },
+        ...(hasPositivePackageInsurance(pkg)
+          ? {}
+          : {
+              insured_value: normalizedPackages[index]?.insuredValue || {
+                amount: 0,
+                currency: fallbackCurrency,
+              },
+            }),
       }));
     } else {
       payload.insurance_provider = 'none';
@@ -566,6 +1137,11 @@ async function updateShipmentPackages({ shipmentId, packages = [] }) {
     carrierIdPresent: Boolean(payload.carrier_id),
     serviceCode: payload.service_code || '',
     requestedShipmentService: payload.requested_shipment_service || '',
+  });
+  console.log('[ShipStation rate check] ShipStation shipment PUT body', {
+    method: 'PUT',
+    path: `/v2/shipments/${safeShipmentId}`,
+    body: payload,
   });
 
   const updated = await shipStationRequest(`/v2/shipments/${encodeURIComponent(safeShipmentId)}`, {
@@ -1013,6 +1589,8 @@ module.exports = {
   getShipmentById,
   getShipmentRates,
   getShipmentRatesDetailed,
+  listCarrierPackageTypes,
+  listPackageTypesForShipment,
   listLabelsForShipment,
   lookupShipmentForOrder,
   purchaseLabelForRate,

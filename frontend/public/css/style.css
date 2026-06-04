@@ -1056,7 +1056,7 @@ button:hover { background: #0056b3; }
 
 .pick-shipping-details {
   display: grid;
-  grid-template-columns: repeat(4, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
   gap: 10px;
   margin-top: 12px;
 }
@@ -1199,6 +1199,46 @@ button:hover { background: #0056b3; }
   display: grid;
   grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 8px;
+}
+
+.pick-shipping-package-type-label {
+  display: grid;
+  gap: 6px;
+}
+
+.pick-shipping-package-type-select {
+  min-height: 68px;
+  width: 100%;
+  box-sizing: border-box;
+  margin: 0;
+  border: 2px solid #304054;
+  border-radius: 8px;
+  appearance: none;
+  background-color: #0f141b;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #d5e4f2 50%),
+    linear-gradient(135deg, #d5e4f2 50%, transparent 50%);
+  background-position:
+    calc(100% - 25px) 50%,
+    calc(100% - 16px) 50%;
+  background-size: 9px 9px, 9px 9px;
+  background-repeat: no-repeat;
+  color: #e6edf3;
+  padding: 14px 44px 14px 16px;
+  font-size: 24px;
+  font-weight: 900;
+  line-height: 1;
+  text-align: center;
+}
+
+.pick-shipping-package-type-warning {
+  padding: 12px;
+  border: 1px solid #6b4a1f;
+  border-radius: 8px;
+  background: #231908;
+  color: #ffd596;
+  font-size: 14px;
+  font-weight: 800;
 }
 
 .pick-shipping-custom-dimensions label {
@@ -6028,6 +6068,21 @@ html.theme-light .pick-shipping-rate-check:disabled:not(.is-loading) {
 html.theme-light .pick-shipping-custom-dimensions label,
 html.theme-light .pick-shipping-dimension-unit {
   color: #60758b;
+}
+
+html.theme-light .pick-shipping-package-type-select {
+  background-color: #ffffff;
+  border-color: #b7cadf;
+  color: #1b2f43;
+  background-image:
+    linear-gradient(45deg, transparent 50%, #31516e 50%),
+    linear-gradient(135deg, #31516e 50%, transparent 50%);
+}
+
+html.theme-light .pick-shipping-package-type-warning {
+  border-color: #e0c48f;
+  background: #fff6e5;
+  color: #7c5514;
 }
 
 html.theme-light .pick-shipping-weight-unit {

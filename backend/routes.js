@@ -47,6 +47,8 @@ const {
 } = require('./preformBuildService');
 const {
   getShipmentRatesDetailed,
+  getShipmentById,
+  listPackageTypesForShipment,
   listLabelsForShipment,
   lookupShipmentForOrder,
   purchaseLabelForRate,
@@ -766,6 +768,11 @@ function isRoyalMailShippingEntity(entity) {
     entity?.raw?.requested_shipment_service,
   ].filter(Boolean).join(' ').toLowerCase();
   return /\broyal\s*mail\b/.test(haystack) || /\broyal_mail\b/.test(haystack);
+}
+
+function isUkCountryCode(countryCode) {
+  const code = String(countryCode || '').trim().toUpperCase();
+  return code === 'GB' || code === 'UK';
 }
 
 function summarizeShippingRate(rate, quote = null) {
@@ -4018,7 +4025,17 @@ router.post('/api/pick-list/shipping/lookup', async (req, res) => {
 
     const identifiers = buildShippingOrderIdentifiers({ order, barcode: normalizedBarcode });
     const lookup = await lookupShipmentForOrder({ identifiers });
-    const shipment = lookup.shipment || null;
+    let shipment = lookup.shipment || null;
+    if (shipment?.shipmentId) {
+      try {
+        shipment = await getShipmentById(shipment.shipmentId) || shipment;
+      } catch (detailErr) {
+        console.warn('[ShipStation package types] Could not refresh shipment before package type lookup', {
+          shipmentId: shipment.shipmentId,
+          error: detailErr.message || String(detailErr),
+        });
+      }
+    }
     const existingLabels = shipment?.shipmentId
       ? await getKnownShippingLabelsForShipment({
           shop: auth.shop,
@@ -4028,6 +4045,36 @@ router.post('/api/pick-list/shipping/lookup', async (req, res) => {
           reusableOnly: false,
         })
       : [];
+    let packageTypes = [];
+    let packageTypesError = '';
+    let packageTypesAttempts = [];
+    if (shipment && isUkCountryCode(shipment?.shipTo?.countryCode)) {
+      try {
+        const packageTypeResult = await listPackageTypesForShipment(shipment);
+        packageTypes = packageTypeResult.packageTypes || [];
+        packageTypesAttempts = packageTypeResult.attempts || [];
+        if (!packageTypes.length) {
+          packageTypesError = 'ShipStation did not return package types for this carrier.';
+        }
+        console.log('[ShipStation package types] Lookup completed', {
+          shipmentId: shipment.shipmentId,
+          carrierId: shipment.carrierId,
+          carrierCode: shipment.carrierCode,
+          carrierFriendlyName: shipment.carrierFriendlyName,
+          packageTypeCount: packageTypes.length,
+          attempts: packageTypesAttempts,
+        });
+      } catch (packageErr) {
+        packageTypesError = packageErr.message || 'Could not load ShipStation package types.';
+        console.error('[ShipStation package types] Failed to load carrier packages', {
+          shipmentId: shipment.shipmentId,
+          carrierId: shipment.carrierId,
+          carrierCode: shipment.carrierCode,
+          carrierFriendlyName: shipment.carrierFriendlyName,
+          error: packageTypesError,
+        });
+      }
+    }
 
     return res.json({
       success: true,
@@ -4035,6 +4082,9 @@ router.post('/api/pick-list/shipping/lookup', async (req, res) => {
       payment,
       shipmentFound: Boolean(shipment),
       shipment,
+      packageTypes,
+      packageTypesError,
+      packageTypesAttempts,
       selectedAttemptLabel: lookup.selectedAttemptLabel || '',
       attemptedIdentifiers: lookup.attemptedIdentifiers || identifiers,
       attemptedQueries: lookup.attemptedQueries || [],
@@ -4063,6 +4113,10 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       weightGrams,
       packageDimensions,
     });
+    const selectedPackageCode = String(req.body?.packageCode || '').trim();
+    const shippingPackagesWithPackageCode = selectedPackageCode
+      ? shippingPackages.map((pkg) => ({ ...pkg, packageCode: selectedPackageCode }))
+      : shippingPackages;
     if (!normalizedBarcode || !shipmentId) {
       return res.status(400).json({ success: false, error: 'Missing barcode or shipment id' });
     }
@@ -4074,8 +4128,10 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       shop: auth.shop,
       barcode: normalizedBarcode,
       shipmentId,
-      packageCount: shippingPackages.length,
-      packages: shippingPackages,
+      packageCount: shippingPackagesWithPackageCode.length,
+      packageCode: selectedPackageCode,
+      rawRequestBody: req.body,
+      packages: shippingPackagesWithPackageCode,
     });
 
     const client = shopifyClient(auth.session);
@@ -4099,15 +4155,20 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       orderNumber: order.name,
       financialStatus: payment.financialStatus,
       shipmentId,
-      packageCount: shippingPackages.length,
-      packages: shippingPackages,
+      packageCount: shippingPackagesWithPackageCode.length,
+      packageCode: selectedPackageCode,
+      packages: shippingPackagesWithPackageCode,
     });
 
-    const updatedShipment = await updateShipmentPackages({ shipmentId, packages: shippingPackages });
+    const updatedShipment = await updateShipmentPackages({
+      shipmentId,
+      packages: shippingPackagesWithPackageCode,
+    });
+    const ratePackageCode = updatedShipment?.packages?.[0]?.packageCode || updatedShipment?.packageCode || selectedPackageCode || '';
     const rateResult = await getShipmentRatesDetailed(shipmentId, {
       carrierId: updatedShipment?.carrierId || '',
       selectedServiceCode: updatedShipment?.serviceCode || '',
-      packageCode: updatedShipment?.packages?.[0]?.packageCode || updatedShipment?.packageCode || '',
+      packageCode: ratePackageCode,
       preferredCurrency: 'GBP',
     });
     const rates = Array.isArray(rateResult.rates) ? rateResult.rates : [];
@@ -4123,6 +4184,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
         serviceType: updatedShipment?.serviceType || '',
         requestedShipmentService: updatedShipment?.requestedShipmentService || '',
         packageCode: updatedShipment?.packageCode || '',
+        ratePackageCode,
         confirmation: updatedShipment?.confirmation || '',
         insuranceProvider: updatedShipment?.insuranceProvider || '',
         shipDate: updatedShipment?.shipDate || '',
@@ -4172,7 +4234,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       orderNumber: order.name,
       shipment: updatedShipment,
       rate,
-      weightGrams: shippingPackages.reduce((sum, pkg) => sum + Math.max(1, Number(pkg.weightGrams) || 1), 0),
+      weightGrams: shippingPackagesWithPackageCode.reduce((sum, pkg) => sum + Math.max(1, Number(pkg.weightGrams) || 1), 0),
       expiresAt,
     })).filter(Boolean);
 
@@ -4195,6 +4257,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       shipmentId: req.body?.shipmentId,
       weightGrams: req.body?.weightGrams,
       packageDimensions: req.body?.packageDimensions,
+      packageCode: req.body?.packageCode,
       packages: req.body?.packages,
     });
     const rateDiagnostics = err.rateDiagnostics || {
@@ -4206,6 +4269,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
           shipmentId: req.body?.shipmentId,
           weightGrams: req.body?.weightGrams,
           packageDimensions: req.body?.packageDimensions,
+          packageCode: req.body?.packageCode,
           packages: req.body?.packages,
         },
       },

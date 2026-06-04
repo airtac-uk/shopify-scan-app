@@ -70,6 +70,8 @@ const SHIPPING_PACKAGE_PRESETS = [
   { key: 'tank_box', label: 'Tank Box', length: 50, width: 75, height: 75 },
   { key: 'custom', label: 'Custom', custom: true },
 ];
+const SHIPSTATION_ROYAL_MAIL_SMALL_PARCEL_CODE = 'royal_mail_small_parcel';
+const SHIPSTATION_ROYAL_MAIL_MEDIUM_PARCEL_CODE = 'royal_mail_medium_parcel';
 
 function appendOrderNoteWarning(message, data) {
   const warning = String(data?.orderNoteWarning || '').trim();
@@ -348,6 +350,10 @@ function createShippingPanelInitialState(barcode = currentOrderBarcode) {
       unit: 'centimeter',
     },
     packages: [],
+    packageTypes: [],
+    packageTypesError: '',
+    packageTypesAttempts: [],
+    selectedPackageCode: '',
   };
 }
 
@@ -456,6 +462,101 @@ function getVerifyShippingModalTitle() {
   const orderLabel = shippingPanelState.orderNumber || currentOrderNumber || currentOrderBarcode || 'Shipping';
   const countryLabel = getShippingOrderCountryLabel();
   return countryLabel ? `${orderLabel} - ${countryLabel}` : orderLabel;
+}
+
+function getShippingDestinationCountryCode(shipment = shippingPanelState.shipment) {
+  return String(
+    shipment?.shipTo?.countryCode
+    || shipment?.raw?.ship_to?.country_code
+    || shipment?.raw?.ship_to?.countryCode
+    || shipment?.raw?.shipTo?.country_code
+    || shipment?.raw?.shipTo?.countryCode
+    || ''
+  ).trim().toUpperCase();
+}
+
+function isUkShippingShipment(shipment = shippingPanelState.shipment) {
+  const countryCode = getShippingDestinationCountryCode(shipment);
+  return countryCode === 'GB' || countryCode === 'UK';
+}
+
+function normalizeShippingPackageCode(value) {
+  return String(value || '').trim();
+}
+
+function getShipmentSelectedPackageCode(shipment = shippingPanelState.shipment) {
+  return normalizeShippingPackageCode(
+    shipment?.packages?.[0]?.packageCode
+    || shipment?.packageCode
+    || shipment?.raw?.packages?.[0]?.package_code
+    || shipment?.raw?.packages?.[0]?.packageCode
+    || shipment?.raw?.package_code
+    || shipment?.raw?.packageCode
+  );
+}
+
+function getShippingPackageTypeOptions() {
+  return Array.isArray(shippingPanelState.packageTypes)
+    ? shippingPanelState.packageTypes.filter((pkg) => normalizeShippingPackageCode(pkg?.packageCode))
+    : [];
+}
+
+function getDefaultSelectedPackageCode(shipment = shippingPanelState.shipment, packageTypes = shippingPanelState.packageTypes) {
+  const options = Array.isArray(packageTypes) ? packageTypes : [];
+  const currentCode = getShipmentSelectedPackageCode(shipment);
+  if (currentCode && options.some((pkg) => normalizeShippingPackageCode(pkg.packageCode) === currentCode)) {
+    return currentCode;
+  }
+  return normalizeShippingPackageCode(options[0]?.packageCode);
+}
+
+function findShippingPackageTypeCode(packageTypes, packageCode) {
+  const targetCode = normalizeShippingPackageCode(packageCode);
+  const match = (Array.isArray(packageTypes) ? packageTypes : [])
+    .find((pkg) => normalizeShippingPackageCode(pkg?.packageCode) === targetCode);
+  return normalizeShippingPackageCode(match?.packageCode);
+}
+
+function getShippingDimensionsVolume(dimensions) {
+  const length = Number(dimensions?.length);
+  const width = Number(dimensions?.width);
+  const height = Number(dimensions?.height);
+  if (![length, width, height].every((value) => Number.isFinite(value) && value > 0)) {
+    return 0;
+  }
+  return length * width * height;
+}
+
+function isShippingPackageLargerThanSmall(row) {
+  const smallDimensions = getPresetDimensions('small');
+  const packageDimensions = getShippingPackageRowDimensions(row);
+  if (!smallDimensions || !packageDimensions) return false;
+  return getShippingDimensionsVolume(packageDimensions) > getShippingDimensionsVolume(smallDimensions);
+}
+
+function getAutoPackageTypeCodeForPackageRows(rows, packageTypes = shippingPanelState.packageTypes, shipment = shippingPanelState.shipment) {
+  if (!isUkShippingShipment(shipment)) return '';
+  const smallParcelCode = findShippingPackageTypeCode(packageTypes, SHIPSTATION_ROYAL_MAIL_SMALL_PARCEL_CODE);
+  const mediumParcelCode = findShippingPackageTypeCode(packageTypes, SHIPSTATION_ROYAL_MAIL_MEDIUM_PARCEL_CODE);
+  const hasPackageLargerThanSmall = (Array.isArray(rows) ? rows : []).some(isShippingPackageLargerThanSmall);
+  if (hasPackageLargerThanSmall) return mediumParcelCode || '';
+  return smallParcelCode || '';
+}
+
+function getPreferredSelectedPackageCode(shipment = shippingPanelState.shipment, packageTypes = shippingPanelState.packageTypes, packageRows = getShippingPackageRows()) {
+  return getAutoPackageTypeCodeForPackageRows(packageRows, packageTypes, shipment)
+    || getDefaultSelectedPackageCode(shipment, packageTypes);
+}
+
+function shouldShowShippingPackageTypeSelector() {
+  return isUkShippingShipment() && getShippingPackageTypeOptions().length > 0;
+}
+
+function hasRequiredShippingPackageTypeSelection() {
+  if (!isUkShippingShipment()) return true;
+  const packageTypes = getShippingPackageTypeOptions();
+  const selectedPackageCode = normalizeShippingPackageCode(shippingPanelState.selectedPackageCode);
+  return packageTypes.length > 0 && packageTypes.some((pkg) => normalizeShippingPackageCode(pkg.packageCode) === selectedPackageCode);
 }
 
 function formatShippingMetaValue(value) {
@@ -601,14 +702,170 @@ function getShippingPackageStateFromShipment(shipment) {
       },
       itemUnitIds: defaultItemUnitIds,
     })],
+    selectedPackageCode: getShipmentSelectedPackageCode(shipment),
+  };
+}
+
+function normalizeShippingProductNameKey(value) {
+  return String(value || '').trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+function getShipStationProductValueEntries() {
+  return (Array.isArray(shippingPanelState.shipment?.products) ? shippingPanelState.shipment.products : [])
+    .map((product) => {
+      const quantity = Math.max(1, Math.floor(Number(product?.quantity) || 1));
+      const unitValueAmount = Number(product?.unitValueAmount || 0);
+      if (!Number.isFinite(unitValueAmount) || unitValueAmount <= 0) return null;
+      return {
+        skuKey: normalizeVerifyCode(product?.sku),
+        nameKey: normalizeShippingProductNameKey(product?.name),
+        quantity,
+        unitValueAmount,
+        valueCurrency: String(product?.valueCurrency || 'GBP').trim().toUpperCase() || 'GBP',
+      };
+    })
+    .filter(Boolean);
+}
+
+function buildShipStationProductValueMap() {
+  const aggregate = new Map();
+  const addValue = (key, entry) => {
+    if (!key) return;
+    const current = aggregate.get(key) || {
+      amount: 0,
+      quantity: 0,
+      currency: entry.valueCurrency || 'GBP',
+    };
+    current.amount += Number(entry.unitValueAmount || 0) * Math.max(1, Number(entry.quantity) || 1);
+    current.quantity += Math.max(1, Number(entry.quantity) || 1);
+    if (!current.currency && entry.valueCurrency) current.currency = entry.valueCurrency;
+    aggregate.set(key, current);
+  };
+
+  getShipStationProductValueEntries().forEach((entry) => {
+    addValue(entry.skuKey ? `sku:${entry.skuKey}` : '', entry);
+    addValue(entry.nameKey ? `name:${entry.nameKey}` : '', entry);
+  });
+
+  return new Map(Array.from(aggregate.entries()).map(([key, value]) => [
+    key,
+    {
+      amount: value.quantity > 0 ? Number((value.amount / value.quantity).toFixed(4)) : 0,
+      currency: value.currency || 'GBP',
+    },
+  ]));
+}
+
+function getShipStationOrderValueTotal() {
+  let amount = 0;
+  let currency = '';
+  (Array.isArray(shippingPanelState.shipment?.products) ? shippingPanelState.shipment.products : [])
+    .forEach((product) => {
+      const productAmount = Number(product?.valueAmount || 0);
+      if (Number.isFinite(productAmount) && productAmount > 0) {
+        amount += productAmount;
+        if (!currency) {
+          currency = String(product?.valueCurrency || product?.total?.currency || product?.totalPaid?.currency || '').trim().toUpperCase();
+        }
+      }
+    });
+  return {
+    amount: Number(amount.toFixed(2)),
+    currency: currency || 'GBP',
+  };
+}
+
+function getShipStationValueForVerifyRow(row, valueMap = buildShipStationProductValueMap()) {
+  if (!row) return null;
+
+  if (row.isWholesaleBundle && Array.isArray(row.bundleParts) && row.bundleParts.length) {
+    let amount = 0;
+    let currency = '';
+    row.bundleParts.forEach((part) => {
+      const partQty = Math.max(1, Math.floor(Number(part?.quantity) || 1));
+      const skuKey = normalizeVerifyCode(part?.sku);
+      const nameKey = normalizeShippingProductNameKey(part?.productName);
+      const match = valueMap.get(skuKey ? `sku:${skuKey}` : '')
+        || valueMap.get(nameKey ? `name:${nameKey}` : '');
+      if (!match || !Number(match.amount)) return;
+      amount += Number(match.amount) * partQty;
+      if (!currency && match.currency) currency = match.currency;
+    });
+    if (amount > 0) {
+      return { amount: Number(amount.toFixed(4)), currency: currency || 'GBP' };
+    }
+  }
+
+  const sku = row?.sku && row.sku !== '(No SKU)' && row.sku !== 'Bundle'
+    ? normalizeVerifyCode(row.sku)
+    : '';
+  const nameKey = normalizeShippingProductNameKey(row?.productName || getVerifyDisplayLabel(row));
+  const match = valueMap.get(sku ? `sku:${sku}` : '')
+    || valueMap.get(nameKey ? `name:${nameKey}` : '');
+  return match && Number(match.amount) > 0 ? match : null;
+}
+
+function buildShipStationValueContext() {
+  const valueMap = buildShipStationProductValueMap();
+  const orderValue = getShipStationOrderValueTotal();
+  const rows = Array.isArray(verifyItems) ? verifyItems : [];
+  let matchedTotal = 0;
+  let unmatchedQty = 0;
+
+  rows.forEach((row) => {
+    const requiredQty = Math.max(0, Math.floor(Number(row?.requiredQty) || 0));
+    if (!requiredQty) return;
+    const shipStationValue = getShipStationValueForVerifyRow(row, valueMap);
+    if (shipStationValue && Number(shipStationValue.amount) > 0) {
+      matchedTotal += Number(shipStationValue.amount) * requiredQty;
+    } else {
+      unmatchedQty += requiredQty;
+    }
+  });
+
+  const remainingAmount = Math.max(0, Number(orderValue.amount || 0) - matchedTotal);
+  return {
+    valueMap,
+    fallbackUnitValue: unmatchedQty > 0 && remainingAmount > 0
+      ? {
+          amount: Number((remainingAmount / unmatchedQty).toFixed(4)),
+          currency: orderValue.currency || 'GBP',
+        }
+      : null,
+  };
+}
+
+function getShippingUnitValueForVerifyRow(row, valueContext = buildShipStationValueContext()) {
+  const valueMap = valueContext?.valueMap || buildShipStationProductValueMap();
+  const shipStationValue = getShipStationValueForVerifyRow(row, valueMap);
+  if (shipStationValue && Number(shipStationValue.amount) > 0) {
+    return {
+      amount: Number(shipStationValue.amount),
+      currency: String(shipStationValue.currency || 'GBP').trim().toUpperCase() || 'GBP',
+    };
+  }
+
+  if (valueContext?.fallbackUnitValue && Number(valueContext.fallbackUnitValue.amount) > 0) {
+    return {
+      amount: Number(valueContext.fallbackUnitValue.amount),
+      currency: String(valueContext.fallbackUnitValue.currency || 'GBP').trim().toUpperCase() || 'GBP',
+    };
+  }
+
+  const fallbackAmount = Number(row?.unitValueAmount || 0);
+  return {
+    amount: Number.isFinite(fallbackAmount) && fallbackAmount > 0 ? fallbackAmount : 0,
+    currency: String(row?.valueCurrency || row?.priceCurrency || 'GBP').trim().toUpperCase() || 'GBP',
   };
 }
 
 function getShippingAssignableItems() {
+  const shipStationValueContext = buildShipStationValueContext();
   return (verifyItems || []).flatMap((row) => {
     const requiredQty = Math.max(0, Math.floor(Number(row?.requiredQty) || 0));
-    const valueAmount = Number(row?.unitValueAmount || 0);
-    const valueCurrency = String(row?.valueCurrency || row?.priceCurrency || 'GBP').trim().toUpperCase() || 'GBP';
+    const rowValue = getShippingUnitValueForVerifyRow(row, shipStationValueContext);
+    const valueAmount = Number(rowValue.amount || 0);
+    const valueCurrency = String(rowValue.currency || 'GBP').trim().toUpperCase() || 'GBP';
     const baseLabel = row?.productName || getVerifyDisplayLabel(row);
     const skuLabel = row?.sku && row.sku !== '(No SKU)' && row.sku !== 'Bundle'
       ? row.sku
@@ -692,6 +949,7 @@ function getShippingPackageInsuranceValue(row) {
 }
 
 function getShippingAllocationRows() {
+  const shipStationValueContext = buildShipStationValueContext();
   return (verifyItems || [])
     .map((row) => {
       const requiredQty = Math.max(0, Math.floor(Number(row?.requiredQty) || 0));
@@ -701,8 +959,9 @@ function getShippingAllocationRows() {
         ? row.sku
         : '';
       const productLabel = row?.productName || getVerifyDisplayLabel(row);
-      const valueAmount = Number(row?.unitValueAmount || 0);
-      const valueCurrency = String(row?.valueCurrency || row?.priceCurrency || 'GBP').trim().toUpperCase() || 'GBP';
+      const rowValue = getShippingUnitValueForVerifyRow(row, shipStationValueContext);
+      const valueAmount = Number(rowValue.amount || 0);
+      const valueCurrency = String(rowValue.currency || 'GBP').trim().toUpperCase() || 'GBP';
 
       return {
         rowKey: row.key,
@@ -842,7 +1101,6 @@ function getSelectedShippingPackageDimensions() {
 
 function getNormalizedShippingPackages() {
   const packageRows = getShippingPackageRows();
-  const includePackageInsuranceValues = packageRows.length > 1;
   return packageRows
     .map((row) => {
       const weightGrams = Math.floor(Number(row?.weightGrams || 0));
@@ -853,7 +1111,7 @@ function getNormalizedShippingPackages() {
         weightGrams,
         packageDimensions,
       };
-      if (includePackageInsuranceValues && insuranceValue.amount > 0) {
+      if (insuranceValue.amount > 0) {
         normalizedPackage.insuredValueAmount = insuranceValue.amount;
         normalizedPackage.insuredValueCurrency = insuranceValue.currency;
       }
@@ -884,9 +1142,11 @@ function setShippingPackageRows(rows, extraPatch = {}) {
     .map((row) => makeShippingPackageRow(row))
     .slice(0, 8);
   const safeRows = balanceShippingPackageItemAssignments(nextRows.length ? nextRows : [makeShippingPackageRow()]);
+  const autoPackageCode = getAutoPackageTypeCodeForPackageRows(safeRows);
   setShippingPanelState({
     packages: safeRows,
     ...getLegacyPackageStateFromRows(safeRows),
+    ...(autoPackageCode ? { selectedPackageCode: autoPackageCode } : {}),
     status: 'shipment_found',
     rates: [],
     selectedQuoteId: '',
@@ -901,7 +1161,8 @@ function setShippingPackageRows(rows, extraPatch = {}) {
 function hasRequiredShippingRateInputs() {
   const packageRows = getShippingPackageRows();
   const normalizedPackages = getNormalizedShippingPackages();
-  return packageRows.length > 0 && normalizedPackages.length === packageRows.length;
+  if (packageRows.length <= 0 || normalizedPackages.length !== packageRows.length) return false;
+  return hasRequiredShippingPackageTypeSelection();
 }
 
 function getShippingRateInputSignature() {
@@ -910,6 +1171,7 @@ function getShippingRateInputSignature() {
   if (!shipmentId || packages.length !== getShippingPackageRows().length) return '';
   return [
     shipmentId,
+    shouldShowShippingPackageTypeSelector() ? normalizeShippingPackageCode(shippingPanelState.selectedPackageCode) : '',
     ...packages.map((pkg) => [
       pkg.weightGrams,
       pkg.packageDimensions.length,
@@ -955,6 +1217,28 @@ function formatShippingInsurance(shipment) {
   const currency = String(insuredValue.currency || '').trim();
   const valueLabel = amount > 0 ? formatShippingMoney(amount, currency) : '';
   return [provider, valueLabel].filter(Boolean).join(' - ') || 'None';
+}
+
+function getShipStationOrderValueSummary(shipment = shippingPanelState.shipment) {
+  const products = Array.isArray(shipment?.products) ? shipment.products : [];
+  if (!products.length) return '';
+
+  let totalAmount = 0;
+  let totalPaidAmount = 0;
+  let currency = '';
+
+  products.forEach((product) => {
+    const productTotal = Number(product?.total?.amount || 0);
+    const productTotalPaid = Number(product?.totalPaid?.amount || 0);
+    totalAmount += Number.isFinite(productTotal) ? productTotal : 0;
+    totalPaidAmount += Number.isFinite(productTotalPaid) ? productTotalPaid : 0;
+    if (!currency) {
+      currency = String(product?.total?.currency || product?.totalPaid?.currency || product?.valueCurrency || '').trim().toUpperCase();
+    }
+  });
+
+  if (totalAmount <= 0 && totalPaidAmount <= 0) return '';
+  return `${formatShippingMoney(totalAmount, currency || 'GBP')} / ${formatShippingMoney(totalPaidAmount, currency || 'GBP')}`;
 }
 
 function getSelectedShippingRate() {
@@ -3420,6 +3704,23 @@ async function loadVerifyShippingLookup() {
     const existingLabels = Array.isArray(data.existingLabels) ? data.existingLabels : [];
     const existingLabel = existingLabels.find((label) => !isShippingLabelVoided(label)) || existingLabels[0] || null;
     const packageDefaults = data.shipment ? getShippingPackageStateFromShipment(data.shipment) : {};
+    const packageTypes = Array.isArray(data.packageTypes) ? data.packageTypes : [];
+    const packageTypesAttempts = Array.isArray(data.packageTypesAttempts) ? data.packageTypesAttempts : [];
+    const packageTypeDefaults = data.shipment
+      ? {
+          packageTypes,
+          packageTypesError: data.packageTypesError || '',
+          packageTypesAttempts,
+          selectedPackageCode: getPreferredSelectedPackageCode(data.shipment, packageTypes, packageDefaults.packages)
+            || packageDefaults.selectedPackageCode
+            || '',
+        }
+      : {
+          packageTypes: [],
+          packageTypesError: data.packageTypesError || '',
+          packageTypesAttempts,
+          selectedPackageCode: '',
+        };
     if (!data.payment?.canShip) {
       setShippingPanelState({
         status: 'payment_blocked',
@@ -3427,6 +3728,7 @@ async function loadVerifyShippingLookup() {
         orderNumber: data.orderNumber || currentOrderNumber,
         payment: data.payment || null,
         attemptedIdentifiers: data.attemptedIdentifiers || [],
+        packageTypesAttempts,
       });
     } else if (existingLabel?.labelId && !isShippingLabelVoided(existingLabel)) {
       setShippingPanelState({
@@ -3441,6 +3743,7 @@ async function loadVerifyShippingLookup() {
         label: existingLabel,
         reusedExistingLabel: true,
         ...packageDefaults,
+        ...packageTypeDefaults,
       });
     } else if (existingLabel?.labelId && data.shipmentFound && data.shipment) {
       setShippingPanelState({
@@ -3455,6 +3758,7 @@ async function loadVerifyShippingLookup() {
         label: existingLabel,
         reusedExistingLabel: false,
         ...packageDefaults,
+        ...packageTypeDefaults,
       });
     } else if (data.shipmentFound && data.shipment) {
       setShippingPanelState({
@@ -3467,6 +3771,7 @@ async function loadVerifyShippingLookup() {
         attemptedIdentifiers: data.attemptedIdentifiers || [],
         attemptedQueries: data.attemptedQueries || [],
         ...packageDefaults,
+        ...packageTypeDefaults,
       });
     } else {
       setShippingPanelState({
@@ -3478,6 +3783,10 @@ async function loadVerifyShippingLookup() {
         selectedAttemptLabel: data.selectedAttemptLabel || '',
         attemptedIdentifiers: data.attemptedIdentifiers || [],
         attemptedQueries: data.attemptedQueries || [],
+        packageTypes: [],
+        packageTypesError: data.packageTypesError || '',
+        packageTypesAttempts,
+        selectedPackageCode: '',
       });
     }
   } catch (err) {
@@ -3517,6 +3826,38 @@ async function rateVerifyShippingShipment({ automatic = false, force = false } =
   }
   const weightGrams = packages.reduce((sum, pkg) => sum + Math.max(1, Number(pkg.weightGrams) || 1), 0);
   const packageDimensions = packages[0]?.packageDimensions || null;
+  const rateRequestBody = {
+    barcode: currentOrderBarcode,
+    shipmentId,
+    weightGrams,
+    packageDimensions,
+    packages,
+    packageCode: shouldShowShippingPackageTypeSelector()
+      ? normalizeShippingPackageCode(shippingPanelState.selectedPackageCode)
+      : '',
+  };
+  console.log('[Shipping rate check] Sending rates request', {
+    request: rateRequestBody,
+    shipStationOrderValue: getShipStationOrderValueTotal(),
+    shipStationValueContext: buildShipStationValueContext(),
+    packageRows: getShippingPackageRows().map((row, index) => ({
+      index,
+      weightGrams: row.weightGrams,
+      packagePresetKey: row.packagePresetKey,
+      packageDimensions: getShippingPackageRowDimensions(row),
+      itemUnitIds: row.itemUnitIds || [],
+      insuranceValue: getShippingPackageInsuranceValue(row),
+    })),
+    allocationRows: getShippingAllocationRows().map((row) => ({
+      rowKey: row.rowKey,
+      skuLabel: row.skuLabel,
+      productLabel: row.productLabel,
+      requiredQty: row.requiredQty,
+      unitValueAmount: row.unitValueAmount,
+      valueCurrency: row.valueCurrency,
+    })),
+    shipStationProducts: shippingPanelState.shipment?.products || [],
+  });
 
   setShippingPanelState({ actionLoading: 'rates', error: '', rateDiagnostics: null });
   renderVerifyShippingModal();
@@ -3525,13 +3866,7 @@ async function rateVerifyShippingShipment({ automatic = false, force = false } =
   try {
     const data = await fetchShippingJson('/api/pick-list/shipping/rates', {
       method: 'POST',
-      body: JSON.stringify({
-        barcode: currentOrderBarcode,
-        shipmentId,
-        weightGrams,
-        packageDimensions,
-        packages,
-      }),
+      body: JSON.stringify(rateRequestBody),
     });
     const rates = Array.isArray(data.rates) ? data.rates : [];
     setShippingPanelState({
@@ -3727,6 +4062,7 @@ function renderShippingShipmentDetails(container) {
   appendShippingDetail(details, 'Requested Service', formatRequestedShippingService(shipment));
   appendShippingDetail(details, 'Confirmation', formatShippingConfirmation(shipment.confirmation));
   appendShippingDetail(details, 'Insurance', formatShippingInsurance(shipment));
+  appendShippingDetail(details, 'Total / Total Paid', getShipStationOrderValueSummary(shipment));
   container.appendChild(details);
 }
 
@@ -3838,7 +4174,9 @@ function renderShippingRateControls(container) {
     rateCheckButton.disabled = loading || Boolean(shippingPanelState.actionLoading) || !canCheckRates;
     rateCheckButton.title = canCheckRates
       ? ''
-      : 'Enter package weight and package size first.';
+      : (isUkShippingShipment() && !hasRequiredShippingPackageTypeSelection()
+          ? 'Choose a valid ShipStation package type first.'
+          : 'Enter package weight and package size first.');
   };
 
   const updatePackageRow = (index, patch, { rerender = true, refreshRates = true, rateDelay = 0 } = {}) => {
@@ -4098,6 +4436,57 @@ function renderShippingRateControls(container) {
     return keypad;
   };
 
+  const renderShipStationPackageTypeSelector = () => {
+    if (!isUkShippingShipment()) return null;
+    const packageTypes = getShippingPackageTypeOptions();
+
+    if (!packageTypes.length) {
+      const warning = document.createElement('div');
+      warning.className = 'pick-shipping-package-type-warning';
+      warning.textContent = shippingPanelState.packageTypesError
+        ? `Could not load ShipStation package types: ${shippingPanelState.packageTypesError}`
+        : 'No ShipStation package types were returned for this carrier.';
+      return warning;
+    }
+
+    const label = document.createElement('label');
+    label.className = 'pick-shipping-package-type-label';
+    label.textContent = 'ShipStation package type';
+
+    const select = document.createElement('select');
+    select.className = 'pick-shipping-package-type-select';
+    select.disabled = loading || Boolean(shippingPanelState.actionLoading);
+    packageTypes.forEach((pkg) => {
+      const packageCode = normalizeShippingPackageCode(pkg.packageCode);
+      const name = String(pkg.name || packageCode).trim() || packageCode;
+      const option = document.createElement('option');
+      option.value = packageCode;
+      option.textContent = `${name} (${packageCode})`;
+      select.appendChild(option);
+    });
+    select.value = normalizeShippingPackageCode(shippingPanelState.selectedPackageCode)
+      || getDefaultSelectedPackageCode(shippingPanelState.shipment, packageTypes);
+
+    select.addEventListener('change', () => {
+      setShippingPanelState({
+        selectedPackageCode: select.value,
+        rates: [],
+        selectedQuoteId: '',
+        expiresAt: '',
+        noRateReason: '',
+        rateInputSignature: '',
+        status: shippingPanelState.status === 'rates' ? 'shipment_found' : shippingPanelState.status,
+      });
+      renderVerifyShippingModal();
+      if (hasRequiredShippingRateInputs()) {
+        queueVerifyShippingRateRefresh({ force: true, delay: 0 });
+      }
+    });
+
+    label.appendChild(select);
+    return label;
+  };
+
   const addPackageButton = document.createElement('button');
   addPackageButton.type = 'button';
   addPackageButton.className = 'pick-shipping-package-add';
@@ -4129,8 +4518,12 @@ function renderShippingRateControls(container) {
 
   const allocationControls = renderShippingPackageAllocationControls(packageRows);
   const weightKeypad = renderWeightKeypad();
+  const packageTypeSelector = renderShipStationPackageTypeSelector();
 
   form.appendChild(packageList);
+  if (packageTypeSelector) {
+    form.appendChild(packageTypeSelector);
+  }
   if (weightKeypad) {
     form.appendChild(weightKeypad);
   }
