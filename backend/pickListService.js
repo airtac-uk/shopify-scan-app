@@ -526,6 +526,53 @@ function mapCountsToDisplayRows({ skuMap, counts }) {
   };
 }
 
+function getLineItemNameCandidates(item = {}) {
+  const title = String(item.title || '').trim();
+  const variantTitle = String(item.variantTitle || '').trim();
+  const candidates = [
+    item.skuLookup,
+    item.productName,
+    item.name,
+    title && variantTitle ? `${title} - ${variantTitle}` : '',
+    title,
+    variantTitle,
+  ];
+
+  return Array.from(new Set(candidates
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)));
+}
+
+function findSkuBySheetTitle(skuMap, nameCandidates = []) {
+  const normalizedCandidates = new Set(nameCandidates.map(normalizeSku).filter(Boolean));
+  if (!normalizedCandidates.size) return '';
+
+  for (const row of skuMap.values()) {
+    if (normalizedCandidates.has(normalizeSku(row.title))) {
+      return row.sku;
+    }
+  }
+
+  return '';
+}
+
+function resolveLineItemSku({ skuMap, item }) {
+  const directSku = normalizeSku(item?.sku);
+  if (directSku) return { sku: directSku, fallbackUsed: false };
+
+  const nameCandidates = getLineItemNameCandidates(item);
+  const directNameMatch = nameCandidates
+    .map(normalizeSku)
+    .find((candidate) => candidate && skuMap.has(candidate));
+  if (directNameMatch) return { sku: directNameMatch, fallbackUsed: true };
+
+  const titleMatch = findSkuBySheetTitle(skuMap, nameCandidates);
+  if (titleMatch) return { sku: titleMatch, fallbackUsed: true };
+
+  const fallbackSku = normalizeSku(nameCandidates[0]);
+  return { sku: fallbackSku, fallbackUsed: Boolean(fallbackSku) };
+}
+
 function buildPickListForOrder({ skuMap, lineItems }) {
   const lineSummaries = [];
   const totalCounts = new Map();
@@ -533,7 +580,8 @@ function buildPickListForOrder({ skuMap, lineItems }) {
 
   for (let lineIndex = 0; lineIndex < lineItems.length; lineIndex += 1) {
     const item = lineItems[lineIndex];
-    const sku = normalizeSku(item.sku);
+    const resolvedSku = resolveLineItemSku({ skuMap, item });
+    const sku = resolvedSku.sku;
     const quantity = Number(item.quantity) || 0;
     if (!sku || quantity <= 0) continue;
 
@@ -563,6 +611,8 @@ function buildPickListForOrder({ skuMap, lineItems }) {
       title: item.title,
       variantTitle: item.variantTitle,
       sku,
+      originalSku: normalizeSku(item.sku),
+      skuFallbackUsed: resolvedSku.fallbackUsed,
       quantity,
       lineType: lineMeta.type || 'UNKNOWN',
       bundleGroupId,
@@ -618,6 +668,8 @@ function buildPickListForOrder({ skuMap, lineItems }) {
     title: line.title,
     variantTitle: line.variantTitle,
     sku: line.sku,
+    originalSku: line.originalSku,
+    skuFallbackUsed: line.skuFallbackUsed,
     quantity: line.quantity,
     lineType: line.lineType,
     bundleGroupId: line.bundleGroupId,

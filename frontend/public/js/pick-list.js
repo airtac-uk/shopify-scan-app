@@ -2723,21 +2723,33 @@ function getPickRowsFromLineSummary(line) {
 function findPickRowsForOrderItem(orderItem = {}) {
   const sku = normalizeDisplaySku(orderItem?.sku);
   const bundleGroupId = String(orderItem?.bundleGroup?.id || '').trim();
-  if (!sku && !bundleGroupId) return [];
+  const orderTitle = String(orderItem?.title || '').trim();
+  const variantTitle = String(orderItem?.variantTitle || '').trim();
+  const orderProductName = normalizeDisplaySku(variantTitle ? `${orderTitle} - ${variantTitle}` : orderTitle);
+  const orderTitleKey = normalizeDisplaySku(orderTitle);
+  if (!sku && !bundleGroupId && !orderProductName && !orderTitleKey) return [];
 
   const matchedLines = (lastRenderedLineItems || []).filter((line) => {
     const lineSku = normalizeDisplaySku(line?.sku);
     const lineBundleGroupId = String(line?.bundleGroupId || '').trim();
+    const lineTitle = String(line?.title || '').trim();
+    const lineVariantTitle = String(line?.variantTitle || '').trim();
+    const lineProductName = normalizeDisplaySku(lineVariantTitle ? `${lineTitle} - ${lineVariantTitle}` : lineTitle);
+    const lineTitleKey = normalizeDisplaySku(lineTitle);
 
     if (bundleGroupId && lineBundleGroupId) {
       return lineBundleGroupId === bundleGroupId && (!sku || !lineSku || lineSku === sku);
     }
-    return sku && lineSku === sku;
+    if (sku) return lineSku === sku;
+    return Boolean(
+      (orderProductName && lineProductName === orderProductName)
+      || (orderTitleKey && lineTitleKey === orderTitleKey)
+    );
   });
 
   const rowMap = new Map();
   matchedLines.flatMap(getPickRowsFromLineSummary)
-    .filter((row) => normalizeDisplaySku(row?.sku) === sku)
+    .filter((row) => !sku || normalizeDisplaySku(row?.sku) === sku)
     .forEach((row) => {
       const key = [
         row.sku,

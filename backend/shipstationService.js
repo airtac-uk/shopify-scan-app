@@ -963,6 +963,36 @@ function pickExistingShipmentField(shipment, key) {
   return shipment[key] === undefined ? undefined : shipment[key];
 }
 
+function getExplicitQuantityValue(item = {}) {
+  if (!item || typeof item !== 'object') return undefined;
+  for (const key of ['quantity', 'qty', 'quantity_ordered', 'quantityOrdered']) {
+    if (Object.prototype.hasOwnProperty.call(item, key)) {
+      return item[key];
+    }
+  }
+  return undefined;
+}
+
+function hasZeroExplicitQuantity(item = {}) {
+  const quantity = getExplicitQuantityValue(item);
+  if (quantity === undefined || quantity === null || quantity === '') return false;
+  const numericQuantity = Number(quantity);
+  return Number.isFinite(numericQuantity) && numericQuantity <= 0;
+}
+
+function removeZeroQuantityShipStationItems(value) {
+  if (Array.isArray(value)) {
+    return value
+      .filter((item) => !hasZeroExplicitQuantity(item))
+      .map(removeZeroQuantityShipStationItems);
+  }
+  if (!value || typeof value !== 'object') return value;
+  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
+    key,
+    removeZeroQuantityShipStationItems(entry),
+  ]));
+}
+
 function normalizePackageUpdateEntries(packages = []) {
   return (Array.isArray(packages) ? packages : [])
     .map((pkg) => {
@@ -999,9 +1029,13 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
   allowedFields.forEach((field) => {
     const value = pickExistingShipmentField(raw, field);
     if (value !== undefined && value !== null) {
-      payload[field] = field === 'ship_to' || field === 'ship_from' || field === 'return_to'
-        ? applyCompanyNameFallbackToAddress(value)
-        : value;
+      if (field === 'ship_to' || field === 'ship_from' || field === 'return_to') {
+        payload[field] = applyCompanyNameFallbackToAddress(value);
+      } else if (field === 'customs') {
+        payload[field] = removeZeroQuantityShipStationItems(value);
+      } else {
+        payload[field] = value;
+      }
     }
   });
 
@@ -1024,7 +1058,9 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
       'products',
     ].forEach((field) => {
       if (pkg[field] !== undefined && pkg[field] !== null) {
-        nextPackage[field] = pkg[field];
+        nextPackage[field] = field === 'products'
+          ? removeZeroQuantityShipStationItems(pkg[field])
+          : pkg[field];
       }
     });
     const existingInsuredValue = normalizePackageInsuranceForPayload(pkg);
