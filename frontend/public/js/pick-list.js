@@ -14,6 +14,7 @@ let hasRenderedPickList = false;
 let currentOrderBarcode = '';
 let currentOrderNumber = '';
 let currentOrderNote = '';
+let currentOrderHumanNote = '';
 let currentOrderTimeline = [];
 let currentWorkflowBlock = null;
 let currentOrderTags = [];
@@ -1578,6 +1579,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentOrderBarcode = '';
   currentOrderNumber = '';
   currentOrderNote = '';
+  currentOrderHumanNote = '';
   currentOrderTimeline = [];
   currentWorkflowBlock = null;
   currentOrderTags = [];
@@ -1862,7 +1864,6 @@ function renderNewOrderQueuePanel() {
   if (!panel) return;
 
   panel.hidden = !pickerModeEnabled;
-  if (!pickerModeEnabled) return;
 
   const status = document.getElementById('newOrderQueueStatus');
   const startButton = document.getElementById('newOrderQueueStartBtn');
@@ -1873,6 +1874,10 @@ function renderNewOrderQueuePanel() {
   const activeItem = getActiveNewOrderQueueItem();
   const orderCount = newOrderQueueState.orders.length;
   const busy = loading || newOrderQueueState.loading || newOrderQueueState.printing;
+
+  if (!pickerModeEnabled) {
+    return;
+  }
 
   panel.classList.toggle('is-active', Boolean(newOrderQueueState.active));
   panel.classList.toggle('is-busy', busy);
@@ -2139,6 +2144,9 @@ function applyOrderHeaderData(data, { fallbackTag = '' } = {}) {
   currentOrderFinancialStatus = String(data?.orderFinancialStatus || currentOrderFinancialStatus || '').trim();
   currentOrderStageKey = String(data?.currentStage?.key || '').trim();
   currentOrderStageLabel = String(data?.currentStage?.label || '').trim();
+  if (Object.prototype.hasOwnProperty.call(data || {}, 'orderHumanNote')) {
+    currentOrderHumanNote = String(data.orderHumanNote || '').trim();
+  }
   if (Object.prototype.hasOwnProperty.call(data || {}, 'qcBuilderStaff')) {
     currentQcBuilderStaff = String(data.qcBuilderStaff || '').trim();
   }
@@ -2148,11 +2156,18 @@ function applyOrderHeaderData(data, { fallbackTag = '' } = {}) {
 function renderOrderHeaderMeta() {
   const orderMeta = document.getElementById('pickListOrderMeta');
   const orderStatus = document.getElementById('pickListOrderStatus');
+  const orderNote = document.getElementById('pickListOrderNote');
   if (!orderMeta || !orderStatus) return;
 
   if (!currentOrderNumber && !currentOrderBarcode) {
     orderMeta.textContent = 'No order loaded';
     orderStatus.textContent = 'Awaiting scan';
+    if (orderNote) {
+      orderNote.hidden = true;
+      orderNote.textContent = '';
+      orderNote.dataset.noteKey = '';
+      orderNote.classList.remove('is-flashing');
+    }
     return;
   }
 
@@ -2170,6 +2185,21 @@ function renderOrderHeaderMeta() {
 
   orderMeta.textContent = `${orderLabel}${barcodeLabel}`;
   orderStatus.textContent = statusParts.length ? statusParts.join(' / ') : 'No tag or status';
+  if (orderNote) {
+    const noteText = String(currentOrderHumanNote || '').trim();
+    const noteKey = noteText ? `${currentOrderNumber || currentOrderBarcode}|${noteText}` : '';
+    const previousNoteKey = orderNote.dataset.noteKey || '';
+    orderNote.hidden = !noteText;
+    orderNote.textContent = noteText;
+    orderNote.dataset.noteKey = noteKey;
+    if (noteText && noteKey !== previousNoteKey) {
+      orderNote.classList.remove('is-flashing');
+      void orderNote.offsetWidth;
+      orderNote.classList.add('is-flashing');
+    } else if (!noteText) {
+      orderNote.classList.remove('is-flashing');
+    }
+  }
 }
 
 function isCurrentOrderLookup(value) {
@@ -6403,6 +6433,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     currentOrderBarcode = data.barcode;
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
+    currentOrderHumanNote = data.orderHumanNote || '';
     currentOrderTimeline = Array.isArray(data.orderTimeline) ? data.orderTimeline : [];
     currentOrderFinancialStatus = String(data.orderFinancialStatus || '').trim();
     setHpaTankShippingWarning(data.hpaTankShippingWarning);

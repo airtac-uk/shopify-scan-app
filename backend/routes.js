@@ -719,6 +719,38 @@ function buildShippingOrderIdentifiers({ order, barcode }) {
     .filter(Boolean)));
 }
 
+const APP_ORDER_NOTE_HEADING_PATTERNS = [
+  /^AWAITING PARTS\b/i,
+  /^ON HOLD\b/i,
+  /^ORDER BUILT - AWAITING QUALITY CHECKS\b/i,
+  /^ORDER PACKAGED - AWAITING COURIER COLLECTION\b/i,
+  /^ORDER READY TO BE BUILT\b/i,
+  /^QC FAIL\b/i,
+  /^QUALITY CHECKS ESCALATED - AWAITING REBUILD\b/i,
+  /^QUALITY CHECKS PASSED - AWAITING SHIPPING\b/i,
+  /^WHOLESALE ADAPTER BUILT\b/i,
+];
+
+function stripAppOrderNoteBlocks(orderNote) {
+  const rawNote = String(orderNote || '').trim();
+  if (!rawNote) return '';
+
+  const segments = rawNote.includes('~')
+    ? rawNote.split('~').map((segment) => segment.trim()).filter(Boolean)
+    : [rawNote];
+
+  return segments
+    .filter((segment) => {
+      const firstLine = segment
+        .split('\n')
+        .map((line) => line.trim())
+        .find(Boolean) || '';
+      return !APP_ORDER_NOTE_HEADING_PATTERNS.some((pattern) => pattern.test(firstLine));
+    })
+    .join('\n\n')
+    .trim();
+}
+
 function summarizeNewOrderQueueItem(order) {
   if (!order?.id) return null;
   const lineItems = Array.isArray(order.lineItems?.edges)
@@ -735,6 +767,7 @@ function summarizeNewOrderQueueItem(order) {
     fulfillmentStatus: String(order.displayFulfillmentStatus || '').trim(),
     itemCount,
     firstItemTitle: String(lineItems[0]?.title || '').trim(),
+    orderNote: stripAppOrderNoteBlocks(order.note),
   };
 }
 
@@ -750,6 +783,7 @@ async function listNewOrderQueueOrders({ client, maxOrders = 1000, pageSize = 10
             id
             name
             createdAt
+            note
             tags
             ${ORDER_WORKFLOW_STATUS_FIELDS}
             lineItems(first: 10) {
@@ -4889,6 +4923,7 @@ router.post('/api/pick-list', async (req, res) => {
         label: currentTrackerStage.label,
       },
       orderNote: order.note || '',
+      orderHumanNote: stripAppOrderNoteBlocks(order.note || ''),
       orderTimeline,
       qcBuilderStaff,
       sheetFetchedAt: pickListSheet.fetchedAt,

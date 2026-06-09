@@ -370,6 +370,40 @@ button:hover { background: #0056b3; }
   line-height: 1.15;
 }
 
+.pick-list-order-note {
+  max-height: 120px;
+  margin: 0 0 10px;
+  overflow: auto;
+  border: 2px solid #f0b74f;
+  border-radius: 8px;
+  background: rgba(240, 183, 79, 0.16);
+  color: #ffe1a6;
+  padding: 12px 14px;
+  font-size: 16px;
+  font-weight: 800;
+  line-height: 1.35;
+  white-space: pre-wrap;
+}
+
+.pick-list-order-note.is-flashing {
+  animation: pick-list-note-flash 1.25s ease-in-out 0s 2;
+}
+
+@keyframes pick-list-note-flash {
+  0%,
+  100% {
+    border-color: #f0b74f;
+    background: rgba(240, 183, 79, 0.16);
+    box-shadow: none;
+  }
+
+  45% {
+    border-color: #ffffff;
+    background: rgba(255, 213, 99, 0.42);
+    box-shadow: 0 0 0 4px rgba(255, 213, 99, 0.18);
+  }
+}
+
 .pick-list-workflow-alert {
   margin: 0 0 16px;
   padding: 16px 18px;
@@ -5583,6 +5617,12 @@ html.theme-light .pick-new-order-queue__empty {
 
 html.theme-light .pick-new-order-queue__status {
   color: #1b2f43;
+}
+
+html.theme-light .pick-list-order-note {
+  background: #fff1c2;
+  border-color: #d49418;
+  color: #8a5d12;
 }
 
 html.theme-light .pick-new-order-queue__actions button,
