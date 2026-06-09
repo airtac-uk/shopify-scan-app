@@ -46,6 +46,7 @@ const {
   transformStlBufferOrientation,
 } = require('./preformBuildService');
 const {
+  downloadPackingSlipBufferForShipment,
   getShipmentRatesDetailed,
   getShipmentById,
   listPackageTypesForShipment,
@@ -60,6 +61,7 @@ const {
 const {
   getBagLabelPrinterCapabilities,
   printBagLabelsPdf,
+  printPackingSlipPdf,
   printPdfLabel,
 } = require('./printNodeService');
 const {
@@ -715,6 +717,101 @@ function buildShippingOrderIdentifiers({ order, barcode }) {
   return Array.from(new Set(values
     .map((value) => String(value || '').trim())
     .filter(Boolean)));
+}
+
+function summarizeNewOrderQueueItem(order) {
+  if (!order?.id) return null;
+  const lineItems = Array.isArray(order.lineItems?.edges)
+    ? buildCurrentOrderLineItems(order.lineItems.edges)
+    : [];
+  const itemCount = lineItems.reduce((sum, item) => sum + Math.max(0, Number(item.quantity) || 0), 0);
+  return {
+    id: order.id,
+    orderNumber: String(order.name || '').trim(),
+    barcode: normalizeScanBarcode(order.name || ''),
+    createdAt: order.createdAt || '',
+    tags: normalizeOrderTags(order.tags),
+    financialStatus: String(order.displayFinancialStatus || '').trim(),
+    fulfillmentStatus: String(order.displayFulfillmentStatus || '').trim(),
+    itemCount,
+    firstItemTitle: String(lineItems[0]?.title || '').trim(),
+  };
+}
+
+async function listNewOrderQueueOrders({ client, maxOrders = 1000, pageSize = 100 } = {}) {
+  const safeMaxOrders = Math.max(1, Math.min(1000, Math.floor(Number(maxOrders) || 1000)));
+  const safePageSize = Math.max(1, Math.min(250, Math.floor(Number(pageSize) || 100)));
+  const query = `
+    query getNewOrderQueue($first: Int!, $after: String) {
+      orders(first: $first, after: $after, query: "tag:new_order status:open", sortKey: CREATED_AT, reverse: false) {
+        edges {
+          cursor
+          node {
+            id
+            name
+            createdAt
+            tags
+            ${ORDER_WORKFLOW_STATUS_FIELDS}
+            lineItems(first: 10) {
+              edges {
+                node {
+                  id
+                  title
+                  sku
+                  quantity
+                  currentQuantity
+                  variantTitle
+                  variant {
+                    barcode
+                  }
+                }
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  `;
+  const orders = [];
+  const seenOrderIds = new Set();
+  let after = null;
+  let hasNextPage = true;
+  let pagesFetched = 0;
+
+  while (hasNextPage && orders.length < safeMaxOrders) {
+    const first = Math.min(safePageSize, safeMaxOrders - orders.length);
+    const response = await client.graphql(query, {
+      variables: {
+        first,
+        after,
+      },
+    });
+    pagesFetched += 1;
+
+    const connection = response.data?.orders || {};
+    const edges = Array.isArray(connection.edges) ? connection.edges : [];
+    edges.forEach((edge) => {
+      const order = summarizeNewOrderQueueItem(edge?.node);
+      if (!order?.barcode || seenOrderIds.has(order.id)) return;
+      seenOrderIds.add(order.id);
+      orders.push(order);
+    });
+
+    hasNextPage = Boolean(connection.pageInfo?.hasNextPage);
+    after = connection.pageInfo?.endCursor || edges[edges.length - 1]?.cursor || null;
+    if (hasNextPage && !after) break;
+  }
+
+  return {
+    orders,
+    pagesFetched,
+    hasMore: hasNextPage && orders.length >= safeMaxOrders,
+    maxOrders: safeMaxOrders,
+  };
 }
 
 function summarizeShippingLabel(label) {
@@ -4950,6 +5047,88 @@ router.get('/api/pick-list/bag-labels/printer-capabilities', async (req, res) =>
   } catch (err) {
     console.error('Error in /api/pick-list/bag-labels/printer-capabilities:', err);
     return res.status(500).json({ success: false, error: err.message || 'Failed to load bag label printer capabilities' });
+  }
+});
+
+router.get('/api/pick-list/new-order-queue', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const client = shopifyClient(auth.session);
+    const queue = await listNewOrderQueueOrders({
+      client,
+      maxOrders: req.query?.maxOrders,
+      pageSize: req.query?.pageSize,
+    });
+    const orders = queue.orders;
+
+    return res.json({
+      success: true,
+      count: orders.length,
+      orders,
+      pagesFetched: queue.pagesFetched,
+      hasMore: queue.hasMore,
+      maxOrders: queue.maxOrders,
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/new-order-queue:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to load new order queue',
+    });
+  }
+});
+
+router.post('/api/pick-list/packing-slip/print', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const normalizedBarcode = normalizeScanBarcode(req.body?.barcode);
+    if (!normalizedBarcode) {
+      return res.status(400).json({ success: false, error: 'Missing barcode' });
+    }
+
+    const client = shopifyClient(auth.session);
+    const order = await findOrderForShipping({ client, barcode: normalizedBarcode });
+    if (!order) {
+      return res.status(404).json({ success: false, error: `Order ${normalizedBarcode} not found` });
+    }
+
+    const identifiers = buildShippingOrderIdentifiers({ order, barcode: normalizedBarcode });
+    const lookup = await lookupShipmentForOrder({ identifiers });
+    const shipment = lookup.shipment || null;
+    if (!shipment?.shipmentId) {
+      return res.status(404).json({
+        success: false,
+        error: `No ShipStation shipment found for ${order.name || normalizedBarcode}`,
+        attemptedIdentifiers: lookup.attemptedIdentifiers || identifiers,
+        attemptedQueries: lookup.attemptedQueries || [],
+      });
+    }
+
+    const packingSlip = await downloadPackingSlipBufferForShipment(shipment.shipmentId);
+    const printResult = await printPackingSlipPdf({
+      shop: auth.shop,
+      orderNumber: order.name || normalizedBarcode,
+      shipmentId: shipment.shipmentId,
+      pdfBuffer: packingSlip.buffer,
+    });
+
+    return res.json({
+      success: true,
+      orderNumber: order.name || normalizedBarcode,
+      shipmentId: shipment.shipmentId,
+      packingSlipSource: packingSlip.source || '',
+      printResult,
+    });
+  } catch (err) {
+    console.error('Error in /api/pick-list/packing-slip/print:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to print packing slip',
+    });
   }
 });
 

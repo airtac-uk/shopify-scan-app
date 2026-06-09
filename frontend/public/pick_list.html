@@ -61,6 +61,22 @@
           </div>
         </section>
 
+        <section id="newOrderQueuePanel" class="pick-new-order-queue" aria-label="New order queue">
+          <div class="pick-new-order-queue__head">
+            <div>
+              <p class="pick-new-order-queue__eyebrow">New Order Queue</p>
+              <p id="newOrderQueueStatus" class="pick-new-order-queue__status">Not loaded</p>
+            </div>
+            <div class="pick-new-order-queue__actions">
+              <button id="newOrderQueueStartBtn" type="button">Start</button>
+              <button id="newOrderQueueRefreshBtn" type="button">Refresh</button>
+              <button id="newOrderQueuePrintBtn" type="button">Print slip</button>
+              <button id="newOrderQueueNextBtn" type="button">Next</button>
+            </div>
+          </div>
+          <div id="newOrderQueueList" class="pick-new-order-queue__list" hidden></div>
+        </section>
+
         <section class="pick-list-actions" aria-label="Order actions">
           <div class="pick-list-action-grid">
             <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false" data-qc-visible="false">Racked</button>

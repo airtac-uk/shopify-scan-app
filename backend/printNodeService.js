@@ -161,6 +161,77 @@ async function printPdfLabel({
   };
 }
 
+async function printPackingSlipPdf({
+  shop,
+  orderNumber = '',
+  shipmentId = '',
+  pdfBuffer,
+  useIdempotency = false,
+} = {}) {
+  const printerIdEnv = String(process.env.PRINTNODE_PACKING_SLIP_PRINTER_ID || '').trim()
+    ? 'PRINTNODE_PACKING_SLIP_PRINTER_ID'
+    : 'PRINTNODE_PRINTER_ID';
+  const { apiKey, printerId, baseUrl } = getPrintNodeConfig({ printerIdEnv });
+  const normalizedOrderNumber = String(orderNumber || '').trim();
+  const normalizedShipmentId = String(shipmentId || '').trim();
+  if (!normalizedOrderNumber && !normalizedShipmentId) {
+    throw new Error('Missing order number or shipment id for packing slip print job.');
+  }
+  if (!Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
+    throw new Error('Missing PDF data for packing slip print job.');
+  }
+
+  const idempotencyKey = useIdempotency
+    ? buildPrintNodeIdempotencyKey({
+        shop,
+        labelId: `packing-slip:${normalizedOrderNumber}:${normalizedShipmentId}`,
+        printerId,
+      })
+    : '';
+  const title = `Packing slip ${normalizedOrderNumber || normalizedShipmentId}`;
+  const response = await fetch(`${baseUrl}/printjobs`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Basic ${Buffer.from(`${apiKey}:`).toString('base64')}`,
+      'Content-Type': 'application/json',
+      ...(idempotencyKey ? { 'X-Idempotency-Key': idempotencyKey } : {}),
+    },
+    body: JSON.stringify({
+      printerId,
+      title,
+      contentType: 'pdf_base64',
+      content: pdfBuffer.toString('base64'),
+      source: 'shopify-scan-app',
+    }),
+  });
+
+  const text = await response.text();
+  const data = text ? safeJsonParse(text) : null;
+
+  if (response.status === 409) {
+    return {
+      printNodeJobId: null,
+      printStatus: 'already_submitted',
+      idempotencyKey,
+      raw: data || text,
+    };
+  }
+
+  if (!response.ok) {
+    const message = data?.message || data?.error || text || response.statusText;
+    throw new Error(`PrintNode error ${response.status}: ${message}`);
+  }
+
+  return {
+    printNodeJobId: typeof data === 'number' || typeof data === 'string'
+      ? String(data)
+      : String(data?.id || data?.printJobId || ''),
+    printStatus: 'submitted',
+    idempotencyKey,
+    raw: data || text,
+  };
+}
+
 async function printBagLabelsPdf({
   orderNumber = '',
   pdfBuffer,
@@ -232,5 +303,6 @@ async function printBagLabelsPdf({
 module.exports = {
   getBagLabelPrinterCapabilities,
   printBagLabelsPdf,
+  printPackingSlipPdf,
   printPdfLabel,
 };

@@ -55,6 +55,15 @@ let activeShippingWeightPackageIndex = null;
 let suppressShippingWeightBlurRefresh = false;
 let bagLabelRows = [];
 let bagLabelActionLoading = '';
+let pendingAwaitingPrintQueueResultCloseAction = null;
+let newOrderQueueState = {
+  active: false,
+  loading: false,
+  printing: false,
+  orders: [],
+  index: -1,
+  error: '',
+};
 
 const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
@@ -1427,7 +1436,7 @@ function promptGettingLowQuantity(row) {
   return quantity;
 }
 
-function openAwaitingPrintQueueResultPopup(message, { isError = false } = {}) {
+function openAwaitingPrintQueueResultPopup(message, { isError = false, onClose = null } = {}) {
   const modal = document.getElementById('awaitingPrintQueueResultModal');
   const title = document.getElementById('awaitingPrintQueueResultTitle');
   const messageEl = document.getElementById('awaitingPrintQueueResultMessage');
@@ -1435,8 +1444,13 @@ function openAwaitingPrintQueueResultPopup(message, { isError = false } = {}) {
 
   if (!safeMessage) return;
 
+  pendingAwaitingPrintQueueResultCloseAction = typeof onClose === 'function' ? onClose : null;
+
   if (!modal || !messageEl) {
     window.alert(safeMessage);
+    const closeAction = pendingAwaitingPrintQueueResultCloseAction;
+    pendingAwaitingPrintQueueResultCloseAction = null;
+    if (closeAction) window.setTimeout(closeAction, 0);
     return;
   }
 
@@ -1456,6 +1470,9 @@ function closeAwaitingPrintQueueResultPopup() {
   if (!modal) return;
   modal.classList.remove('is-open');
   modal.setAttribute('aria-hidden', 'true');
+  const closeAction = pendingAwaitingPrintQueueResultCloseAction;
+  pendingAwaitingPrintQueueResultCloseAction = null;
+  if (closeAction) window.setTimeout(closeAction, 0);
 }
 
 function openHpaTankRegRemovalPopup(row = null) {
@@ -1825,6 +1842,232 @@ function setLoading(isLoading) {
   syncAwaitingToggleDisabledState();
   syncShippingPanelDisabledState();
   syncBagLabelsDialogDisabledState();
+  renderNewOrderQueuePanel();
+}
+
+function getActiveNewOrderQueueItem() {
+  if (!newOrderQueueState.active) return null;
+  return newOrderQueueState.orders[newOrderQueueState.index] || null;
+}
+
+function isCurrentNewOrderQueueOrder() {
+  const activeItem = getActiveNewOrderQueueItem();
+  if (!activeItem) return false;
+  const activeBarcode = normalizeVerifyCode(activeItem.barcode || activeItem.orderNumber);
+  return Boolean(activeBarcode && activeBarcode === normalizeVerifyCode(currentOrderBarcode || currentOrderNumber));
+}
+
+function renderNewOrderQueuePanel() {
+  const panel = document.getElementById('newOrderQueuePanel');
+  if (!panel) return;
+
+  panel.hidden = !pickerModeEnabled;
+  if (!pickerModeEnabled) return;
+
+  const status = document.getElementById('newOrderQueueStatus');
+  const startButton = document.getElementById('newOrderQueueStartBtn');
+  const refreshButton = document.getElementById('newOrderQueueRefreshBtn');
+  const printButton = document.getElementById('newOrderQueuePrintBtn');
+  const nextButton = document.getElementById('newOrderQueueNextBtn');
+  const list = document.getElementById('newOrderQueueList');
+  const activeItem = getActiveNewOrderQueueItem();
+  const orderCount = newOrderQueueState.orders.length;
+  const busy = loading || newOrderQueueState.loading || newOrderQueueState.printing;
+
+  panel.classList.toggle('is-active', Boolean(newOrderQueueState.active));
+  panel.classList.toggle('is-busy', busy);
+
+  if (status) {
+    if (newOrderQueueState.error) {
+      status.textContent = newOrderQueueState.error;
+    } else if (newOrderQueueState.printing) {
+      status.textContent = `Printing packing slip for ${currentOrderNumber || currentOrderBarcode}...`;
+    } else if (newOrderQueueState.loading) {
+      status.textContent = 'Loading new_order queue...';
+    } else if (!orderCount) {
+      status.textContent = 'No new_order orders loaded';
+    } else if (activeItem) {
+      status.textContent = `${newOrderQueueState.index + 1}/${orderCount}: ${activeItem.orderNumber || activeItem.barcode}`;
+    } else {
+      status.textContent = `${orderCount} new_order order${orderCount === 1 ? '' : 's'} ready`;
+    }
+  }
+
+  if (startButton) {
+    startButton.disabled = busy;
+    startButton.textContent = newOrderQueueState.active ? 'Restart' : 'Start';
+  }
+  if (refreshButton) refreshButton.disabled = busy;
+  if (printButton) printButton.disabled = busy || !hasRenderedPickList || !currentOrderBarcode;
+  if (nextButton) nextButton.disabled = busy || !newOrderQueueState.active || !orderCount;
+
+  if (list) {
+    list.hidden = true;
+    list.innerHTML = '';
+  }
+}
+
+async function loadNewOrderQueue({ activate = false } = {}) {
+  if (!pickerModeEnabled) return;
+  if (newOrderQueueState.loading || loading) return;
+  newOrderQueueState = {
+    ...newOrderQueueState,
+    loading: true,
+    error: '',
+  };
+  renderNewOrderQueuePanel();
+
+  try {
+    const response = await fetch('/api/pick-list/new-order-queue');
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to load new_order queue');
+    }
+    newOrderQueueState = {
+      ...newOrderQueueState,
+      active: activate || newOrderQueueState.active,
+      loading: false,
+      orders: Array.isArray(data.orders) ? data.orders : [],
+      index: activate && Array.isArray(data.orders) && data.orders.length ? 0 : newOrderQueueState.index,
+      error: '',
+    };
+    if (newOrderQueueState.index >= newOrderQueueState.orders.length) {
+      newOrderQueueState.index = newOrderQueueState.orders.length ? 0 : -1;
+    }
+    renderNewOrderQueuePanel();
+    if (activate && newOrderQueueState.orders.length) {
+      await loadNewOrderQueueOrder(newOrderQueueState.index);
+    } else {
+      const capNote = data.hasMore ? ` Showing first ${data.maxOrders || newOrderQueueState.orders.length}.` : '';
+      setStatus(`Loaded ${newOrderQueueState.orders.length} new_order order${newOrderQueueState.orders.length === 1 ? '' : 's'}.${capNote}`, 'success');
+    }
+  } catch (err) {
+    newOrderQueueState = {
+      ...newOrderQueueState,
+      loading: false,
+      error: err.message || 'Failed to load queue',
+    };
+    renderNewOrderQueuePanel();
+    setStatus(`Queue error: ${err.message}`, 'error');
+  }
+}
+
+async function loadNewOrderQueueOrder(index) {
+  const safeIndex = Math.max(0, Math.floor(Number(index) || 0));
+  const order = newOrderQueueState.orders[safeIndex];
+  if (!order) {
+    setStatus('No queued order to load.', 'info');
+    return;
+  }
+  newOrderQueueState = {
+    ...newOrderQueueState,
+    active: true,
+    index: safeIndex,
+    error: '',
+  };
+  renderNewOrderQueuePanel();
+  const lookup = order.barcode || order.orderNumber;
+  const input = document.getElementById('pickListBarcode');
+  if (input) input.value = lookup;
+  await fetchPickList(lookup, { skipActionReminder: true });
+  renderNewOrderQueuePanel();
+}
+
+async function printCurrentPackingSlip() {
+  const barcode = String(currentOrderBarcode || currentOrderNumber || '').trim();
+  if (!barcode) {
+    setStatus('Load an order before printing a packing slip.', 'error');
+    return false;
+  }
+  if (newOrderQueueState.printing) return false;
+
+  newOrderQueueState = {
+    ...newOrderQueueState,
+    printing: true,
+    error: '',
+  };
+  renderNewOrderQueuePanel();
+  setStatus(`Printing ShipStation packing slip for ${currentOrderNumber || barcode}...`, 'info');
+
+  try {
+    const response = await fetch('/api/pick-list/packing-slip/print', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ barcode }),
+    });
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to print packing slip');
+    }
+    setStatus(`Packing slip sent to PrintNode for ${data.orderNumber || currentOrderNumber || barcode}.`, 'success');
+    return true;
+  } catch (err) {
+    newOrderQueueState = {
+      ...newOrderQueueState,
+      error: err.message || 'Failed to print packing slip',
+    };
+    setStatus(`Packing slip print failed: ${err.message}`, 'error');
+    return false;
+  } finally {
+    newOrderQueueState = {
+      ...newOrderQueueState,
+      printing: false,
+    };
+    renderNewOrderQueuePanel();
+  }
+}
+
+async function advanceNewOrderQueue() {
+  if (!newOrderQueueState.active) return;
+  const nextIndex = newOrderQueueState.index + 1;
+  if (nextIndex >= newOrderQueueState.orders.length) {
+    await loadNewOrderQueue({ activate: false });
+    if (!newOrderQueueState.orders.length) {
+      newOrderQueueState = {
+        ...newOrderQueueState,
+        active: false,
+        index: -1,
+      };
+      renderNewOrderQueuePanel();
+      setStatus('New order queue complete.', 'success');
+      return;
+    }
+    await loadNewOrderQueueOrder(0);
+    return;
+  }
+  await loadNewOrderQueueOrder(nextIndex);
+}
+
+async function completeCurrentNewOrderQueueOrder({ completeStatus = 'Packing slip printed. New order queue complete.' } = {}) {
+  if (!isCurrentNewOrderQueueOrder()) return;
+  const printed = await printCurrentPackingSlip();
+  if (!printed) return;
+  await loadNewOrderQueue({ activate: false });
+  const currentCode = normalizeVerifyCode(currentOrderBarcode || currentOrderNumber);
+  const nextIndex = newOrderQueueState.orders.findIndex((order) => normalizeVerifyCode(order.barcode || order.orderNumber) !== currentCode);
+  if (nextIndex >= 0) {
+    await loadNewOrderQueueOrder(nextIndex);
+    return;
+  }
+  newOrderQueueState = {
+    ...newOrderQueueState,
+    active: false,
+    index: -1,
+  };
+  renderNewOrderQueuePanel();
+  setStatus(completeStatus, 'success');
+}
+
+async function handleNewOrderQueueRackedOrder() {
+  await completeCurrentNewOrderQueueOrder({
+    completeStatus: 'Packing slip printed. New order queue complete.',
+  });
+}
+
+async function handleNewOrderQueueAwaitingPartsOrder() {
+  await completeCurrentNewOrderQueueOrder({
+    completeStatus: 'Awaiting parts saved, packing slip printed. New order queue complete.',
+  });
 }
 
 function normalizeTypeKey(type) {
@@ -2467,6 +2710,7 @@ async function saveAwaitingPartsSelection({ orderId, items, closeDialog = false 
     const printQueueStatus = normalizedItems.length > 0
       ? formatAwaitingPrintQueueMessage(data.printQueueUpdate)
       : '';
+    const shouldAdvanceNewOrderQueue = normalizedItems.length > 0 && isCurrentNewOrderQueueOrder();
     setStatus(
       [appendOrderNoteWarning(baseStatus, data), printQueueStatus].filter(Boolean).join(' '),
       data.printQueueUpdate?.error ? 'error' : 'success'
@@ -2479,7 +2723,12 @@ async function saveAwaitingPartsSelection({ orderId, items, closeDialog = false 
     if (printQueueStatus) {
       openAwaitingPrintQueueResultPopup(printQueueStatus, {
         isError: Boolean(data.printQueueUpdate?.error),
+        onClose: shouldAdvanceNewOrderQueue ? handleNewOrderQueueAwaitingPartsOrder : null,
       });
+    } else if (shouldAdvanceNewOrderQueue) {
+      window.setTimeout(() => {
+        handleNewOrderQueueAwaitingPartsOrder();
+      }, 0);
     }
 
     return true;
@@ -6072,6 +6321,7 @@ async function runOrderAction(tag) {
         'success'
       );
     }
+    const shouldAdvanceNewOrderQueue = tag === 'racked_up' && isCurrentNewOrderQueueOrder();
 
     if (tag === 'awaiting_parts') {
       openAwaitingPartsDialog(normalizedBarcode, lastRenderedLineItems);
@@ -6080,6 +6330,11 @@ async function runOrderAction(tag) {
     } else if (hasRenderedPickList) {
       setCurrentAwaitingPartsItems([]);
       renderCurrentOrderSection();
+    }
+    if (shouldAdvanceNewOrderQueue) {
+      window.setTimeout(() => {
+        handleNewOrderQueueRackedOrder();
+      }, 0);
     }
     return true;
   } catch (err) {
@@ -6452,10 +6707,15 @@ document.addEventListener('DOMContentLoaded', () => {
   const wholesaleModeToggle = document.getElementById('wholesaleModeToggle');
   const qcModeToggle = document.getElementById('qcModeToggle');
   const bagLabelsOpenBtn = document.getElementById('bagLabelsOpenBtn');
+  const newOrderQueueStartBtn = document.getElementById('newOrderQueueStartBtn');
+  const newOrderQueueRefreshBtn = document.getElementById('newOrderQueueRefreshBtn');
+  const newOrderQueuePrintBtn = document.getElementById('newOrderQueuePrintBtn');
+  const newOrderQueueNextBtn = document.getElementById('newOrderQueueNextBtn');
 
   actionButtons = Array.from(document.querySelectorAll('.pick-list-action-btn'));
   setActionButtonsEnabled(false);
   syncActionVisibilityForModes();
+  renderNewOrderQueuePanel();
 
   actionButtons.forEach((actionButton) => {
     actionButton.addEventListener('click', () => {
@@ -6467,6 +6727,18 @@ document.addEventListener('DOMContentLoaded', () => {
 
   if (bagLabelsOpenBtn) {
     bagLabelsOpenBtn.addEventListener('click', openBagLabelsDialog);
+  }
+  if (newOrderQueueStartBtn) {
+    newOrderQueueStartBtn.addEventListener('click', () => loadNewOrderQueue({ activate: true }));
+  }
+  if (newOrderQueueRefreshBtn) {
+    newOrderQueueRefreshBtn.addEventListener('click', () => loadNewOrderQueue({ activate: false }));
+  }
+  if (newOrderQueuePrintBtn) {
+    newOrderQueuePrintBtn.addEventListener('click', printCurrentPackingSlip);
+  }
+  if (newOrderQueueNextBtn) {
+    newOrderQueueNextBtn.addEventListener('click', advanceNewOrderQueue);
   }
 
   if (button) {
@@ -6557,6 +6829,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setCookieValue(QC_MODE_COOKIE, qcModeEnabled ? '1' : '0');
 
     syncActionVisibilityForModes();
+    renderNewOrderQueuePanel();
     setActionButtonsEnabled(actionButtonsUnlocked);
     syncVerificationStateForMode();
     if (hasRenderedPickList) {

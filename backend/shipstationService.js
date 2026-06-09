@@ -1620,8 +1620,119 @@ async function downloadLabelBuffer(labelUrl) {
   return download;
 }
 
+function extractDocumentUrl(payload) {
+  if (!payload || typeof payload !== 'object') return '';
+  const candidates = [
+    payload.url,
+    payload.href,
+    payload.download_url,
+    payload.downloadUrl,
+    payload.document_url,
+    payload.documentUrl,
+    payload.packing_slip_url,
+    payload.packingSlipUrl,
+    payload.document?.url,
+    payload.document?.href,
+    payload.document?.download_url,
+    payload.document?.downloadUrl,
+    payload.documents?.[0]?.url,
+    payload.documents?.[0]?.href,
+    payload.documents?.[0]?.download_url,
+    payload.documents?.[0]?.downloadUrl,
+  ];
+  return normalizeId(candidates.find((value) => normalizeId(value)));
+}
+
+function buildPackingSlipPathAttempts(shipmentId) {
+  const safeShipmentId = encodeURIComponent(normalizeId(shipmentId));
+  const configuredTemplate = normalizeId(process.env.SHIPSTATION_PACKING_SLIP_PATH_TEMPLATE);
+  const configuredAttempt = configuredTemplate
+    ? [{
+        label: 'configured',
+        method: 'GET',
+        path: configuredTemplate.replace(/\{shipmentId\}/g, safeShipmentId),
+      }]
+    : [];
+
+  return [
+    ...configuredAttempt,
+    { label: 'shipment_packing_slip', method: 'GET', path: `/v2/shipments/${safeShipmentId}/packing_slip` },
+    { label: 'shipment_packing-slip', method: 'GET', path: `/v2/shipments/${safeShipmentId}/packing-slip` },
+    { label: 'shipment_documents_packing_slip', method: 'GET', path: `/v2/shipments/${safeShipmentId}/documents/packing_slip` },
+    { label: 'shipment_documents_packing-slip', method: 'GET', path: `/v2/shipments/${safeShipmentId}/documents/packing-slip` },
+    {
+      label: 'documents_packing_slip',
+      method: 'POST',
+      path: '/v2/documents/packing_slip',
+      body: {
+        shipment_id: normalizeId(shipmentId),
+        document_format: 'pdf',
+      },
+    },
+    {
+      label: 'documents',
+      method: 'POST',
+      path: '/v2/documents',
+      body: {
+        document_type: 'packing_slip',
+        shipment_id: normalizeId(shipmentId),
+        document_format: 'pdf',
+      },
+    },
+  ];
+}
+
+async function requestPackingSlipDocument(attempt) {
+  const download = await shipStationRequest(attempt.path, {
+    method: attempt.method || 'GET',
+    body: attempt.body,
+    raw: true,
+    headers: {
+      Accept: 'application/pdf,application/json,*/*',
+    },
+  });
+  const contentType = String(download.contentType || '').trim().toLowerCase();
+  if (contentType.includes('pdf') || contentType.includes('octet-stream')) {
+    return download;
+  }
+
+  const text = download.buffer.toString('utf8');
+  const payload = safeJsonParse(text);
+  const documentUrl = extractDocumentUrl(payload);
+  if (!documentUrl) {
+    throw new Error(`ShipStation packing slip response was ${contentType || 'not a PDF'} and did not include a document URL.`);
+  }
+
+  return shipStationRequest(documentUrl, { raw: true });
+}
+
+async function downloadPackingSlipBufferForShipment(shipmentId) {
+  const safeShipmentId = normalizeId(shipmentId);
+  if (!safeShipmentId) throw new Error('Missing ShipStation shipment id for packing slip.');
+
+  const errors = [];
+  for (const attempt of buildPackingSlipPathAttempts(safeShipmentId)) {
+    try {
+      const download = await requestPackingSlipDocument(attempt);
+      const contentType = String(download.contentType || '').trim().toLowerCase();
+      if (contentType && !contentType.includes('pdf') && !contentType.includes('octet-stream')) {
+        throw new Error(`ShipStation packing slip returned ${contentType}, not a printable PDF.`);
+      }
+      return {
+        ...download,
+        source: attempt.label,
+      };
+    } catch (err) {
+      errors.push(`${attempt.label}: ${err.message || String(err)}`);
+    }
+  }
+
+  throw new Error(`Could not download ShipStation packing slip for shipment ${safeShipmentId}. ${errors.join(' | ')}`);
+}
+
 module.exports = {
   buildOrderLookupIdentifiers,
+  downloadPackingSlipBufferForShipment,
   getShipmentById,
   getShipmentRates,
   getShipmentRatesDetailed,
