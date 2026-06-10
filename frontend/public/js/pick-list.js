@@ -1886,7 +1886,7 @@ function renderNewOrderQueuePanel() {
     if (newOrderQueueState.error) {
       status.textContent = newOrderQueueState.error;
     } else if (newOrderQueueState.printing) {
-      status.textContent = `Printing packing slip for ${currentOrderNumber || currentOrderBarcode}...`;
+      status.textContent = `Printing packing label for ${currentOrderNumber || currentOrderBarcode}...`;
     } else if (newOrderQueueState.loading) {
       status.textContent = 'Loading new_order queue...';
     } else if (!orderCount) {
@@ -1981,7 +1981,7 @@ async function loadNewOrderQueueOrder(index) {
 async function printCurrentPackingSlip() {
   const barcode = String(currentOrderBarcode || currentOrderNumber || '').trim();
   if (!barcode) {
-    setStatus('Load an order before printing a packing slip.', 'error');
+    setStatus('Load an order before printing a packing label.', 'error');
     return false;
   }
   if (newOrderQueueState.printing) return false;
@@ -1992,7 +1992,7 @@ async function printCurrentPackingSlip() {
     error: '',
   };
   renderNewOrderQueuePanel();
-  setStatus(`Printing ShipStation packing slip for ${currentOrderNumber || barcode}...`, 'info');
+  setStatus(`Printing packing label for ${currentOrderNumber || barcode}...`, 'info');
 
   try {
     const response = await fetch('/api/pick-list/packing-slip/print', {
@@ -2002,16 +2002,16 @@ async function printCurrentPackingSlip() {
     });
     const data = await response.json();
     if (!response.ok || !data.success) {
-      throw new Error(data.error || 'Failed to print packing slip');
+      throw new Error(data.error || 'Failed to print packing label');
     }
-    setStatus(`Packing slip sent to PrintNode for ${data.orderNumber || currentOrderNumber || barcode}.`, 'success');
+    setStatus(`Packing label sent to PrintNode for ${data.orderNumber || currentOrderNumber || barcode}.`, 'success');
     return true;
   } catch (err) {
     newOrderQueueState = {
       ...newOrderQueueState,
-      error: err.message || 'Failed to print packing slip',
+      error: err.message || 'Failed to print packing label',
     };
-    setStatus(`Packing slip print failed: ${err.message}`, 'error');
+    setStatus(`Packing label print failed: ${err.message}`, 'error');
     return false;
   } finally {
     newOrderQueueState = {
@@ -2043,7 +2043,7 @@ async function advanceNewOrderQueue() {
   await loadNewOrderQueueOrder(nextIndex);
 }
 
-async function completeCurrentNewOrderQueueOrder({ completeStatus = 'Packing slip printed. New order queue complete.' } = {}) {
+async function completeCurrentNewOrderQueueOrder({ completeStatus = 'Packing label printed. New order queue complete.' } = {}) {
   if (!isCurrentNewOrderQueueOrder()) return;
   const printed = await printCurrentPackingSlip();
   if (!printed) return;
@@ -2065,13 +2065,13 @@ async function completeCurrentNewOrderQueueOrder({ completeStatus = 'Packing sli
 
 async function handleNewOrderQueueRackedOrder() {
   await completeCurrentNewOrderQueueOrder({
-    completeStatus: 'Packing slip printed. New order queue complete.',
+    completeStatus: 'Packing label printed. New order queue complete.',
   });
 }
 
 async function handleNewOrderQueueAwaitingPartsOrder() {
   await completeCurrentNewOrderQueueOrder({
-    completeStatus: 'Awaiting parts saved, packing slip printed. New order queue complete.',
+    completeStatus: 'Awaiting parts saved, packing label printed. New order queue complete.',
   });
 }
 

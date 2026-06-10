@@ -46,7 +46,6 @@ const {
   transformStlBufferOrientation,
 } = require('./preformBuildService');
 const {
-  downloadPackingSlipBufferForShipment,
   getShipmentRatesDetailed,
   getShipmentById,
   listPackageTypesForShipment,
@@ -67,6 +66,9 @@ const {
 const {
   buildBagLabelsPdf,
 } = require('./bagLabelService');
+const {
+  buildPackingOrderLabelPdf,
+} = require('./packingLabelService');
 
 router.use(cookieParser());
 
@@ -686,6 +688,19 @@ function getShippingOrderQuery() {
             name
             note
             tags
+            shippingAddress {
+              name
+              company
+              firstName
+              lastName
+              country
+              countryCodeV2
+            }
+            customer {
+              displayName
+              firstName
+              lastName
+            }
             ${ORDER_WORKFLOW_STATUS_FIELDS}
           }
         }
@@ -705,6 +720,29 @@ async function findOrderForShipping({ client, barcode }) {
   });
 
   return response.data?.orders?.edges?.[0]?.node || null;
+}
+
+function buildPackingLabelCustomerName(order) {
+  const shippingAddress = order?.shippingAddress || {};
+  const customer = order?.customer || {};
+  const shippingName = String(shippingAddress.name || '').trim();
+  const shippingCompany = String(shippingAddress.company || '').trim();
+  const shippingPartsName = [shippingAddress.firstName, shippingAddress.lastName]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join(' ');
+  const customerDisplayName = String(customer.displayName || '').trim();
+  const customerPartsName = [customer.firstName, customer.lastName]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .join(' ');
+
+  return shippingName || shippingCompany || shippingPartsName || customerDisplayName || customerPartsName || '';
+}
+
+function buildPackingLabelCountry(order) {
+  const shippingAddress = order?.shippingAddress || {};
+  return String(shippingAddress.country || shippingAddress.countryCodeV2 || '').trim();
 }
 
 function buildShippingOrderIdentifiers({ order, barcode }) {
@@ -5131,38 +5169,31 @@ router.post('/api/pick-list/packing-slip/print', async (req, res) => {
       return res.status(404).json({ success: false, error: `Order ${normalizedBarcode} not found` });
     }
 
-    const identifiers = buildShippingOrderIdentifiers({ order, barcode: normalizedBarcode });
-    const lookup = await lookupShipmentForOrder({ identifiers });
-    const shipment = lookup.shipment || null;
-    if (!shipment?.shipmentId) {
-      return res.status(404).json({
-        success: false,
-        error: `No ShipStation shipment found for ${order.name || normalizedBarcode}`,
-        attemptedIdentifiers: lookup.attemptedIdentifiers || identifiers,
-        attemptedQueries: lookup.attemptedQueries || [],
-      });
-    }
-
-    const packingSlip = await downloadPackingSlipBufferForShipment(shipment.shipmentId);
+    const packingLabel = buildPackingOrderLabelPdf({
+      orderNumber: order.name || normalizedBarcode,
+      customerName: buildPackingLabelCustomerName(order),
+      country: buildPackingLabelCountry(order),
+    });
     const printResult = await printPackingSlipPdf({
       shop: auth.shop,
-      orderNumber: order.name || normalizedBarcode,
-      shipmentId: shipment.shipmentId,
-      pdfBuffer: packingSlip.buffer,
+      orderNumber: packingLabel.orderNumber,
+      pdfBuffer: packingLabel.pdfBuffer,
     });
 
     return res.json({
       success: true,
-      orderNumber: order.name || normalizedBarcode,
-      shipmentId: shipment.shipmentId,
-      packingSlipSource: packingSlip.source || '',
+      orderNumber: packingLabel.orderNumber,
+      customerName: packingLabel.customerName,
+      country: packingLabel.country,
+      packingSlipSource: 'generated_4x6_qr_label',
+      pageSize: packingLabel.pageSize,
       printResult,
     });
   } catch (err) {
     console.error('Error in /api/pick-list/packing-slip/print:', err);
     return res.status(500).json({
       success: false,
-      error: err.message || 'Failed to print packing slip',
+      error: err.message || 'Failed to print packing label',
     });
   }
 });

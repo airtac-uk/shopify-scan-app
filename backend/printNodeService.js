@@ -175,10 +175,10 @@ async function printPackingSlipPdf({
   const normalizedOrderNumber = String(orderNumber || '').trim();
   const normalizedShipmentId = String(shipmentId || '').trim();
   if (!normalizedOrderNumber && !normalizedShipmentId) {
-    throw new Error('Missing order number or shipment id for packing slip print job.');
+    throw new Error('Missing order number or shipment id for packing label print job.');
   }
   if (!Buffer.isBuffer(pdfBuffer) || pdfBuffer.length === 0) {
-    throw new Error('Missing PDF data for packing slip print job.');
+    throw new Error('Missing PDF data for packing label print job.');
   }
 
   const idempotencyKey = useIdempotency
@@ -188,7 +188,7 @@ async function printPackingSlipPdf({
         printerId,
       })
     : '';
-  const title = `Packing slip ${normalizedOrderNumber || normalizedShipmentId}`;
+  const title = `Packing label ${normalizedOrderNumber || normalizedShipmentId}`;
   const response = await fetch(`${baseUrl}/printjobs`, {
     method: 'POST',
     headers: {
