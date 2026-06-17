@@ -966,6 +966,48 @@ function summarizeShippingRate(rate, quote = null) {
   };
 }
 
+function getEmptyStateCityFallback(shipment) {
+  const shipTo = shipment?.shipTo || {};
+  const stateProvince = String(shipTo.stateProvince || '').trim();
+  const city = String(shipTo.city || '').trim();
+  if (stateProvince || !city) return '';
+  return city;
+}
+
+function buildShippingRateRouteDiagnostics({ rateResult, shipment, ratePackageCode, packages, retryInfo = null }) {
+  const diagnostics = {
+    ...(rateResult?.diagnostics || {}),
+    shipment: {
+      shipmentId: shipment?.shipmentId || '',
+      shipmentNumber: shipment?.shipmentNumber || '',
+      status: shipment?.status || '',
+      carrierCode: shipment?.carrierCode || '',
+      carrierFriendlyName: shipment?.carrierFriendlyName || '',
+      serviceCode: shipment?.serviceCode || '',
+      serviceType: shipment?.serviceType || '',
+      requestedShipmentService: shipment?.requestedShipmentService || '',
+      packageCode: shipment?.packageCode || '',
+      ratePackageCode,
+      confirmation: shipment?.confirmation || '',
+      insuranceProvider: shipment?.insuranceProvider || '',
+      shipDate: shipment?.shipDate || '',
+      shipTo: shipment?.shipTo || null,
+      shipFrom: shipment?.shipFrom || null,
+      packageCount: shipment?.packages?.length || 0,
+    },
+    packages,
+  };
+
+  if (retryInfo) {
+    diagnostics.retry = {
+      ...(diagnostics.retry || {}),
+      emptyStateCityFallback: retryInfo,
+    };
+  }
+
+  return diagnostics;
+}
+
 function normalizeShippingPackageDimensionsInput(dimensions) {
   if (!dimensions || typeof dimensions !== 'object') return null;
   const length = Number(dimensions.length);
@@ -1155,6 +1197,23 @@ function normalizeShopifyLineItemMoney(node = {}) {
   };
 }
 
+function normalizeShopifyImage(...images) {
+  for (const image of images) {
+    if (!image || typeof image !== 'object') continue;
+    const url = String(image.url || image.src || image.transformedSrc || '').trim();
+    if (!url) continue;
+    return {
+      url,
+      altText: String(image.altText || '').trim(),
+    };
+  }
+
+  return {
+    url: '',
+    altText: '',
+  };
+}
+
 function buildCurrentOrderLineItems(edges = []) {
   return (edges || [])
     .map((edge, index) => {
@@ -1177,6 +1236,10 @@ function buildCurrentOrderLineItems(edges = []) {
             quantity: Number(node.lineItemGroup.quantity) || null,
           }
         : null;
+      const image = normalizeShopifyImage(
+        node.variant?.image,
+        node.variant?.product?.featuredImage
+      );
 
       return {
         id: node.id || `ORDER_LINE_${index + 1}`,
@@ -1185,6 +1248,8 @@ function buildCurrentOrderLineItems(edges = []) {
         quantity,
         variantTitle: node.variantTitle || '',
         upc: node.variant?.barcode || '',
+        imageUrl: image.url,
+        imageAltText: image.altText,
         bundleGroup,
         priceAmount: lineMoney.amount,
         priceCurrency: lineMoney.currency,
@@ -2224,7 +2289,20 @@ function includesMissingPurchasingEntityFieldError(err) {
     || raw.includes('required access');
 }
 
-function getPickListOrderQuery({ includeBundleGroup, includePurchasingEntity = false }) {
+function includesProductImageFieldError(err) {
+  const raw = JSON.stringify(err?.response?.body || err?.response || err?.body || err?.message || err || '').toLowerCase();
+  return (
+    (raw.includes('image') || raw.includes('featuredimage') || raw.includes('product'))
+    && (
+      raw.includes("doesn't exist")
+      || raw.includes('field')
+      || raw.includes('access denied')
+      || raw.includes('required access')
+    )
+  );
+}
+
+function getPickListOrderQuery({ includeBundleGroup, includePurchasingEntity = false, includeProductImages = false }) {
   return `
       query getOrderForPickList($query: String!) {
         orders(first: 1, query: $query) {
@@ -2278,6 +2356,17 @@ function getPickListOrderQuery({ includeBundleGroup, includePurchasingEntity = f
                     variantTitle
                     variant {
                       barcode
+                      ${includeProductImages ? `
+                      image {
+                        url
+                        altText
+                      }
+                      product {
+                        featuredImage {
+                          url
+                          altText
+                        }
+                      }` : ''}
                     }
                     ${includeBundleGroup ? `
                     lineItemGroup {
@@ -2299,17 +2388,21 @@ async function fetchPickListOrderResponse({
   client,
   variables,
   includePurchasingEntity = false,
+  includeProductImages = false,
 } = {}) {
   let includeBundleGroup = true;
   let usePurchasingEntity = Boolean(includePurchasingEntity);
+  let useProductImages = Boolean(includeProductImages);
   let bundleMetadataSupported = true;
   let purchasingEntitySupported = usePurchasingEntity;
+  let productImagesSupported = useProductImages;
 
   while (true) {
     try {
       const response = await client.graphql(getPickListOrderQuery({
         includeBundleGroup,
         includePurchasingEntity: usePurchasingEntity,
+        includeProductImages: useProductImages,
       }), {
         variables,
       });
@@ -2318,8 +2411,15 @@ async function fetchPickListOrderResponse({
         response,
         bundleMetadataSupported,
         purchasingEntitySupported,
+        productImagesSupported,
       };
     } catch (err) {
+      if (useProductImages && includesProductImageFieldError(err)) {
+        useProductImages = false;
+        productImagesSupported = false;
+        continue;
+      }
+
       if (includeBundleGroup && includesMissingBundleFieldError(err)) {
         includeBundleGroup = false;
         bundleMetadataSupported = false;
@@ -4333,53 +4433,106 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       shipmentId,
       packages: shippingPackagesWithPackageCode,
     });
-    const ratePackageCode = updatedShipment?.packages?.[0]?.packageCode || updatedShipment?.packageCode || selectedPackageCode || '';
-    const rateResult = await getShipmentRatesDetailed(shipmentId, {
-      carrierId: updatedShipment?.carrierId || '',
-      selectedServiceCode: updatedShipment?.serviceCode || '',
-      packageCode: ratePackageCode,
-      preferredCurrency: 'GBP',
-    });
-    const rates = Array.isArray(rateResult.rates) ? rateResult.rates : [];
-    const rateDiagnostics = {
-      ...(rateResult.diagnostics || {}),
-      shipment: {
-        shipmentId: updatedShipment?.shipmentId || '',
-        shipmentNumber: updatedShipment?.shipmentNumber || '',
-        status: updatedShipment?.status || '',
-        carrierCode: updatedShipment?.carrierCode || '',
-        carrierFriendlyName: updatedShipment?.carrierFriendlyName || '',
-        serviceCode: updatedShipment?.serviceCode || '',
-        serviceType: updatedShipment?.serviceType || '',
-        requestedShipmentService: updatedShipment?.requestedShipmentService || '',
-        packageCode: updatedShipment?.packageCode || '',
-        ratePackageCode,
-        confirmation: updatedShipment?.confirmation || '',
-        insuranceProvider: updatedShipment?.insuranceProvider || '',
-        shipDate: updatedShipment?.shipDate || '',
-        shipTo: updatedShipment?.shipTo || null,
-        shipFrom: updatedShipment?.shipFrom || null,
-        packageCount: updatedShipment?.packages?.length || 0,
-      },
+    let ratedShipment = updatedShipment;
+    let ratePackageCode = ratedShipment?.packages?.[0]?.packageCode || ratedShipment?.packageCode || selectedPackageCode || '';
+    let rateResult = null;
+    let rateError = null;
+
+    try {
+      rateResult = await getShipmentRatesDetailed(shipmentId, {
+        carrierId: ratedShipment?.carrierId || '',
+        selectedServiceCode: ratedShipment?.serviceCode || '',
+        packageCode: ratePackageCode,
+        preferredCurrency: 'GBP',
+      });
+    } catch (err) {
+      rateError = err;
+    }
+
+    let rates = Array.isArray(rateResult?.rates) ? rateResult.rates : [];
+    let retryInfo = null;
+    const cityAsStateFallback = getEmptyStateCityFallback(updatedShipment);
+
+    if ((rateError || !rates.length) && cityAsStateFallback) {
+      const firstAttemptDiagnostics = rateError?.rateDiagnostics || rateResult?.diagnostics || null;
+      retryInfo = {
+        attempted: true,
+        applied: false,
+        reason: 'ship_to.stateProvince was empty and the first ShipStation rate attempt did not return a usable rate.',
+        stateProvince: cityAsStateFallback,
+        city: updatedShipment?.shipTo?.city || cityAsStateFallback,
+        firstAttempt: firstAttemptDiagnostics,
+        retryAttempt: null,
+      };
+
+      console.log('[ShipStation rate check] Retrying with city as state/province fallback', {
+        barcode: normalizedBarcode,
+        orderNumber: order.name,
+        shipmentId,
+        city: retryInfo.city,
+        stateProvince: cityAsStateFallback,
+        firstAttemptError: rateError?.message || '',
+        firstAttemptRateCount: rates.length,
+      });
+
+      try {
+        ratedShipment = await updateShipmentPackages({
+          shipmentId,
+          packages: shippingPackagesWithPackageCode,
+          shipToStateProvince: cityAsStateFallback,
+        });
+        retryInfo.applied = true;
+        ratePackageCode = ratedShipment?.packages?.[0]?.packageCode || ratedShipment?.packageCode || selectedPackageCode || '';
+        rateResult = await getShipmentRatesDetailed(shipmentId, {
+          carrierId: ratedShipment?.carrierId || '',
+          selectedServiceCode: ratedShipment?.serviceCode || '',
+          packageCode: ratePackageCode,
+          preferredCurrency: 'GBP',
+        });
+        rates = Array.isArray(rateResult?.rates) ? rateResult.rates : [];
+        retryInfo.retryAttempt = rateResult?.diagnostics || null;
+        rateError = null;
+      } catch (retryErr) {
+        retryInfo.retryAttempt = retryErr.rateDiagnostics || null;
+        retryErr.rateDiagnostics = {
+          ...(retryErr.rateDiagnostics || {}),
+          retry: {
+            emptyStateCityFallback: retryInfo,
+          },
+        };
+        throw retryErr;
+      }
+    }
+
+    if (rateError) {
+      throw rateError;
+    }
+
+    const rateDiagnostics = buildShippingRateRouteDiagnostics({
+      rateResult,
+      shipment: ratedShipment,
+      ratePackageCode,
       packages: shippingPackages,
-    };
+      retryInfo,
+    });
     console.log('[ShipStation rate check] Rate check completed', {
       barcode: normalizedBarcode,
       orderNumber: order.name,
       shipmentId,
-      updatedShipmentId: updatedShipment?.shipmentId || '',
-      packageCount: updatedShipment?.packages?.length || shippingPackages.length,
+      updatedShipmentId: ratedShipment?.shipmentId || '',
+      packageCount: ratedShipment?.packages?.length || shippingPackages.length,
+      cityAsStateFallbackApplied: Boolean(retryInfo?.applied),
       rateCount: rates.length,
       rates: rates.map((rate) => summarizeShippingRate(rate)),
     });
 
     if (!rates.length) {
-      if (isRoyalMailShippingEntity(updatedShipment)) {
+      if (isRoyalMailShippingEntity(ratedShipment)) {
         return res.json({
           success: true,
           orderNumber: order.name,
           payment,
-          shipment: updatedShipment,
+          shipment: ratedShipment,
           expiresAt: null,
           rates: [],
           noRateReason: 'Royal Mail service is available, but ShipStation does not return a quote through the API.',
@@ -4390,7 +4543,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       return res.status(422).json({
         success: false,
         error: 'ShipStation did not return any valid rates for this shipment.',
-        shipment: updatedShipment,
+        shipment: ratedShipment,
         rateError: true,
         rateDiagnostics,
       });
@@ -4401,7 +4554,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       shop: auth.shop,
       barcode: normalizedBarcode,
       orderNumber: order.name,
-      shipment: updatedShipment,
+      shipment: ratedShipment,
       rate,
       weightGrams: shippingPackagesWithPackageCode.reduce((sum, pkg) => sum + Math.max(1, Number(pkg.weightGrams) || 1), 0),
       expiresAt,
@@ -4413,7 +4566,7 @@ router.post('/api/pick-list/shipping/rates', async (req, res) => {
       success: true,
       orderNumber: order.name,
       payment,
-      shipment: updatedShipment,
+      shipment: ratedShipment,
       expiresAt,
       rates: rates.map((rate) => summarizeShippingRate(rate, quoteByRateId.get(rate.rateId))),
       rateDiagnostics,
@@ -4863,10 +5016,12 @@ router.post('/api/pick-list', async (req, res) => {
       response: orderResponse,
       bundleMetadataSupported,
       purchasingEntitySupported,
+      productImagesSupported,
     } = await fetchPickListOrderResponse({
       client,
       variables: queryVariables,
       includePurchasingEntity: true,
+      includeProductImages: true,
     });
 
     const orderEdge = orderResponse.data?.orders?.edges?.[0];
@@ -4971,6 +5126,7 @@ router.post('/api/pick-list', async (req, res) => {
       notesError: pickListSheet.notesError || null,
       bundleMetadataSupported,
       purchasingEntitySupported,
+      productImagesSupported,
       workflowBlocked: Boolean(workflowBlock),
       workflowBlockCode: workflowBlock?.code || null,
       workflowStatus: workflowBlock?.status || null,

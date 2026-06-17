@@ -211,6 +211,20 @@ function applyCompanyNameFallbackToAddress(address) {
   };
 }
 
+function applyStateProvinceFallbackToAddress(address, fallbackStateProvince = '') {
+  if (!address || typeof address !== 'object') return address;
+  const safeFallbackStateProvince = normalizeId(fallbackStateProvince);
+  if (!safeFallbackStateProvince) return address;
+
+  const existingStateProvince = normalizeId(address.state_province || address.stateProvince || address.state);
+  if (existingStateProvince) return address;
+
+  return {
+    ...address,
+    state_province: safeFallbackStateProvince,
+  };
+}
+
 function normalizePackageWeight(weight) {
   if (!weight || typeof weight !== 'object') return null;
   return {
@@ -965,7 +979,17 @@ function pickExistingShipmentField(shipment, key) {
 
 function getExplicitQuantityValue(item = {}) {
   if (!item || typeof item !== 'object') return undefined;
-  for (const key of ['quantity', 'qty', 'quantity_ordered', 'quantityOrdered']) {
+  const quantityKeys = [
+    'quantity',
+    'qty',
+    'item_quantity',
+    'itemQuantity',
+    'customs_quantity',
+    'customsQuantity',
+    'quantity_ordered',
+    'quantityOrdered',
+  ];
+  for (const key of quantityKeys) {
     if (Object.prototype.hasOwnProperty.call(item, key)) {
       return item[key];
     }
@@ -987,10 +1011,11 @@ function removeZeroQuantityShipStationItems(value) {
       .map(removeZeroQuantityShipStationItems);
   }
   if (!value || typeof value !== 'object') return value;
-  return Object.fromEntries(Object.entries(value).map(([key, entry]) => [
-    key,
-    removeZeroQuantityShipStationItems(entry),
-  ]));
+  if (hasZeroExplicitQuantity(value)) return undefined;
+
+  return Object.fromEntries(Object.entries(value)
+    .map(([key, entry]) => [key, removeZeroQuantityShipStationItems(entry)])
+    .filter(([, entry]) => entry !== undefined));
 }
 
 function normalizePackageUpdateEntries(packages = []) {
@@ -1006,7 +1031,9 @@ function normalizePackageUpdateEntries(packages = []) {
     .filter(Boolean);
 }
 
-function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
+function buildShipmentPackagesUpdatePayload(existingShipment, packages = [], {
+  shipToStateProvince = '',
+} = {}) {
   const raw = existingShipment?.raw || existingShipment || {};
   const normalizedPackages = normalizePackageUpdateEntries(packages);
   const allowedFields = [
@@ -1030,7 +1057,10 @@ function buildShipmentPackagesUpdatePayload(existingShipment, packages = []) {
     const value = pickExistingShipmentField(raw, field);
     if (value !== undefined && value !== null) {
       if (field === 'ship_to' || field === 'ship_from' || field === 'return_to') {
-        payload[field] = applyCompanyNameFallbackToAddress(value);
+        const addressWithNameFallback = applyCompanyNameFallbackToAddress(value);
+        payload[field] = field === 'ship_to'
+          ? applyStateProvinceFallbackToAddress(addressWithNameFallback, shipToStateProvince)
+          : addressWithNameFallback;
       } else if (field === 'customs') {
         payload[field] = removeZeroQuantityShipStationItems(value);
       } else {
@@ -1130,7 +1160,7 @@ function buildShipmentWeightUpdatePayload(existingShipment, weightGrams, package
   }]);
 }
 
-async function updateShipmentPackages({ shipmentId, packages = [] }) {
+async function updateShipmentPackages({ shipmentId, packages = [], shipToStateProvince = '' }) {
   const safeShipmentId = normalizeId(shipmentId);
   const normalizedPackages = normalizePackageUpdateEntries(packages);
   if (!safeShipmentId) throw new Error('Missing ShipStation shipment id.');
@@ -1142,6 +1172,7 @@ async function updateShipmentPackages({ shipmentId, packages = [] }) {
     shipmentId: safeShipmentId,
     packageCount: normalizedPackages.length,
     packages: normalizedPackages,
+    shipToStateProvinceFallback: normalizeId(shipToStateProvince),
   });
   const existingShipment = await getShipmentById(safeShipmentId);
   console.log('[ShipStation rate check] Existing shipment summary', {
@@ -1156,7 +1187,9 @@ async function updateShipmentPackages({ shipmentId, packages = [] }) {
     packageCount: existingShipment?.packages?.length || 0,
   });
 
-  const payload = buildShipmentPackagesUpdatePayload(existingShipment, normalizedPackages);
+  const payload = buildShipmentPackagesUpdatePayload(existingShipment, normalizedPackages, {
+    shipToStateProvince,
+  });
   console.log('[ShipStation rate check] Updating shipment packages', {
     shipmentId: safeShipmentId,
     existingShipDate: existingShipment?.shipDate || '',
@@ -1173,6 +1206,7 @@ async function updateShipmentPackages({ shipmentId, packages = [] }) {
     carrierIdPresent: Boolean(payload.carrier_id),
     serviceCode: payload.service_code || '',
     requestedShipmentService: payload.requested_shipment_service || '',
+    shipToStateProvince: payload.ship_to?.state_province || '',
   });
   console.log('[ShipStation rate check] ShipStation shipment PUT body', {
     method: 'PUT',

@@ -66,6 +66,7 @@
             <div>
               <p class="pick-new-order-queue__eyebrow">New Order Queue</p>
               <p id="newOrderQueueStatus" class="pick-new-order-queue__status">Not loaded</p>
+              <p id="newOrderQueueLastRacked" class="pick-new-order-queue__last-racked">Last racked: None yet</p>
             </div>
             <div class="pick-new-order-queue__actions">
               <button id="newOrderQueueStartBtn" type="button">Start</button>
@@ -174,6 +175,14 @@
         <button id="verifyShippingModalCloseBtn" class="pick-shipping-modal__close" type="button" aria-label="Close shipping label popup">Close</button>
       </div>
       <div id="verifyShippingModalBody" class="pick-shipping-modal__body"></div>
+    </div>
+  </div>
+
+  <div id="productImageModal" class="pick-modal pick-product-image-modal" aria-hidden="true">
+    <div class="pick-modal__panel pick-product-image-modal__panel" role="dialog" aria-modal="true" aria-labelledby="productImageModalTitle">
+      <button id="productImageModalCloseBtn" class="pick-product-image-modal__close" type="button" aria-label="Close product image preview">Close</button>
+      <img id="productImageModalImg" class="pick-product-image-modal__img" alt="" />
+      <p id="productImageModalTitle" class="pick-product-image-modal__title"></p>
     </div>
   </div>
 

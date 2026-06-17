@@ -31,6 +31,7 @@ let currentAwaitingPartsCatalog = new Map();
 let currentPickedRowCounts = new Map();
 let lastActionTag = '';
 let lastActionBarcode = '';
+let lastRackedOrder = null;
 let pendingActionReminderTarget = null;
 let suppressNextActionReminderUnload = false;
 let actionButtons = [];
@@ -70,6 +71,7 @@ const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
 const WHOLESALE_MODE_COOKIE = 'pick_list_wholesale_mode';
 const QC_MODE_COOKIE = 'pick_list_qc_mode';
+const LAST_RACKED_ORDER_STORAGE_KEY = 'pick_list_last_racked_order';
 const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built', 'on_hold']);
 const HPA_TANK_REG_REMOVAL_SKUS = new Set(['T1P_TANK-1', 'T1P_TANK-2']);
 const SHIPPING_PACKAGE_DIMENSION_UNIT = 'centimeter';
@@ -159,6 +161,12 @@ function setOrderLookupInUrl(value) {
 
 function normalizeDisplaySku(value) {
   return String(value || '').trim().toUpperCase();
+}
+
+function normalizeImageUrl(value) {
+  const url = String(value || '').trim();
+  if (!/^https?:\/\//i.test(url)) return '';
+  return url;
 }
 
 function normalizeHpaTankWarning(warning) {
@@ -1507,6 +1515,41 @@ function closeHpaTankRegRemovalPopup() {
   modal.setAttribute('aria-hidden', 'true');
 }
 
+function openProductImageModal(row) {
+  const imageUrl = normalizeImageUrl(row?.imageUrl);
+  if (!imageUrl) return;
+
+  const modal = document.getElementById('productImageModal');
+  const image = document.getElementById('productImageModalImg');
+  const title = document.getElementById('productImageModalTitle');
+  const closeButton = document.getElementById('productImageModalCloseBtn');
+  if (!modal || !image || !title) return;
+
+  const label = String(row?.productName || row?.sku || '').trim();
+  image.src = imageUrl;
+  image.alt = String(row?.imageAltText || label || 'Product image').trim();
+  title.textContent = label;
+  modal.classList.add('is-open');
+  modal.setAttribute('aria-hidden', 'false');
+  if (closeButton) closeButton.focus();
+}
+
+function closeProductImageModal() {
+  const modal = document.getElementById('productImageModal');
+  const image = document.getElementById('productImageModalImg');
+  const title = document.getElementById('productImageModalTitle');
+  if (!modal) return;
+
+  modal.classList.remove('is-open');
+  modal.setAttribute('aria-hidden', 'true');
+  if (image) {
+    image.removeAttribute('src');
+    image.alt = '';
+  }
+  if (title) title.textContent = '';
+  refocusBarcodeInputForScanner();
+}
+
 function maybeShowHpaTankRegRemovalPopupForPickRow(row, rowKey, previousCount, nextCount) {
   if (!isHpaTankPickRow(row) || nextCount <= previousCount) return;
   const alertKey = rowKey || normalizeDisplaySku(row?.sku || row?.productName || row?.title);
@@ -1859,6 +1902,56 @@ function isCurrentNewOrderQueueOrder() {
   return Boolean(activeBarcode && activeBarcode === normalizeVerifyCode(currentOrderBarcode || currentOrderNumber));
 }
 
+function normalizeLastRackedOrder(value) {
+  if (!value || typeof value !== 'object') return null;
+  const orderNumber = String(value.orderNumber || '').trim();
+  const barcode = normalizeDisplaySku(value.barcode);
+  if (!orderNumber && !barcode) return null;
+  return {
+    orderNumber,
+    barcode,
+    rackedAt: String(value.rackedAt || '').trim(),
+  };
+}
+
+function loadLastRackedOrder() {
+  try {
+    const parsed = JSON.parse(window.localStorage?.getItem(LAST_RACKED_ORDER_STORAGE_KEY) || 'null');
+    lastRackedOrder = normalizeLastRackedOrder(parsed);
+  } catch (err) {
+    lastRackedOrder = null;
+  }
+}
+
+function saveLastRackedOrder(order) {
+  lastRackedOrder = normalizeLastRackedOrder(order);
+  try {
+    if (lastRackedOrder) {
+      window.localStorage?.setItem(LAST_RACKED_ORDER_STORAGE_KEY, JSON.stringify(lastRackedOrder));
+    } else {
+      window.localStorage?.removeItem(LAST_RACKED_ORDER_STORAGE_KEY);
+    }
+  } catch (err) {
+    // Local storage is optional; the in-memory value still updates this session.
+  }
+  renderNewOrderQueuePanel();
+}
+
+function recordLastRackedOrder({ orderNumber = '', barcode = '' } = {}) {
+  saveLastRackedOrder({
+    orderNumber: String(orderNumber || '').trim(),
+    barcode: normalizeDisplaySku(barcode),
+    rackedAt: new Date().toISOString(),
+  });
+}
+
+function formatLastRackedOrderText() {
+  const order = normalizeLastRackedOrder(lastRackedOrder);
+  if (!order) return 'None yet';
+
+  return order.orderNumber || order.barcode;
+}
+
 function renderNewOrderQueuePanel() {
   const panel = document.getElementById('newOrderQueuePanel');
   if (!panel) return;
@@ -1866,6 +1959,7 @@ function renderNewOrderQueuePanel() {
   panel.hidden = !pickerModeEnabled;
 
   const status = document.getElementById('newOrderQueueStatus');
+  const lastRacked = document.getElementById('newOrderQueueLastRacked');
   const startButton = document.getElementById('newOrderQueueStartBtn');
   const refreshButton = document.getElementById('newOrderQueueRefreshBtn');
   const printButton = document.getElementById('newOrderQueuePrintBtn');
@@ -1896,6 +1990,9 @@ function renderNewOrderQueuePanel() {
     } else {
       status.textContent = `${orderCount} new_order order${orderCount === 1 ? '' : 's'} ready`;
     }
+  }
+  if (lastRacked) {
+    lastRacked.textContent = `Last racked: ${formatLastRackedOrderText()}`;
   }
 
   if (startButton) {
@@ -2679,6 +2776,7 @@ function isAnyDialogOpen() {
   const verifyShippingModal = document.getElementById('verifyShippingModal');
   const bagLabelsModal = document.getElementById('bagLabelsModal');
   const hpaTankRegRemovalModal = document.getElementById('hpaTankRegRemovalModal');
+  const productImageModal = document.getElementById('productImageModal');
 
   return Boolean(
     awaitingPartsModal?.classList.contains('is-open') ||
@@ -2688,6 +2786,7 @@ function isAnyDialogOpen() {
     verifyShippingModal?.classList.contains('is-open') ||
     bagLabelsModal?.classList.contains('is-open') ||
     hpaTankRegRemovalModal?.classList.contains('is-open') ||
+    productImageModal?.classList.contains('is-open') ||
     isOrderActionReminderDialogOpen()
   );
 }
@@ -3794,6 +3893,8 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const lineValueCurrency = String(item?.priceCurrency || '').trim().toUpperCase();
     const requiresRegRemoval = isHpaTankWarningSku(sku);
     const pickRows = findPickRowsForOrderItem(item);
+    const imageUrl = normalizeImageUrl(item?.imageUrl);
+    const imageAltText = String(item?.imageAltText || '').trim();
 
     const normalizedSku = normalizeVerifyCode(sku);
     const normalizedUpc = normalizeVerifyCode(upc);
@@ -3824,6 +3925,8 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
         isWholesaleBundle,
         bundleItemCount: 0,
         bundleParts: [],
+        imageUrl: isWholesaleBundle ? '' : imageUrl,
+        imageAltText: isWholesaleBundle ? '' : imageAltText,
         sortIndex: index,
         requiredQty: 0,
         scannedQty: 0,
@@ -3839,6 +3942,10 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const row = grouped.get(key);
     row.requiresRegRemoval = row.requiresRegRemoval || requiresRegRemoval;
     mergeVerifyPickRows(row, pickRows);
+    if (!isWholesaleBundle && !row.imageUrl && imageUrl) {
+      row.imageUrl = imageUrl;
+      row.imageAltText = imageAltText;
+    }
     row.sortIndex = Math.min(row.sortIndex, index);
     if (Number.isFinite(lineValueAmount) && lineValueAmount > 0) {
       row.totalValueAmount += lineValueAmount;
@@ -3852,6 +3959,8 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
         sku: sku || '(No SKU)',
         productName: productName || sku || upc || `Item ${index + 1}`,
         quantity: qty,
+        imageUrl,
+        imageAltText,
       });
       row.requiredQty = Math.max(
         row.requiredQty,
@@ -5377,6 +5486,45 @@ function createWholesaleVerifyWarningCard() {
   return card;
 }
 
+function createVerifyProductImageThumb(row) {
+  const imageUrl = normalizeImageUrl(row?.imageUrl);
+  const label = getVerifyDisplayLabel(row);
+  const altText = String(row?.imageAltText || label || 'Product image').trim();
+
+  if (!imageUrl) {
+    const empty = document.createElement('span');
+    empty.className = 'pick-verify-item-image pick-verify-item-image--empty';
+    empty.setAttribute('aria-hidden', 'true');
+    return empty;
+  }
+
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'pick-verify-item-image';
+  button.setAttribute('aria-label', `Expand product image for ${label}`);
+
+  const image = document.createElement('img');
+  image.src = imageUrl;
+  image.alt = altText;
+  image.loading = 'lazy';
+  image.decoding = 'async';
+  image.addEventListener('error', () => {
+    button.classList.add('pick-verify-item-image--empty');
+    button.disabled = true;
+    button.setAttribute('aria-hidden', 'true');
+    button.removeAttribute('aria-label');
+    image.remove();
+  });
+
+  button.addEventListener('click', (event) => {
+    event.stopPropagation();
+    openProductImageModal(row);
+  });
+
+  button.appendChild(image);
+  return button;
+}
+
 function renderVerifyPickLocations(row) {
   const pickRows = Array.isArray(row?.pickRows) ? row.pickRows : [];
   const wrapper = document.createElement('div');
@@ -5517,6 +5665,8 @@ function renderVerifyOrderCards() {
         refocusBarcodeInputForScanner();
       });
       item.addEventListener('keydown', async (event) => {
+        const target = event.target instanceof Element ? event.target : null;
+        if (target?.closest('button, a, input, select, textarea')) return;
         if (event.key !== 'Enter' && event.key !== ' ') return;
         if (event.key === 'Enter' && hidBuffer.trim().length > 0) return;
         event.preventDefault();
@@ -5531,6 +5681,7 @@ function renderVerifyOrderCards() {
 
     const title = document.createElement('h3');
     title.textContent = row.productName;
+    title.title = row.productName;
 
     const meta = document.createElement('p');
     if (row.isWholesaleBundle) {
@@ -5549,6 +5700,7 @@ function renderVerifyOrderCards() {
         ? 'Manual build only (no SKU/UPC barcode)'
         : 'Manual verify only (no SKU/UPC barcode)';
     }
+    meta.title = meta.textContent;
 
     info.appendChild(title);
     info.appendChild(meta);
@@ -5581,6 +5733,7 @@ function renderVerifyOrderCards() {
     progress.className = 'pick-verify-item-progress';
     progress.textContent = `${row.scannedQty} / ${row.requiredQty}`;
 
+    item.appendChild(createVerifyProductImageThumb(row));
     item.appendChild(info);
     if (verifyModeEnabled && !wholesaleModeEnabled) {
       item.appendChild(renderVerifyPickLocations(row));
@@ -6336,6 +6489,12 @@ async function runOrderAction(tag) {
     lastActionTag = tag;
     lastActionBarcode = normalizedBarcode;
     applyOrderHeaderData(data, { fallbackTag: tag });
+    if (tag === 'racked_up') {
+      recordLastRackedOrder({
+        orderNumber: data.orderNumber || currentOrderNumber,
+        barcode: normalizedBarcode,
+      });
+    }
 
     if (tag === 'wholesale_adapter_built') {
       setStatus(
@@ -6620,6 +6779,7 @@ function registerModalHandlers() {
   const verifyShippingModal = document.getElementById('verifyShippingModal');
   const bagLabelsModal = document.getElementById('bagLabelsModal');
   const hpaTankRegRemovalModal = document.getElementById('hpaTankRegRemovalModal');
+  const productImageModal = document.getElementById('productImageModal');
 
   const awaitingCancel = document.getElementById('awaitingPartsCancelBtn');
   const awaitingConfirm = document.getElementById('awaitingPartsConfirmBtn');
@@ -6636,6 +6796,7 @@ function registerModalHandlers() {
   const bagLabelsPrint = document.getElementById('bagLabelsPrintBtn');
   const bagLabelsAdd = document.getElementById('bagLabelsAddBtn');
   const hpaTankRegRemovalClose = document.getElementById('hpaTankRegRemovalCloseBtn');
+  const productImageClose = document.getElementById('productImageModalCloseBtn');
 
   if (awaitingCancel) awaitingCancel.addEventListener('click', cancelAwaitingPartsDialog);
   if (awaitingConfirm) awaitingConfirm.addEventListener('click', submitAwaitingParts);
@@ -6650,6 +6811,7 @@ function registerModalHandlers() {
   if (bagLabelsPrint) bagLabelsPrint.addEventListener('click', submitBagLabels);
   if (bagLabelsAdd) bagLabelsAdd.addEventListener('click', addBagLabelRow);
   if (hpaTankRegRemovalClose) hpaTankRegRemovalClose.addEventListener('click', closeHpaTankRegRemovalPopup);
+  if (productImageClose) productImageClose.addEventListener('click', closeProductImageModal);
   if (reminderCancel) reminderCancel.addEventListener('click', () => closeOrderActionReminderDialog());
   if (reminderContinue) {
     reminderContinue.addEventListener('click', () => {
@@ -6722,6 +6884,20 @@ function registerModalHandlers() {
       }
     });
   }
+
+  if (productImageModal) {
+    productImageModal.addEventListener('click', (event) => {
+      if (event.target === event.currentTarget) {
+        closeProductImageModal();
+      }
+    });
+  }
+
+  document.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape' && productImageModal?.classList.contains('is-open')) {
+      closeProductImageModal();
+    }
+  });
 }
 
 document.addEventListener('DOMContentLoaded', () => {
@@ -6811,6 +6987,7 @@ document.addEventListener('DOMContentLoaded', () => {
   verifyModeEnabled = getCookieValue(VERIFY_MODE_COOKIE) === '1';
   wholesaleModeEnabled = getCookieValue(WHOLESALE_MODE_COOKIE) === '1';
   qcModeEnabled = getCookieValue(QC_MODE_COOKIE) === '1';
+  loadLastRackedOrder();
 
   if (qcModeEnabled) {
     pickerModeEnabled = false;
