@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Putting Away</title>
+  <title>Part Explorer</title>
   <link rel="stylesheet" href="css/style.css" />
   <script src="/js/theme-secret.js" defer></script>
 </head>
@@ -11,32 +11,33 @@
   <main class="pick-list-layout putting-away-layout">
     <header class="pick-list-floating-header">
       <div class="pick-list-floating-header__top">
-        <nav class="pick-list-link-row" aria-label="Putting away navigation">
+        <nav class="pick-list-link-row" aria-label="Part Explorer navigation">
           <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
           <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
           <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
           <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
         </nav>
         <div class="pick-list-order-summary" aria-live="polite">
-          <p id="putAwaySummary" class="pick-list-order-meta">Putting Away</p>
-          <p id="putAwaySheetStatus" class="pick-list-order-status">No SKUs scanned</p>
+          <p id="putAwaySummary" class="pick-list-order-meta">Part Explorer</p>
+          <p id="putAwaySheetStatus" class="pick-list-order-status">No SKU selected</p>
         </div>
       </div>
 
       <div class="pick-list-floating-header__body">
         <section class="pick-list-controls" aria-label="SKU lookup">
           <div class="pick-list-input-row">
-            <input id="putAwaySkuInput" type="text" placeholder="Scan or enter SKU" autocomplete="off" autocapitalize="characters" aria-label="SKU" />
+            <input id="putAwaySkuInput" type="text" placeholder="Search or scan SKU" autocomplete="off" autocapitalize="characters" aria-label="Search or scan SKU" />
             <button id="putAwayLookupBtn" type="button" title="Look Up SKU">Lookup</button>
           </div>
           <div class="pick-list-status-row">
             <span id="putAwaySpinner" class="loader" style="display:none;"></span>
             <p id="putAwayStatus" data-type="info">Ready to scan.</p>
           </div>
+          <div id="partExplorerCatalogList" class="part-explorer-catalog-list" aria-live="polite"></div>
         </section>
 
-        <section class="put-away-actions" aria-label="Putting away actions">
-          <button id="putAwayClearBtn" type="button" class="pick-list-action-btn pick-list-action-btn--hold">Clear List</button>
+        <section class="put-away-actions" aria-label="Part Explorer actions">
+          <button id="putAwayClearBtn" type="button" class="pick-list-action-btn pick-list-action-btn--hold">Clear</button>
         </section>
       </div>
     </header>

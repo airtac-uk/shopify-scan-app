@@ -13,6 +13,7 @@ const {
   fetchPickListSheet,
   buildPickListForOrder,
   buildPutAwaySkuLookup,
+  buildPartExplorerCatalogFromSheet,
   normalizeSku,
   normalizePickType,
   getWaitingPartsTypeGroup,
@@ -3377,6 +3378,34 @@ router.get('/api/print-catalog', async (req, res) => {
   }
 });
 
+router.get('/api/part-explorer-catalog', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const pickListSheet = await fetchPickListSheet();
+    const items = buildPartExplorerCatalogFromSheet({
+      skuMap: pickListSheet.skuMap,
+    });
+
+    return res.json({
+      success: true,
+      items,
+      sheetFetchedAt: pickListSheet.fetchedAt,
+      sheetSkuCount: pickListSheet.sourceRowCount,
+      notesEnabled: pickListSheet.notesEnabled || false,
+      notesLoaded: pickListSheet.notesLoaded || false,
+      notesError: pickListSheet.notesError || null,
+    });
+  } catch (err) {
+    console.error('Error in /api/part-explorer-catalog:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
 router.get('/api/print-queue', async (req, res) => {
   try {
     const auth = resolveAuthenticatedRequest(req, res);
@@ -4185,17 +4214,20 @@ router.post('/api/qc-fail', async (req, res) => {
       orderNote: order.note || '',
     });
 
-    const timestamp = new Date()
+    const qcFailCreatedAt = new Date();
+    const timestamp = qcFailCreatedAt
       .toISOString()
       .replace('T', ' ')
       .slice(0, 16);
+    const normalizedReason = String(reason).trim();
+    const normalizedSku = normalizeSku(sku);
 
     const qcFailBlock = [
       '~',
       `QC FAIL — ${timestamp}`,
       `Team Member: ${staff}`,
-      `SKU: ${sku}`,
-      `Reason: ${String(reason).trim()}`,
+      `SKU: ${normalizedSku}`,
+      `Reason: ${normalizedReason}`,
       '',
     ].join('\n');
 
@@ -4228,6 +4260,18 @@ router.post('/api/qc-fail', async (req, res) => {
     //   });
     // }
 
+    const qcFailRecord = sessionsStore.recordQcFailReason({
+      shop,
+      barcode: normalizedBarcode,
+      orderId: order.id,
+      orderNumber: order.name,
+      sku: normalizedSku,
+      reason: normalizedReason,
+      reportedBy: staff,
+      builtBy: latestWaitingQcStaff || '',
+      createdAt: qcFailCreatedAt.toISOString(),
+    });
+
     try {
       await sendGoogleChatMessage(
         process.env.GCHAT_QC_FAIL_URL,
@@ -4235,8 +4279,8 @@ router.post('/api/qc-fail', async (req, res) => {
           `QC fail reported for order ${order.name}`,
           `Reported by: ${staff}`,
           `Built by: ${latestWaitingQcStaff || 'No waiting_qc record found'}`,
-          `SKU: ${sku}`,
-          `Reason: ${String(reason).trim()}`,
+          `SKU: ${normalizedSku}`,
+          `Reason: ${normalizedReason}`,
         ].join('\n')
       );
     } catch (chatErr) {
@@ -4246,7 +4290,8 @@ router.post('/api/qc-fail', async (req, res) => {
     return res.json({
       success: true,
       orderNumber: order.name,
-      sku,
+      sku: normalizedSku,
+      qcFailReason: qcFailRecord,
       latestWaitingQcStaff: latestWaitingQcStaff || null,
     });
   } catch (err) {
@@ -5099,6 +5144,12 @@ router.post('/api/pick-list', async (req, res) => {
       orderId: order.id,
       orderNote: order.note || '',
     });
+    const qcFailReasons = sessionsStore.getQcFailReasonsForOrder({
+      shop,
+      barcode: normalizedBarcode,
+      orderId: order.id,
+      limit: 20,
+    });
     const orderTimeline = buildInternalOrderTimeline({
       trackerRecord,
       orderNote: order.note || '',
@@ -5119,6 +5170,7 @@ router.post('/api/pick-list', async (req, res) => {
       orderHumanNote: stripAppOrderNoteBlocks(order.note || ''),
       orderTimeline,
       qcBuilderStaff,
+      qcFailReasons,
       sheetFetchedAt: pickListSheet.fetchedAt,
       sheetSkuCount: pickListSheet.sourceRowCount,
       notesEnabled: pickListSheet.notesEnabled || false,

@@ -50,6 +50,31 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE TABLE IF NOT EXISTS qc_fail_reasons (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    orderId TEXT,
+    orderNumber TEXT,
+    sku TEXT NOT NULL,
+    reason TEXT NOT NULL,
+    reportedBy TEXT,
+    builtBy TEXT,
+    createdAt TEXT NOT NULL
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_qc_fail_reasons_shop_barcode_createdAt
+  ON qc_fail_reasons (shop, barcode, createdAt DESC, id DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_qc_fail_reasons_shop_order_createdAt
+  ON qc_fail_reasons (shop, orderId, createdAt DESC, id DESC)
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS wholesale_build_progress (
     shop TEXT NOT NULL,
     barcode TEXT NOT NULL,
@@ -573,6 +598,23 @@ function normalizeShippingLabelRecord(row) {
   };
 }
 
+function normalizeQcFailReasonRecord(row) {
+  if (!row) return null;
+
+  return {
+    id: Number(row.id),
+    shop: String(row.shop || '').trim(),
+    barcode: normalizeBarcode(row.barcode),
+    orderId: String(row.orderId || '').trim(),
+    orderNumber: String(row.orderNumber || '').trim(),
+    sku: normalizeBarcode(row.sku),
+    reason: String(row.reason || '').trim(),
+    reportedBy: String(row.reportedBy || '').trim(),
+    builtBy: String(row.builtBy || '').trim(),
+    createdAt: row.createdAt || null,
+  };
+}
+
 module.exports = {
   /**
    * Save session for a shop
@@ -650,6 +692,78 @@ module.exports = {
     `).get(normalizedBarcode);
 
     return row?.staff || null;
+  },
+
+  recordQcFailReason({
+    shop,
+    barcode,
+    orderId = null,
+    orderNumber = null,
+    sku,
+    reason,
+    reportedBy = null,
+    builtBy = null,
+    createdAt = null,
+  }) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedBarcode = normalizeBarcode(barcode);
+    const normalizedSku = normalizeBarcode(sku);
+    const normalizedReason = String(reason || '').trim();
+    if (!normalizedShop || !normalizedBarcode || !normalizedSku || !normalizedReason) return null;
+
+    const createdAtValue = createdAt || new Date().toISOString();
+    const result = db.prepare(`
+      INSERT INTO qc_fail_reasons
+      (shop, barcode, orderId, orderNumber, sku, reason, reportedBy, builtBy, createdAt)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+    `).run(
+      normalizedShop,
+      normalizedBarcode,
+      orderId ? String(orderId).trim() : null,
+      orderNumber ? String(orderNumber).trim() : null,
+      normalizedSku,
+      normalizedReason,
+      reportedBy ? String(reportedBy).trim() : null,
+      builtBy ? String(builtBy).trim() : null,
+      createdAtValue
+    );
+
+    const row = db.prepare(`
+      SELECT *
+      FROM qc_fail_reasons
+      WHERE id = ?
+      LIMIT 1
+    `).get(result.lastInsertRowid);
+
+    return normalizeQcFailReasonRecord(row);
+  },
+
+  getQcFailReasonsForOrder({ shop, barcode = '', orderId = '', limit = 20 }) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedBarcode = normalizeBarcode(barcode);
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!normalizedShop || (!normalizedBarcode && !normalizedOrderId)) return [];
+
+    const filters = [];
+    const params = [normalizedShop];
+    if (normalizedBarcode) {
+      filters.push('barcode = ?');
+      params.push(normalizedBarcode);
+    }
+    if (normalizedOrderId) {
+      filters.push('orderId = ?');
+      params.push(normalizedOrderId);
+    }
+    params.push(Math.max(1, Math.min(50, Math.floor(Number(limit) || 20))));
+
+    return db.prepare(`
+      SELECT *
+      FROM qc_fail_reasons
+      WHERE shop = ?
+        AND (${filters.join(' OR ')})
+      ORDER BY createdAt DESC, id DESC
+      LIMIT ?
+    `).all(...params).map(normalizeQcFailReasonRecord).filter(Boolean);
   },
 
   getWholesaleBuildProgress({ shop, barcode }) {

@@ -4250,6 +4250,68 @@ button.pick-verify-item-image:focus-visible:not(:disabled) {
   min-width: 150px;
 }
 
+.part-explorer-catalog-list {
+  margin-top: 10px;
+}
+
+.part-explorer-catalog-list:empty {
+  display: none;
+}
+
+.part-explorer-catalog-list .print-catalog-results {
+  max-height: 280px;
+}
+
+.part-explorer-result-btn {
+  appearance: none;
+  box-sizing: border-box;
+  display: block;
+  width: 100%;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+
+.part-explorer-result-btn:hover:not(:disabled),
+.part-explorer-result-btn:focus-visible:not(:disabled) {
+  border-color: #4e7cae;
+  background: #121b27;
+}
+
+.part-explorer-result-btn:disabled {
+  cursor: wait;
+  opacity: 0.78;
+}
+
+.part-explorer-result-btn.is-selected {
+  border-color: rgba(124, 200, 255, 0.62);
+  background: rgba(39, 78, 116, 0.3);
+}
+
+.part-explorer-result-btn .print-catalog-result__main,
+.part-explorer-result__sku,
+.part-explorer-result__title,
+.part-explorer-result-btn .print-catalog-result__note {
+  display: block;
+}
+
+.part-explorer-result__sku {
+  color: #edf3fa;
+  font-size: 18px;
+  font-weight: 900;
+  line-height: 1.15;
+  overflow-wrap: anywhere;
+}
+
+.part-explorer-result__title {
+  margin-top: 4px;
+  color: #8ea0b3;
+  font-size: 12px;
+  overflow-wrap: anywhere;
+}
+
 .put-away-list {
   display: grid;
   gap: 12px;
@@ -6769,6 +6831,25 @@ html.theme-light .print-catalog-search-empty {
 
 html.theme-light .print-catalog-result {
   background: #ffffff;
+}
+
+html.theme-light .part-explorer-result-btn:hover:not(:disabled),
+html.theme-light .part-explorer-result-btn:focus-visible:not(:disabled) {
+  border-color: #a8c8e8;
+  background: #f5f9fd;
+}
+
+html.theme-light .part-explorer-result-btn.is-selected {
+  border-color: #72a8d8;
+  background: #eef7ff;
+}
+
+html.theme-light .part-explorer-result__sku {
+  color: #1b2f43;
+}
+
+html.theme-light .part-explorer-result__title {
+  color: #60758b;
 }
 
 html.theme-light .print-orientation-viewer {

@@ -239,6 +239,7 @@ function buildRowsFromTable(table) {
     h === 'TITLE'
     || h === 'NAME'
     || h === 'PRODUCT'
+    || h === 'PRODUCTNAME'
     || h === 'PRODUCTTITLE'
     || h === 'DESCRIPTION'
   ));
@@ -714,6 +715,25 @@ function buildPutAwaySkuLookup({ skuMap, sku }) {
       componentCount: Array.isArray(componentRow?.components) ? componentRow.components.length : 0,
     };
   };
+  const collectVisibleComponents = (componentSku, stackSet = new Set()) => {
+    const normalizedComponentSku = normalizeSku(componentSku);
+    if (!normalizedComponentSku) return [];
+
+    const componentRow = skuMap.get(normalizedComponentSku);
+    const childComponents = Array.isArray(componentRow?.components) ? componentRow.components : [];
+
+    if (!componentRow?.hideOwnPickRow || childComponents.length === 0 || stackSet.has(normalizedComponentSku)) {
+      return [serializeComponent(normalizedComponentSku)];
+    }
+
+    stackSet.add(normalizedComponentSku);
+    const visibleComponents = childComponents.flatMap((childSku) =>
+      collectVisibleComponents(childSku, stackSet)
+    );
+    stackSet.delete(normalizedComponentSku);
+
+    return visibleComponents.length ? visibleComponents : [serializeComponent(normalizedComponentSku)];
+  };
 
   return {
     sku: normalizedSku,
@@ -725,14 +745,71 @@ function buildPutAwaySkuLookup({ skuMap, sku }) {
     note: row.note || meta.note || '',
     classification: meta.classification,
     hideOwnPickRow: Boolean(row.hideOwnPickRow),
-    components: Array.isArray(row.components) ? row.components.map(serializeComponent) : [],
+    components: Array.isArray(row.components)
+      ? row.components.flatMap((componentSku) => collectVisibleComponents(componentSku))
+      : [],
   };
+}
+
+function countPartExplorerDescendants({ skuMap, sku, seen = new Set() }) {
+  const normalizedSku = normalizeSku(sku);
+  if (!normalizedSku || seen.has(normalizedSku)) return 0;
+
+  seen.add(normalizedSku);
+  const row = skuMap.get(normalizedSku);
+  const components = (Array.isArray(row?.components) ? row.components : [])
+    .map(normalizeSku)
+    .filter(Boolean);
+
+  return components.reduce((count, componentSku) => {
+    if (seen.has(componentSku)) return count;
+    return count + 1 + countPartExplorerDescendants({
+      skuMap,
+      sku: componentSku,
+      seen,
+    });
+  }, 0);
+}
+
+function buildPartExplorerCatalogFromSheet({ skuMap }) {
+  if (!(skuMap instanceof Map)) return [];
+
+  return Array.from(skuMap.values())
+    .map((row) => {
+      const sku = normalizeSku(row?.sku);
+      const components = (Array.isArray(row?.components) ? row.components : [])
+        .map(normalizeSku)
+        .filter(Boolean);
+      const pickType = String(row?.pickType || '').trim().toUpperCase();
+      const type = String(row?.type || '').trim().toUpperCase();
+
+      return {
+        sku,
+        title: String(row?.title || '').trim(),
+        type,
+        typeRaw: type || pickType || 'UNKNOWN',
+        pickType,
+        location: String(row?.location || '').trim(),
+        note: String(row?.note || '').trim(),
+        rsq: Math.max(0, Math.floor(Number(row?.rsq) || 0)),
+        hideOwnPickRow: Boolean(row?.hideOwnPickRow),
+        componentCount: components.length,
+        eligibleComponentCount: countPartExplorerDescendants({ skuMap, sku }),
+      };
+    })
+    .filter((item) => item.sku)
+    .sort((left, right) => {
+      const typeDiff = String(left.typeRaw || '').localeCompare(String(right.typeRaw || ''));
+      if (typeDiff !== 0) return typeDiff;
+      return String(left.sku || '').localeCompare(String(right.sku || ''));
+    });
 }
 
 module.exports = {
   fetchPickListSheet,
   buildPickListForOrder,
   buildPutAwaySkuLookup,
+  buildPartExplorerCatalogFromSheet,
   normalizeSku,
   normalizePickType,
   getWaitingPartsTypeGroup,

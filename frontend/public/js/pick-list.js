@@ -23,6 +23,7 @@ let currentOrderFinancialStatus = '';
 let currentOrderStageKey = '';
 let currentOrderStageLabel = '';
 let currentQcBuilderStaff = '';
+let currentQcFailReasons = [];
 let currentHpaTankShippingWarning = null;
 let currentWholesaleOrderWarning = null;
 let hpaTankRegRemovalAlertedKeys = new Set();
@@ -1631,6 +1632,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentOrderStageKey = '';
   currentOrderStageLabel = '';
   currentQcBuilderStaff = '';
+  currentQcFailReasons = [];
   setHpaTankShippingWarning(null);
   setWholesaleOrderWarning(null);
   currentAwaitingPartsSkuMap = new Map();
@@ -2247,24 +2249,92 @@ function applyOrderHeaderData(data, { fallbackTag = '' } = {}) {
   if (Object.prototype.hasOwnProperty.call(data || {}, 'qcBuilderStaff')) {
     currentQcBuilderStaff = String(data.qcBuilderStaff || '').trim();
   }
+  if (Object.prototype.hasOwnProperty.call(data || {}, 'qcFailReasons')) {
+    currentQcFailReasons = normalizeQcFailReasons(data.qcFailReasons);
+  }
   renderOrderHeaderMeta();
+}
+
+function normalizeQcFailReasons(items) {
+  if (!Array.isArray(items)) return [];
+
+  return items
+    .map((item) => ({
+      id: Number(item?.id || 0),
+      sku: normalizeDisplaySku(item?.sku),
+      reason: String(item?.reason || '').trim(),
+      reportedBy: String(item?.reportedBy || '').trim(),
+      builtBy: String(item?.builtBy || '').trim(),
+      createdAt: String(item?.createdAt || '').trim(),
+    }))
+    .filter((item) => item.sku || item.reason);
+}
+
+function formatQcFailTimestamp(value) {
+  if (!value) return '';
+
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value || '').trim();
+
+  return date.toLocaleString([], {
+    day: '2-digit',
+    month: 'short',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function buildQcFailReasonsNoteText(reasons = currentQcFailReasons) {
+  const items = normalizeQcFailReasons(reasons);
+  if (!items.length) return '';
+
+  const lines = ['Previous QC fail reasons'];
+  items.forEach((item) => {
+    const head = [item.sku, item.reason].filter(Boolean).join(': ');
+    const meta = [
+      item.reportedBy ? `Reported by ${item.reportedBy}` : '',
+      item.builtBy ? `Built by ${item.builtBy}` : '',
+      formatQcFailTimestamp(item.createdAt),
+    ].filter(Boolean).join(' / ');
+
+    if (head) lines.push(head);
+    if (meta) lines.push(meta);
+  });
+
+  return lines.join('\n');
+}
+
+function updateOrderNoteBanner(element, text, key) {
+  if (!element) return;
+
+  const noteText = String(text || '').trim();
+  const noteKey = noteText ? key : '';
+  const previousNoteKey = element.dataset.noteKey || '';
+  element.hidden = !noteText;
+  element.textContent = noteText;
+  element.dataset.noteKey = noteKey;
+
+  if (noteText && noteKey !== previousNoteKey) {
+    element.classList.remove('is-flashing');
+    void element.offsetWidth;
+    element.classList.add('is-flashing');
+  } else if (!noteText) {
+    element.classList.remove('is-flashing');
+  }
 }
 
 function renderOrderHeaderMeta() {
   const orderMeta = document.getElementById('pickListOrderMeta');
   const orderStatus = document.getElementById('pickListOrderStatus');
   const orderNote = document.getElementById('pickListOrderNote');
+  const qcFailNote = document.getElementById('pickListQcFailReasons');
   if (!orderMeta || !orderStatus) return;
 
   if (!currentOrderNumber && !currentOrderBarcode) {
     orderMeta.textContent = 'No order loaded';
     orderStatus.textContent = 'Awaiting scan';
-    if (orderNote) {
-      orderNote.hidden = true;
-      orderNote.textContent = '';
-      orderNote.dataset.noteKey = '';
-      orderNote.classList.remove('is-flashing');
-    }
+    updateOrderNoteBanner(orderNote, '', '');
+    updateOrderNoteBanner(qcFailNote, '', '');
     return;
   }
 
@@ -2282,21 +2352,19 @@ function renderOrderHeaderMeta() {
 
   orderMeta.textContent = `${orderLabel}${barcodeLabel}`;
   orderStatus.textContent = statusParts.length ? statusParts.join(' / ') : 'No tag or status';
-  if (orderNote) {
-    const noteText = String(currentOrderHumanNote || '').trim();
-    const noteKey = noteText ? `${currentOrderNumber || currentOrderBarcode}|${noteText}` : '';
-    const previousNoteKey = orderNote.dataset.noteKey || '';
-    orderNote.hidden = !noteText;
-    orderNote.textContent = noteText;
-    orderNote.dataset.noteKey = noteKey;
-    if (noteText && noteKey !== previousNoteKey) {
-      orderNote.classList.remove('is-flashing');
-      void orderNote.offsetWidth;
-      orderNote.classList.add('is-flashing');
-    } else if (!noteText) {
-      orderNote.classList.remove('is-flashing');
-    }
-  }
+  const noteText = String(currentOrderHumanNote || '').trim();
+  updateOrderNoteBanner(
+    orderNote,
+    noteText,
+    noteText ? `${currentOrderNumber || currentOrderBarcode}|order-note|${noteText}` : ''
+  );
+
+  const qcFailText = qcModeEnabled ? buildQcFailReasonsNoteText(currentQcFailReasons) : '';
+  updateOrderNoteBanner(
+    qcFailNote,
+    qcFailText,
+    qcFailText ? `${currentOrderNumber || currentOrderBarcode}|qc-fails|${qcFailText}` : ''
+  );
 }
 
 function isCurrentOrderLookup(value) {
@@ -6419,6 +6487,17 @@ async function submitQcFail() {
       throw new Error(data.error || 'Failed to save QC fail');
     }
 
+    if (data.qcFailReason) {
+      const [savedReason] = normalizeQcFailReasons([data.qcFailReason]);
+      if (savedReason) {
+        currentQcFailReasons = [
+          savedReason,
+          ...currentQcFailReasons.filter((item) => Number(item.id || 0) !== Number(savedReason.id || 0)),
+        ];
+        renderOrderHeaderMeta();
+      }
+    }
+
     setStatus(
       `QC fail saved for ${sku}: ${reason}. Last waiting_qc by: ${data.latestWaitingQcStaff || 'No waiting_qc record found'}`,
       'success'
@@ -7041,6 +7120,7 @@ document.addEventListener('DOMContentLoaded', () => {
     setActionButtonsEnabled(actionButtonsUnlocked);
     syncVerificationStateForMode();
     if (hasRenderedPickList) {
+      renderOrderHeaderMeta();
       renderCurrentOrderSection();
       renderOrderTimeline();
     }

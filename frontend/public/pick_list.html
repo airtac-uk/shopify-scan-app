@@ -13,7 +13,7 @@
       <div class="pick-list-floating-header__top">
         <nav class="pick-list-link-row" aria-label="Pick list navigation">
           <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
-          <a href="/putting_away.html" class="pick-list-link">Putting Away</a>
+          <a href="/putting_away.html" class="pick-list-link">Part Explorer</a>
           <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
           <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
         </nav>
@@ -80,6 +80,7 @@
 
         <section class="pick-list-actions" aria-label="Order actions">
           <p id="pickListOrderNote" class="pick-list-order-note" hidden></p>
+          <p id="pickListQcFailReasons" class="pick-list-order-note pick-list-qc-fail-note" hidden></p>
           <div class="pick-list-action-grid">
             <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false" data-qc-visible="false">Racked</button>
             <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true" data-qc-visible="false">Awaiting Parts</button>
