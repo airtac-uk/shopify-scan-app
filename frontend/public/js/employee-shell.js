@@ -1,6 +1,7 @@
 (function () {
   const NAV_LINKS = [
     { href: '/pick_list.html', label: 'Orders' },
+    { href: '/dashboard.html', label: 'Dashboard' },
     { href: '/order_flow.html', label: 'Monitor' },
     { href: '/putting_away.html', label: 'Part Explorer' },
     { href: '/awaiting_parts.html', label: 'Awaiting Parts' },

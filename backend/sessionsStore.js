@@ -200,6 +200,11 @@ db.prepare(`
   ON order_tracker_events (shop, orderId, createdAt ASC, id ASC)
 `).run();
 
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_order_tracker_events_shop_stage_createdAt
+  ON order_tracker_events (shop, stageKey, createdAt DESC, id DESC)
+`).run();
+
 const orderTrackerEventColumns = db.prepare(`
   PRAGMA table_info(order_tracker_events)
 `).all();
@@ -518,6 +523,80 @@ function safeJsonParse(value, fallback) {
 
 function generatePublicToken() {
   return crypto.randomBytes(18).toString('hex');
+}
+
+const DAILY_OPERATION_METRICS = [
+  {
+    key: 'scanned',
+    label: 'Scanned',
+    stageKeys: ['queued', 'building', 'awaiting_parts', 'quality_check', 'rebuild', 'passed_qc', 'packaged', 'on_hold', 'fulfilled', 'partially_fulfilled'],
+    countMode: 'events',
+  },
+  {
+    key: 'racked',
+    label: 'Racked',
+    stageKeys: ['queued'],
+    countMode: 'orders',
+  },
+  {
+    key: 'built',
+    label: 'Built',
+    stageKeys: ['quality_check'],
+    countMode: 'orders',
+  },
+  {
+    key: 'adapter_built',
+    label: 'Adapter Built',
+    stageKeys: ['building'],
+    countMode: 'orders',
+  },
+  {
+    key: 'qc_passed',
+    label: 'QC Passed',
+    stageKeys: ['passed_qc'],
+    countMode: 'orders',
+  },
+  {
+    key: 'qc_failed',
+    label: 'QC Failed',
+    stageKeys: ['rebuild'],
+    countMode: 'orders',
+  },
+  {
+    key: 'packed',
+    label: 'Packed',
+    stageKeys: ['packaged'],
+    countMode: 'orders',
+  },
+  {
+    key: 'awaiting_parts',
+    label: 'Awaiting Parts',
+    stageKeys: ['awaiting_parts'],
+    countMode: 'orders',
+  },
+];
+
+function getDailyOperationPeriodBounds(nowValue = new Date()) {
+  const now = nowValue instanceof Date ? nowValue : new Date(nowValue);
+  const safeNow = Number.isNaN(now.getTime()) ? new Date() : now;
+  const todayStart = new Date(
+    safeNow.getFullYear(),
+    safeNow.getMonth(),
+    safeNow.getDate()
+  );
+  const yesterdayStart = new Date(todayStart);
+  yesterdayStart.setDate(todayStart.getDate() - 1);
+
+  const weekStart = new Date(todayStart);
+  const daysSinceMonday = (todayStart.getDay() + 6) % 7;
+  weekStart.setDate(todayStart.getDate() - daysSinceMonday);
+
+  return {
+    nowIso: safeNow.toISOString(),
+    todayStartIso: todayStart.toISOString(),
+    yesterdayStartIso: yesterdayStart.toISOString(),
+    weekStartIso: weekStart.toISOString(),
+  };
 }
 
 function buildOrderTrackerRecord(tracker) {
@@ -2277,6 +2356,92 @@ module.exports = {
     `).all(normalizedShop, safeLimit);
 
     return rows.map(buildOrderTrackerRecord).filter(Boolean);
+  },
+
+  getDailyOperationsSummary({ shop, now = new Date() } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) {
+      return {
+        generatedAt: new Date().toISOString(),
+        periods: null,
+        metrics: [],
+        topStaff: [],
+      };
+    }
+
+    const bounds = getDailyOperationPeriodBounds(now);
+
+    const countForPeriod = (metric, startIso, endIso) => {
+      const stageKeys = Array.isArray(metric.stageKeys)
+        ? metric.stageKeys.map((stageKey) => String(stageKey || '').trim()).filter(Boolean)
+        : [];
+      if (!stageKeys.length) return 0;
+
+      const placeholders = stageKeys.map(() => '?').join(', ');
+      const row = db.prepare(`
+        SELECT
+          COUNT(*) AS eventCount,
+          COUNT(DISTINCT orderId) AS orderCount
+        FROM order_tracker_events
+        WHERE shop = ?
+          AND createdAt >= ?
+          AND createdAt < ?
+          AND stageKey IN (${placeholders})
+      `).get(normalizedShop, startIso, endIso, ...stageKeys);
+
+      return metric.countMode === 'events'
+        ? Number(row?.eventCount || 0)
+        : Number(row?.orderCount || 0);
+    };
+
+    const allStageKeys = Array.from(new Set(
+      DAILY_OPERATION_METRICS.flatMap((metric) => metric.stageKeys || [])
+    ));
+    const stagePlaceholders = allStageKeys.map(() => '?').join(', ');
+    const topStaff = allStageKeys.length
+      ? db.prepare(`
+          SELECT
+            COALESCE(NULLIF(TRIM(staff), ''), 'Unknown') AS staff,
+            COUNT(*) AS count
+          FROM order_tracker_events
+          WHERE shop = ?
+            AND createdAt >= ?
+            AND createdAt < ?
+            AND stageKey IN (${stagePlaceholders})
+          GROUP BY COALESCE(NULLIF(TRIM(staff), ''), 'Unknown')
+          ORDER BY count DESC, staff ASC
+          LIMIT 8
+        `).all(normalizedShop, bounds.todayStartIso, bounds.nowIso, ...allStageKeys)
+          .map((row) => ({
+            staff: String(row.staff || 'Unknown').trim() || 'Unknown',
+            count: Number(row.count || 0),
+          }))
+      : [];
+
+    return {
+      generatedAt: bounds.nowIso,
+      periods: {
+        todayStart: bounds.todayStartIso,
+        yesterdayStart: bounds.yesterdayStartIso,
+        weekStart: bounds.weekStartIso,
+      },
+      metrics: DAILY_OPERATION_METRICS.map((metric) => {
+        const today = countForPeriod(metric, bounds.todayStartIso, bounds.nowIso);
+        const yesterday = countForPeriod(metric, bounds.yesterdayStartIso, bounds.todayStartIso);
+        const week = countForPeriod(metric, bounds.weekStartIso, bounds.nowIso);
+        return {
+          key: metric.key,
+          label: metric.label,
+          today,
+          yesterday,
+          week,
+          delta: today - yesterday,
+          countMode: metric.countMode,
+          stageKeys: [...metric.stageKeys],
+        };
+      }),
+      topStaff,
+    };
   },
 
   listOrderFlowSnoozes({ shop, includeDeleted = false } = {}) {

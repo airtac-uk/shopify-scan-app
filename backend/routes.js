@@ -395,6 +395,7 @@ const ORDER_WORKFLOW_STATUS_FIELDS = `
 const TRACKER_METAFIELD_NAMESPACE = String(process.env.SHOPIFY_TRACKER_METAFIELD_NAMESPACE || 'airtac').trim();
 const TRACKER_METAFIELD_KEY = String(process.env.SHOPIFY_TRACKER_METAFIELD_KEY || 'tracker_token').trim();
 const HPA_TANK_REG_REMOVAL_SKUS = new Set(['T1P_TANK-1', 'T1P_TANK-2']);
+const ORDER_LOOKUP_CANDIDATE_LIMIT = 10;
 const ORDER_TRACKER_METAFIELD_FIELD = `
               trackerTokenMetafield: metafield(namespace: "${TRACKER_METAFIELD_NAMESPACE}", key: "${TRACKER_METAFIELD_KEY}") {
                 value
@@ -403,6 +404,60 @@ const ORDER_TRACKER_METAFIELD_FIELD = `
 
 function normalizeScanBarcode(barcode) {
   return normalizeSku(barcode);
+}
+
+function getOrderLookupTokens(value) {
+  const normalized = normalizeScanBarcode(value);
+  if (!normalized) return [];
+
+  const tokens = new Set([normalized]);
+  const withoutHash = normalized.replace(/^#/, '');
+  if (withoutHash) tokens.add(withoutHash);
+  if (withoutHash && !withoutHash.startsWith('ORDER-')) {
+    tokens.add(`ORDER-${withoutHash}`);
+  }
+  if (withoutHash.startsWith('ORDER-')) {
+    const withoutOrderPrefix = withoutHash.replace(/^ORDER-/, '');
+    if (withoutOrderPrefix) tokens.add(withoutOrderPrefix);
+  }
+  return Array.from(tokens).filter(Boolean);
+}
+
+function orderMatchesExactLookup(order, lookup) {
+  const lookupTokens = new Set(getOrderLookupTokens(lookup));
+  if (!lookupTokens.size || !order) return false;
+
+  const orderTokens = new Set([
+    ...getOrderLookupTokens(order.name),
+    ...getOrderLookupTokens(order.orderNumber),
+    ...getOrderLookupTokens(order.barcode),
+  ]);
+
+  const lineItemEdges = Array.isArray(order.lineItems?.edges) ? order.lineItems.edges : [];
+  lineItemEdges.forEach((edge) => {
+    const node = edge?.node || {};
+    getOrderLookupTokens(node?.variant?.barcode).forEach((token) => orderTokens.add(token));
+  });
+
+  return Array.from(lookupTokens).some((token) => orderTokens.has(token));
+}
+
+function selectExactOrderEdge(edges, lookup) {
+  return (Array.isArray(edges) ? edges : [])
+    .find((edge) => orderMatchesExactLookup(edge?.node, lookup)) || null;
+}
+
+function selectExactOrderNode(response, lookup) {
+  return selectExactOrderEdge(response?.data?.orders?.edges, lookup)?.node || null;
+}
+
+function buildOrderSearchQuery(lookup) {
+  const lookupTokens = getOrderLookupTokens(lookup);
+  const nameToken = lookupTokens.find((token) => !token.startsWith('ORDER-') && !token.startsWith('#'))
+    || lookupTokens.find((token) => !token.startsWith('ORDER-'))
+    || lookupTokens[0]
+    || '';
+  return nameToken ? `name:${nameToken} status:any` : 'status:any';
 }
 
 function normalizeOrderTags(tags) {
@@ -742,7 +797,7 @@ function getShippingLabelPurchaseBlock(order) {
 function getShippingOrderQuery() {
   return `
     query getOrderForShipping($query: String!) {
-      orders(first: 1, query: $query) {
+      orders(first: ${ORDER_LOOKUP_CANDIDATE_LIMIT}, query: $query) {
         edges {
           node {
             id
@@ -776,11 +831,11 @@ async function findOrderForShipping({ client, barcode }) {
 
   const response = await client.graphql(getShippingOrderQuery(), {
     variables: {
-      query: `${normalizedBarcode} status:any`,
+      query: buildOrderSearchQuery(normalizedBarcode),
     },
   });
 
-  return response.data?.orders?.edges?.[0]?.node || null;
+  return selectExactOrderNode(response, normalizedBarcode);
 }
 
 function buildPackingLabelCustomerName(order) {
@@ -2914,7 +2969,7 @@ function includesProductImageFieldError(err) {
 function getPickListOrderQuery({ includeBundleGroup, includePurchasingEntity = false, includeProductImages = false }) {
   return `
       query getOrderForPickList($query: String!) {
-        orders(first: 1, query: $query) {
+        orders(first: ${ORDER_LOOKUP_CANDIDATE_LIMIT}, query: $query) {
           edges {
             node {
               id
@@ -3131,7 +3186,7 @@ router.post('/api/tag-order', async (req, res) => {
     // --------------------------------------------------
     const query = `
       query getOrder($query: String!) {
-        orders(first: 1, query: $query) {
+        orders(first: ${ORDER_LOOKUP_CANDIDATE_LIMIT}, query: $query) {
           edges {
             node {
               id
@@ -3177,11 +3232,11 @@ router.post('/api/tag-order', async (req, res) => {
 
     const response = await client.graphql(query, {
       variables: {
-        query: `${barcode} status:any`,
+        query: buildOrderSearchQuery(normalizedBarcode),
       },
     });
 
-    const orderEdge = response.data?.orders?.edges?.[0];
+    const orderEdge = selectExactOrderEdge(response.data?.orders?.edges, normalizedBarcode);
     if (!orderEdge) {
       return res.json({ success: false, error: `Order ${barcode} not found` });
     }
@@ -3517,7 +3572,7 @@ router.post('/api/awaiting-parts', async (req, res) => {
     // --------------------------------------------------
     const findOrderQuery = `
       query findOrder($query: String!) {
-        orders(first: 1, query: $query) {
+        orders(first: ${ORDER_LOOKUP_CANDIDATE_LIMIT}, query: $query) {
           edges {
             node {
               id
@@ -3534,11 +3589,11 @@ router.post('/api/awaiting-parts', async (req, res) => {
 
     const findRes = await client.graphql(findOrderQuery, {
       variables: {
-        query: `${barcode} status:any`,
+        query: buildOrderSearchQuery(barcode),
       },
     });
 
-    const orderEdge = findRes.data?.orders?.edges?.[0];
+    const orderEdge = selectExactOrderEdge(findRes.data?.orders?.edges, barcode);
     if (!orderEdge) {
       return res.status(404).json({
         success: false,
@@ -4815,7 +4870,7 @@ router.post('/api/qc-fail', async (req, res) => {
 
     const findOrderQuery = `
       query findOrder($query: String!) {
-        orders(first: 1, query: $query) {
+        orders(first: ${ORDER_LOOKUP_CANDIDATE_LIMIT}, query: $query) {
           edges {
             node {
               id
@@ -4829,11 +4884,11 @@ router.post('/api/qc-fail', async (req, res) => {
 
     const findRes = await client.graphql(findOrderQuery, {
       variables: {
-        query: `${barcode} status:any`,
+        query: buildOrderSearchQuery(normalizedBarcode),
       },
     });
 
-    const orderEdge = findRes.data?.orders?.edges?.[0];
+    const orderEdge = selectExactOrderEdge(findRes.data?.orders?.edges, normalizedBarcode);
     if (!orderEdge) {
       return res.status(404).json({
         success: false,
@@ -5583,7 +5638,7 @@ router.post('/api/wholesale-progress', async (req, res) => {
           });
         }
 
-        const orderEdge = orderResponse.data?.orders?.edges?.[0];
+        const orderEdge = selectExactOrderEdge(orderResponse.data?.orders?.edges, normalizedBarcode);
         const order = orderEdge?.node || null;
 
         if (order?.id) {
@@ -5689,7 +5744,7 @@ router.post('/api/pick-list', async (req, res) => {
     const client = shopifyClient(session);
 
     const queryVariables = {
-      query: `${normalizedBarcode} status:any`,
+      query: buildOrderSearchQuery(normalizedBarcode),
     };
 
     const {
@@ -5704,7 +5759,7 @@ router.post('/api/pick-list', async (req, res) => {
       includeProductImages: true,
     });
 
-    const orderEdge = orderResponse.data?.orders?.edges?.[0];
+    const orderEdge = selectExactOrderEdge(orderResponse.data?.orders?.edges, normalizedBarcode);
     if (!orderEdge) {
       return res.status(404).json({ success: false, error: `Order ${normalizedBarcode} not found` });
     }
@@ -5987,6 +6042,28 @@ router.get('/api/order-flow/overview', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: err.message || 'Failed to load Monitor overview',
+    });
+  }
+});
+
+router.get('/api/dashboard/daily-output', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const summary = sessionsStore.getDailyOperationsSummary({
+      shop: auth.shop,
+    });
+
+    return res.json({
+      success: true,
+      ...summary,
+    });
+  } catch (err) {
+    console.error('Error in /api/dashboard/daily-output:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to load dashboard output summary',
     });
   }
 });

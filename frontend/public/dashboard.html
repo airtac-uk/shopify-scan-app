@@ -1,0 +1,41 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Dashboard</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body class="dashboard-page">
+  <main class="dashboard-shell" aria-labelledby="dashboardTitle">
+    <header class="dashboard-header">
+      <div>
+        <p class="dashboard-eyebrow">Live Operations</p>
+        <h1 id="dashboardTitle">Dashboard</h1>
+      </div>
+      <div class="dashboard-header__meta">
+        <time id="dashboardClock" class="dashboard-clock">--:--</time>
+        <p id="dashboardStatus" class="dashboard-status" data-type="info">Loading.</p>
+      </div>
+    </header>
+
+    <section id="dashboardSlides" class="dashboard-slides" aria-live="polite">
+      <article class="dashboard-slide is-active">
+        <div class="dashboard-loading-panel">
+          <span class="loader"></span>
+          <p>Loading dashboard.</p>
+        </div>
+      </article>
+    </section>
+
+    <footer class="dashboard-footer">
+      <div id="dashboardDots" class="dashboard-dots" aria-label="Dashboard pages"></div>
+      <span id="dashboardLastUpdated">Waiting for first load.</span>
+    </footer>
+  </main>
+
+  <script src="/js/auth-guard.js"></script>
+  <script src="js/dashboard.js"></script>
+</body>
+</html>

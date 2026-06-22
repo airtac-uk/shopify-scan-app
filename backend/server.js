@@ -26,6 +26,7 @@ const protectedEmployeePages = new Set([
   '/scan_usb.html',
   '/scan_photo.html',
   '/pick_list.html',
+  '/dashboard.html',
   '/order_flow.html',
   '/putting_away.html',
   '/awaiting_parts.html',
