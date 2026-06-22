@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Print Queue</title>
+  <title>FDM Print Queue</title>
   <link rel="stylesheet" href="css/style.css" />
   <script type="importmap">
     {
@@ -15,29 +15,29 @@
   </script>
   <script src="/js/theme-secret.js" defer></script>
 </head>
-<body class="pick-list-page print-queue-page" data-print-queue-key="sls">
+<body class="pick-list-page print-queue-page fdm-print-queue-page" data-print-queue-key="fdm">
   <main class="pick-list-layout print-queue-layout">
     <header class="pick-list-topbar">
-      <nav class="pick-list-link-row" aria-label="Print queue navigation">
+      <nav class="pick-list-link-row" aria-label="FDM print queue navigation">
+        <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
         <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
         <a href="/order_flow.html" class="pick-list-link">Monitor</a>
         <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
         <a href="/putting_away.html" class="pick-list-link">Part Explorer</a>
-        <a href="/fdm_print_queue.html" class="pick-list-link">FDM Print Queue</a>
         <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
       </nav>
-      <h1>Print Queue</h1>
-      <p>SLS and adapter print jobs through the build and dye workflow.</p>
+      <h1>FDM Print Queue</h1>
+      <p>FDM print jobs with STL and 3MF files from Google Drive.</p>
     </header>
 
     <section class="print-queue-controls">
       <div>
-        <p class="print-queue-eyebrow">Live Queue</p>
+        <p class="print-queue-eyebrow">FDM Queue</p>
         <p id="printQueueLastUpdated" class="print-queue-muted">Waiting for first load.</p>
       </div>
       <div class="print-queue-actions">
         <span id="printQueueSpinner" class="loader" style="display:none;"></span>
-        <button id="printQueueBuildBtn" type="button">Prepare SLS Build</button>
+        <button id="printQueueBuildBtn" type="button" hidden>Prepare SLS Build</button>
         <button id="printQueueRefreshBtn" type="button">Refresh</button>
       </div>
       <p id="printQueueStatus" class="print-queue-status" data-type="info">Ready.</p>
@@ -50,10 +50,10 @@
       <section class="print-queue-panel print-queue-panel--catalog">
         <div class="print-queue-panel__head">
           <div>
-            <h2 class="pick-list-section-title">Sheet Catalog</h2>
-            <p id="printCatalogSheetStatus">SLS and adapter rows from the pick-list sheet.</p>
+            <h2 class="pick-list-section-title">FDM Sheet Catalog</h2>
+            <p id="printCatalogSheetStatus">FDM rows from the pick-list sheet.</p>
           </div>
-          <input id="printCatalogSearch" class="print-queue-search" type="search" placeholder="Search SKU, type:sls, type:adapter, rsq&gt;2, has:children" autocomplete="off" autocapitalize="characters" aria-label="Search printable catalog" />
+          <input id="printCatalogSearch" class="print-queue-search" type="search" placeholder="Search SKU, type:fdm, rsq&gt;2, has:children" autocomplete="off" autocapitalize="characters" aria-label="Search FDM catalog" />
         </div>
         <div id="printCatalogList" class="print-catalog-list"></div>
       </section>
@@ -61,8 +61,8 @@
       <section class="print-queue-panel">
         <div class="print-queue-panel__head">
           <div>
-            <h2 class="pick-list-section-title">Custom File</h2>
-            <p>Add one-off files to the same workflow.</p>
+            <h2 class="pick-list-section-title">Custom FDM File</h2>
+            <p>Add one-off FDM files to the same workflow.</p>
           </div>
         </div>
         <form id="printCustomForm" class="print-custom-form">
@@ -82,7 +82,7 @@
             <span>Notes</span>
             <textarea id="printCustomNotes" rows="4"></textarea>
           </label>
-          <button type="submit">Add Custom Job</button>
+          <button type="submit">Add Custom FDM Job</button>
         </form>
       </section>
     </section>
@@ -97,7 +97,7 @@
       <div class="print-put-away-modal__head">
         <div>
           <p class="print-queue-eyebrow">Put Away Review</p>
-          <h3 id="printPutAwayTitle">Put away print job</h3>
+          <h3 id="printPutAwayTitle">Put away FDM print job</h3>
           <p id="printPutAwaySummary">Check every printed part and location before clearing this card.</p>
         </div>
       </div>

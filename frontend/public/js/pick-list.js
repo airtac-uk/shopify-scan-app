@@ -1380,6 +1380,58 @@ function formatSkuSummary(skus, maxVisible = 3) {
 function formatAwaitingPrintQueueMessage(update) {
   if (!update) return '';
 
+  const queueEntries = Object.values(update.queues || {})
+    .filter((entry) => entry && (
+      (Array.isArray(entry.addedSkus) && entry.addedSkus.length > 0)
+      || (Array.isArray(entry.alreadyQueuedSkus) && entry.alreadyQueuedSkus.length > 0)
+      || (Array.isArray(entry.blockedByQueued) && entry.blockedByQueued.length > 0)
+    ));
+  if (queueEntries.length > 0) {
+    const messages = queueEntries.map((entry) => {
+      const queueParts = [];
+      const addedSkus = Array.isArray(entry.addedSkus) ? entry.addedSkus : [];
+      const alreadyQueuedSkus = Array.isArray(entry.alreadyQueuedSkus) ? entry.alreadyQueuedSkus : [];
+      const blockedByQueued = Array.isArray(entry.blockedByQueued) ? entry.blockedByQueued : [];
+      const label = String(entry.label || getPrintQueueLabelForKey(entry.queueKey)).trim() || 'Print Queue';
+
+      if (addedSkus.length > 0) {
+        queueParts.push(`added ${formatSkuSummary(addedSkus)} to Needs Printed`);
+      }
+      if (alreadyQueuedSkus.length > 0) {
+        queueParts.push(`${formatSkuSummary(alreadyQueuedSkus)} already queued`);
+      }
+      if (blockedByQueued.length > 0) {
+        const blockedLabels = blockedByQueued.map((blockedEntry) => {
+          const sku = normalizeDisplaySku(blockedEntry?.sku);
+          const queuedSkus = formatSkuSummary(blockedEntry?.queuedSkus || [], 2);
+          return queuedSkus ? `${sku} blocked by ${queuedSkus}` : sku;
+        }).filter(Boolean);
+        if (blockedLabels.length > 0) {
+          queueParts.push(`${blockedLabels.join(', ')} already represented`);
+        }
+      }
+
+      return queueParts.length > 0 ? `${label}: ${queueParts.join('; ')}` : '';
+    }).filter(Boolean);
+
+    const extras = [];
+    const notPrintableSkus = Array.isArray(update.notPrintableSkus) ? update.notPrintableSkus : [];
+    const missingSkus = Array.isArray(update.missingSkus) ? update.missingSkus : [];
+    if (notPrintableSkus.length > 0) {
+      extras.push(`${formatSkuSummary(notPrintableSkus)} not printable`);
+    }
+    if (missingSkus.length > 0) {
+      extras.push(`${formatSkuSummary(missingSkus)} not found in the sheet`);
+    }
+    if (update.error) {
+      extras.push(`print queue not updated: ${update.error}`);
+    }
+
+    return [...messages, ...extras].length > 0
+      ? `${[...messages, ...extras].join('. ')}.`
+      : '';
+  }
+
   const parts = [];
   const addedSkus = Array.isArray(update.addedSkus) ? update.addedSkus : [];
   const alreadyQueuedSkus = Array.isArray(update.alreadyQueuedSkus) ? update.alreadyQueuedSkus : [];
@@ -1404,7 +1456,7 @@ function formatAwaitingPrintQueueMessage(update) {
     }
   }
   if (notPrintableSkus.length > 0) {
-    parts.push(`${formatSkuSummary(notPrintableSkus)} not SLS/Adapter`);
+    parts.push(`${formatSkuSummary(notPrintableSkus)} not printable`);
   }
   if (missingSkus.length > 0) {
     parts.push(`${formatSkuSummary(missingSkus)} not found in the sheet`);
@@ -1417,9 +1469,23 @@ function formatAwaitingPrintQueueMessage(update) {
 }
 
 function isPrintablePickListType(type) {
+  return Boolean(getPrintQueueKeyForPickListType(type));
+}
+
+function getPrintQueueKeyForPickListType(type) {
   const normalized = String(type || '').trim().toUpperCase();
-  return /(^|[^A-Z0-9])SLS([^A-Z0-9]|$)/.test(normalized)
-    || /(^|[^A-Z0-9])ADAPTER([^A-Z0-9]|$)/.test(normalized);
+  if (/(^|[^A-Z0-9])FDM([^A-Z0-9]|$)/.test(normalized)) return 'fdm';
+  if (
+    /(^|[^A-Z0-9])SLS([^A-Z0-9]|$)/.test(normalized)
+    || /(^|[^A-Z0-9])ADAPTER([^A-Z0-9]|$)/.test(normalized)
+  ) {
+    return 'sls';
+  }
+  return '';
+}
+
+function getPrintQueueLabelForKey(queueKey) {
+  return queueKey === 'fdm' ? 'FDM Print Queue' : 'Print Queue';
 }
 
 function getRowRsq(row) {
@@ -2986,17 +3052,20 @@ async function addGettingLowToPrintQueue(row) {
   const normalizedSku = normalizeDisplaySku(row?.sku);
   if (!normalizedSku || loading || isCurrentOrderWorkflowBlocked()) return false;
 
+  const queueKey = getPrintQueueKeyForPickListType(row?.typeRaw || row?.type);
+  const queueLabel = getPrintQueueLabelForKey(queueKey);
   const quantity = promptGettingLowQuantity(row);
   if (quantity === null) return false;
 
   setLoading(true);
-  setStatus(`Adding ${normalizedSku} x${quantity} to Needs Printed...`, 'info');
+  setStatus(`Adding ${normalizedSku} x${quantity} to ${queueLabel}...`, 'info');
 
   try {
-    const response = await fetch('/api/print-queue/catalog', {
+    const queueQuery = queueKey ? `?queue=${encodeURIComponent(queueKey)}` : '';
+    const response = await fetch(`/api/print-queue/catalog${queueQuery}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
-      body: JSON.stringify({ sku: normalizedSku, quantity }),
+      body: JSON.stringify({ sku: normalizedSku, quantity, queueKey }),
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.success) {
@@ -3004,9 +3073,9 @@ async function addGettingLowToPrintQueue(row) {
     }
 
     const addedPartCount = Number(data.createdPartCount || data.createdCount || 0);
-    const message = `Added ${normalizedSku} x${quantity} to Needs Printed${addedPartCount > 1 ? ` (${addedPartCount} build parts)` : ''}.`;
+    const message = `Added ${normalizedSku} x${quantity} to ${queueLabel} Needs Printed${addedPartCount > 1 ? ` (${addedPartCount} build parts)` : ''}.`;
     setStatus(message, 'success');
-    openAwaitingPrintQueueResultPopup(`Print queue: ${message}`, { isError: false });
+    openAwaitingPrintQueueResultPopup(`${queueLabel}: ${message}`, { isError: false });
     return true;
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
@@ -3018,11 +3087,12 @@ async function addGettingLowToPrintQueue(row) {
 
 function createGettingLowButton(row) {
   const normalizedSku = normalizeDisplaySku(row?.sku);
+  const queueLabel = getPrintQueueLabelForKey(getPrintQueueKeyForPickListType(row?.typeRaw || row?.type));
   const button = document.createElement('button');
   button.type = 'button';
   button.className = 'pick-list-getting-low-btn';
   button.textContent = 'Getting low';
-  button.title = `Add ${normalizedSku} to Needs Printed without changing the order tag`;
+  button.title = `Add ${normalizedSku} to ${queueLabel} without changing the order tag`;
   button.disabled = loading || isCurrentOrderWorkflowBlocked();
   button.addEventListener('click', async (event) => {
     event.preventDefault();

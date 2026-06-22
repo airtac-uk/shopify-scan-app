@@ -12,8 +12,10 @@
     <header class="pick-list-topbar">
       <div class="pick-list-link-row">
         <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
+        <a href="/order_flow.html" class="pick-list-link">Monitor</a>
         <a href="/putting_away.html" class="pick-list-link">Part Explorer</a>
         <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
+        <a href="/fdm_print_queue.html" class="pick-list-link">FDM Print Queue</a>
         <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
       </div>
       <h1>Awaiting Parts Queue</h1>
@@ -46,7 +48,7 @@
     <section class="awaiting-parts-filters-card">
       <div class="awaiting-parts-filters-card__head">
         <h2 class="pick-list-section-title">Filter By Type</h2>
-        <p>Group Adapter and SLS are combined into one queue.</p>
+        <p>SLS and adapter feed Print Queue. FDM feeds FDM Print Queue.</p>
       </div>
       <div id="awaitingPartsFilters" class="awaiting-parts-filters"></div>
     </section>
@@ -57,6 +59,7 @@
   </main>
 
   <script src="/js/auth-guard.js"></script>
+  <script src="/js/employee-shell.js"></script>
   <script src="js/awaiting-parts-dashboard.js"></script>
 </body>
 </html>

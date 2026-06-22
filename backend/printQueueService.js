@@ -8,8 +8,40 @@ const PRINT_QUEUE_STAGES = [
   { key: 'complete', label: 'Complete' },
 ];
 
+const PRINT_QUEUE_CONFIGS = {
+  sls: {
+    key: 'sls',
+    label: 'Print Queue',
+    shortLabel: 'SLS / Adapter',
+    catalogLabel: 'SLS and adapter rows',
+    emptyCatalogLabel: 'No SLS or adapter SKUs found in the sheet.',
+    supportsPreformBuild: true,
+    typeMatches: ['SLS', 'ADAPTER'],
+  },
+  fdm: {
+    key: 'fdm',
+    label: 'FDM Print Queue',
+    shortLabel: 'FDM',
+    catalogLabel: 'FDM rows',
+    emptyCatalogLabel: 'No FDM SKUs found in the sheet.',
+    supportsPreformBuild: false,
+    typeMatches: ['FDM'],
+  },
+};
+
+const DEFAULT_PRINT_QUEUE_KEY = 'sls';
+const PRINT_QUEUE_KEYS = new Set(Object.keys(PRINT_QUEUE_CONFIGS));
 const PRINT_QUEUE_STAGE_KEYS = new Set(PRINT_QUEUE_STAGES.map((stage) => stage.key));
 const DEFAULT_PRINT_QUEUE_STAGE = 'needs_printed';
+
+function normalizePrintQueueKey(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return PRINT_QUEUE_KEYS.has(normalized) ? normalized : DEFAULT_PRINT_QUEUE_KEY;
+}
+
+function getPrintQueueConfig(value) {
+  return PRINT_QUEUE_CONFIGS[normalizePrintQueueKey(value)] || PRINT_QUEUE_CONFIGS[DEFAULT_PRINT_QUEUE_KEY];
+}
 
 function normalizeStageKey(value) {
   const normalized = String(value || '').trim().toLowerCase();
@@ -59,14 +91,26 @@ function normalizePrintableType(value) {
   return normalizePickType(value);
 }
 
-function isPrintableSheetType(type) {
+function typeContainsToken(type, token) {
   const normalized = normalizePrintableType(type);
-  return /(^|[^A-Z0-9])SLS([^A-Z0-9]|$)/.test(normalized)
-    || /(^|[^A-Z0-9])ADAPTER([^A-Z0-9]|$)/.test(normalized);
+  const escapedToken = String(token || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`(^|[^A-Z0-9])${escapedToken}([^A-Z0-9]|$)`).test(normalized);
 }
 
-function isPrintableSheetRow(row) {
-  return isPrintableSheetType(row?.type || row?.pickType);
+function isPrintableSheetType(type, queueKey = DEFAULT_PRINT_QUEUE_KEY) {
+  const config = getPrintQueueConfig(queueKey);
+  return config.typeMatches.some((token) => typeContainsToken(type, token));
+}
+
+function isPrintableSheetRow(row, queueKey = DEFAULT_PRINT_QUEUE_KEY) {
+  return isPrintableSheetType(row?.type || row?.pickType, queueKey);
+}
+
+function getPrintQueueKeyForSheetRow(row) {
+  const type = row?.type || row?.pickType;
+  if (isPrintableSheetType(type, 'fdm')) return 'fdm';
+  if (isPrintableSheetType(type, 'sls')) return 'sls';
+  return '';
 }
 
 function getComponentItems(row) {
@@ -87,7 +131,7 @@ function getComponentItems(row) {
     .filter((component) => component.sku);
 }
 
-function countEligibleDescendants({ skuMap, sku, seen = new Set() }) {
+function countEligibleDescendants({ skuMap, sku, queueKey = DEFAULT_PRINT_QUEUE_KEY, seen = new Set() }) {
   const normalizedSku = normalizeSku(sku);
   if (!normalizedSku || seen.has(normalizedSku)) return 0;
 
@@ -99,16 +143,17 @@ function countEligibleDescendants({ skuMap, sku, seen = new Set() }) {
     if (!component.sku || seen.has(component.sku)) return count;
 
     const componentRow = skuMap.get(component.sku);
-    const ownCount = isPrintableSheetRow(componentRow) ? 1 : 0;
+    const ownCount = isPrintableSheetRow(componentRow, queueKey) ? 1 : 0;
     return count + ownCount + countEligibleDescendants({
       skuMap,
       sku: component.sku,
+      queueKey,
       seen,
     });
   }, 0);
 }
 
-function serializeSheetRow({ skuMap, sku, parentSku = '', rootSku = '' }) {
+function serializeSheetRow({ skuMap, sku, parentSku = '', rootSku = '', queueKey = DEFAULT_PRINT_QUEUE_KEY }) {
   const normalizedSku = normalizeSku(sku);
   const row = skuMap.get(normalizedSku);
   const typeRaw = normalizePrintableType(row?.type || row?.pickType);
@@ -131,6 +176,7 @@ function serializeSheetRow({ skuMap, sku, parentSku = '', rootSku = '' }) {
     eligibleComponentCount: countEligibleDescendants({
       skuMap,
       sku: normalizedSku,
+      queueKey,
     }),
     components,
     componentItems,
@@ -142,6 +188,7 @@ function serializeSheetRow({ skuMap, sku, parentSku = '', rootSku = '' }) {
 function collectPrintableSkuWithChildren({
   skuMap,
   sku,
+  queueKey = DEFAULT_PRINT_QUEUE_KEY,
   rootSku = '',
   parentSku = '',
   seen = new Set(),
@@ -158,6 +205,7 @@ function collectPrintableSkuWithChildren({
     sku: normalizedSku,
     parentSku,
     rootSku: rootSku || normalizedSku,
+    queueKey,
   });
   const baseQuantity = rootQuantity == null ? row.defaultQuantity : rootQuantity;
   const isRootRow = !normalizeSku(parentSku);
@@ -171,23 +219,28 @@ function collectPrintableSkuWithChildren({
   const childRows = row.componentItems.flatMap((component) => collectPrintableSkuWithChildren({
     skuMap,
     sku: component.sku,
+    queueKey,
     rootSku: rootSku || normalizedSku,
     parentSku: normalizedSku,
     seen,
     rootQuantity: baseQuantity,
   }));
 
-  return includeCurrent || isPrintableSheetRow(sheetRow)
+  return includeCurrent || isPrintableSheetRow(sheetRow, queueKey)
     ? [rowWithQuantity, ...childRows]
     : childRows;
 }
 
-function buildPrintCatalogFromSheet({ skuMap }) {
+function buildPrintCatalogFromSheet({ skuMap, queueKey = DEFAULT_PRINT_QUEUE_KEY }) {
   if (!(skuMap instanceof Map)) return [];
+  const normalizedQueueKey = normalizePrintQueueKey(queueKey);
 
   return Array.from(skuMap.entries())
-    .filter(([, row]) => isPrintableSheetRow(row))
-    .map(([sku]) => serializeSheetRow({ skuMap, sku }))
+    .filter(([, row]) => isPrintableSheetRow(row, normalizedQueueKey))
+    .map(([sku]) => ({
+      ...serializeSheetRow({ skuMap, sku, queueKey: normalizedQueueKey }),
+      queueKey: normalizedQueueKey,
+    }))
     .sort((left, right) => {
       const typeDiff = left.typeRaw.localeCompare(right.typeRaw);
       if (typeDiff !== 0) return typeDiff;
@@ -195,19 +248,21 @@ function buildPrintCatalogFromSheet({ skuMap }) {
     });
 }
 
-function buildPrintQueueItemsForCatalogSku({ skuMap, sku, quantity = null }) {
+function buildPrintQueueItemsForCatalogSku({ skuMap, sku, quantity = null, queueKey = DEFAULT_PRINT_QUEUE_KEY }) {
   const normalizedSku = normalizeSku(sku);
+  const normalizedQueueKey = normalizePrintQueueKey(queueKey);
   if (!normalizedSku || !(skuMap instanceof Map) || !skuMap.has(normalizedSku)) {
     return [];
   }
 
-  if (!isPrintableSheetRow(skuMap.get(normalizedSku))) {
+  if (!isPrintableSheetRow(skuMap.get(normalizedSku), normalizedQueueKey)) {
     return [];
   }
 
   const printableRows = collectPrintableSkuWithChildren({
     skuMap,
     sku: normalizedSku,
+    queueKey: normalizedQueueKey,
     includeCurrent: true,
     rootQuantity: quantity == null ? null : parsePositiveInteger(quantity, 1),
   });
@@ -215,6 +270,7 @@ function buildPrintQueueItemsForCatalogSku({ skuMap, sku, quantity = null }) {
   if (!rootRow) return [];
 
   return [{
+    queueKey: normalizedQueueKey,
     sourceType: 'catalog',
     sku: rootRow.sku,
     rootSku: rootRow.rootSku,
@@ -242,11 +298,16 @@ function buildPrintQueueItemsForCatalogSku({ skuMap, sku, quantity = null }) {
 
 module.exports = {
   PRINT_QUEUE_STAGES,
+  PRINT_QUEUE_CONFIGS,
+  DEFAULT_PRINT_QUEUE_KEY,
   DEFAULT_PRINT_QUEUE_STAGE,
+  normalizePrintQueueKey,
+  getPrintQueueConfig,
   normalizeStageKey,
   getPrintQueueStage,
   isPrintableSheetType,
   isPrintableSheetRow,
+  getPrintQueueKeyForSheetRow,
   buildPrintCatalogFromSheet,
   buildPrintQueueItemsForCatalogSku,
   parsePositiveInteger,

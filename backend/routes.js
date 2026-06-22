@@ -30,9 +30,14 @@ const {
 } = require('./orderTrackerService');
 const {
   PRINT_QUEUE_STAGES,
+  PRINT_QUEUE_CONFIGS,
+  DEFAULT_PRINT_QUEUE_KEY,
   DEFAULT_PRINT_QUEUE_STAGE,
+  normalizePrintQueueKey,
+  getPrintQueueConfig,
   normalizeStageKey,
   isPrintableSheetRow,
+  getPrintQueueKeyForSheetRow,
   buildPrintCatalogFromSheet,
   buildPrintQueueItemsForCatalogSku,
   parsePositiveInteger,
@@ -152,6 +157,29 @@ function sendAuthRequired(res, error) {
   });
 }
 
+function clearFrontendAuthCookies(res) {
+  const cookieOptions = { sameSite: 'lax' };
+  res.clearCookie('shop', cookieOptions);
+  res.clearCookie('userId', cookieOptions);
+  res.clearCookie('authReturnTo', cookieOptions);
+}
+
+function getSessionDisplayUser(session, cookieUser) {
+  const fromCookie = String(cookieUser || '').trim();
+  if (fromCookie) return fromCookie;
+
+  const associatedUser = session?.associated_user;
+  if (!associatedUser) return '';
+  if (typeof associatedUser === 'string') return associatedUser.trim();
+
+  return String(
+    associatedUser.first_name ||
+    associatedUser.name ||
+    associatedUser.email ||
+    ''
+  ).trim();
+}
+
 router.get('/auth', async (req, res) => {
   try {
     const shop = req.query.shop;
@@ -207,8 +235,13 @@ router.get('/auth/callback', async (req, res) => {
     console.log("Data");
     console.log(JSON.stringify(data));
 
+    const associatedUserName = getSessionDisplayUser(
+      { associated_user: data.associated_user },
+      ''
+    );
+
     // Store session in SQLite
-    sessionsStore.set(shop, { shop, accessToken, isOnline: false, associated_user: data.associated_user.first_name });
+    sessionsStore.set(shop, { shop, accessToken, isOnline: false, associated_user: associatedUserName });
 
     try {
       const client = shopifyClient({ shop, accessToken, isOnline: false });
@@ -219,7 +252,7 @@ router.get('/auth/callback', async (req, res) => {
 
     // Set cookie for frontend
     res.cookie('shop', shop, { httpOnly: false, sameSite: 'lax' });
-    res.cookie('userId', data.associated_user.first_name, { httpOnly: false, sameSite: 'lax' });
+    res.cookie('userId', associatedUserName, { httpOnly: false, sameSite: 'lax' });
 
 
     const returnTo = getSafeAuthReturnTo(req.cookies?.authReturnTo);
@@ -232,6 +265,16 @@ router.get('/auth/callback', async (req, res) => {
     console.error('Error in /auth/callback:', err);
     res.status(500).send('OAuth failed');
   }
+});
+
+router.post('/auth/logout', (req, res) => {
+  clearFrontendAuthCookies(res);
+  res.json({ success: true, loginUrl: '/' });
+});
+
+router.get('/auth/logout', (req, res) => {
+  clearFrontendAuthCookies(res);
+  res.redirect('/');
 });
 
 router.get('/api/auth/status', async (req, res) => {
@@ -255,9 +298,11 @@ router.get('/api/auth/status', async (req, res) => {
   } catch (webhookErr) {
     console.error(`Failed to ensure orders/create webhook for ${shop}:`, webhookErr);
   }
-
-
-  res.json({ authenticated: true, shop: req.cookies.shop });
+  res.json({
+    authenticated: true,
+    shop: req.cookies.shop,
+    user: getSessionDisplayUser(session, req.cookies.userId),
+  });
 });
 
 async function sendGoogleChatMessage(webhookUrl, text) {
@@ -326,6 +371,21 @@ const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED'
 const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
 const SHIPPING_ALLOWED_FINANCIAL_STATUSES = new Set(['PAID', 'PARTIALLY_REFUNDED']);
 const SHIPPING_LABEL_PURCHASE_STAGE_KEYS = new Set(['packaged', 'fulfilled', 'partially_fulfilled']);
+const ORDER_FLOW_TERMINAL_WORKFLOW_STATUSES = new Set(['FULFILLED', 'RESTOCKED', 'CANCELLED']);
+const ORDER_FLOW_DEFAULT_NEW_ORDER_WORKING_DAYS = 1;
+const ORDER_FLOW_DEFAULT_STAGE_THRESHOLD_WORKING_DAYS = 1;
+const ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS = {
+  received: 0.25,
+  queued: 1,
+  building: 1,
+  awaiting_parts: 3,
+  quality_check: 0.5,
+  rebuild: 2,
+  passed_qc: 1,
+  packaged: 1,
+  on_hold: 3,
+  partially_fulfilled: 3,
+};
 const ORDER_WORKFLOW_STATUS_FIELDS = `
               displayFulfillmentStatus
               displayFinancialStatus
@@ -887,6 +947,507 @@ async function listNewOrderQueueOrders({ client, maxOrders = 1000, pageSize = 10
   };
 }
 
+function parseOrderFlowPositiveNumber(value, fallback, { min = 0.25, max = 720 } = {}) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return fallback;
+  return Math.min(max, Math.max(min, parsed));
+}
+
+function parseOrderFlowWorkingDays(value, fallback, { min = 0.25, max = 60 } = {}) {
+  return parseOrderFlowPositiveNumber(value, fallback, { min, max });
+}
+
+function parseOrderFlowStageWorkingDays(value) {
+  let rawValue = value;
+  if (typeof rawValue === 'string') {
+    try {
+      rawValue = JSON.parse(rawValue);
+    } catch (err) {
+      rawValue = {};
+    }
+  }
+
+  const rawThresholds = rawValue && typeof rawValue === 'object' && !Array.isArray(rawValue)
+    ? rawValue
+    : {};
+
+  return Object.keys(ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS).reduce((acc, stageKey) => {
+    acc[stageKey] = parseOrderFlowWorkingDays(
+      rawThresholds[stageKey],
+      ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS[stageKey],
+      { min: 0.25, max: 60 }
+    );
+    return acc;
+  }, {});
+}
+
+function getOrderFlowStageThresholdWorkingDays(
+  stageKey,
+  stageWorkingDays = ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS,
+  fallbackWorkingDays = ORDER_FLOW_DEFAULT_STAGE_THRESHOLD_WORKING_DAYS
+) {
+  const normalizedStageKey = String(stageKey || '').trim();
+  const stageThreshold = Number(stageWorkingDays?.[normalizedStageKey]);
+  return Number.isFinite(stageThreshold) && stageThreshold > 0 ? stageThreshold : fallbackWorkingDays;
+}
+
+function getOrderFlowDateMs(value) {
+  const date = value ? new Date(value) : null;
+  if (!date || Number.isNaN(date.getTime())) return null;
+  return date.getTime();
+}
+
+function getOrderFlowElapsedCalendarHours(nowMs, value) {
+  const dateMs = getOrderFlowDateMs(value);
+  if (!dateMs) return null;
+  return Math.max(0, (nowMs - dateMs) / 3600000);
+}
+
+function isOrderFlowWorkingDay(date) {
+  const day = date.getDay();
+  return day !== 0 && day !== 6;
+}
+
+function getOrderFlowElapsedWorkingDays(nowMs, value) {
+  const startMs = getOrderFlowDateMs(value);
+  if (!startMs || !Number.isFinite(nowMs) || nowMs <= startMs) return null;
+
+  let cursor = new Date(startMs);
+  const endMs = nowMs;
+  let workingMs = 0;
+
+  while (cursor.getTime() < endMs) {
+    const dayEnd = new Date(cursor);
+    dayEnd.setHours(24, 0, 0, 0);
+    const segmentEndMs = Math.min(dayEnd.getTime(), endMs);
+
+    if (isOrderFlowWorkingDay(cursor)) {
+      workingMs += Math.max(0, segmentEndMs - cursor.getTime());
+    }
+
+    cursor = new Date(segmentEndMs);
+  }
+
+  return workingMs / 86400000;
+}
+
+function getOrderFlowLatestStaff(tracker) {
+  const events = Array.isArray(tracker?.events) ? tracker.events : [];
+  for (let index = events.length - 1; index >= 0; index -= 1) {
+    const staff = String(events[index]?.staff || '').trim();
+    if (staff) return staff;
+  }
+  return '';
+}
+
+function getOrderFlowTrackerStage(tracker, shopifyOrder = null) {
+  if (tracker?.currentStageKey) {
+    return {
+      key: String(tracker.currentStageKey || '').trim(),
+      label: String(tracker.currentStageLabel || '').trim() || formatOrderStatusLabel(tracker.currentStageKey),
+    };
+  }
+
+  const derived = deriveTrackerStage({
+    explicitTag: '',
+    tags: shopifyOrder?.tags || [],
+    cancelledAt: shopifyOrder?.cancelledAt,
+    displayFulfillmentStatus: shopifyOrder?.fulfillmentStatus || shopifyOrder?.displayFulfillmentStatus,
+    orderNote: shopifyOrder?.orderNote || shopifyOrder?.note || '',
+  });
+  return {
+    key: derived.key,
+    label: derived.label,
+  };
+}
+
+function summarizeOrderFlowShopifyOrder(order) {
+  if (!order?.id) return null;
+  const lineItems = Array.isArray(order.lineItems?.edges)
+    ? buildCurrentOrderLineItems(order.lineItems.edges)
+    : [];
+  const itemCount = lineItems.reduce((sum, item) => sum + Math.max(0, Number(item.quantity) || 0), 0);
+  return {
+    id: String(order.id || '').trim(),
+    orderNumber: String(order.name || '').trim(),
+    barcode: normalizeScanBarcode(order.name || ''),
+    createdAt: order.createdAt || '',
+    updatedAt: order.updatedAt || '',
+    tags: normalizeOrderTags(order.tags),
+    financialStatus: String(order.displayFinancialStatus || '').trim(),
+    fulfillmentStatus: String(order.displayFulfillmentStatus || '').trim(),
+    cancelledAt: order.cancelledAt || null,
+    cancelReason: String(order.cancelReason || '').trim(),
+    itemCount,
+    firstItemTitle: String(lineItems[0]?.title || '').trim(),
+    orderNote: stripAppOrderNoteBlocks(order.note),
+  };
+}
+
+async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100 } = {}) {
+  const safeMaxOrders = Math.max(1, Math.min(1000, Math.floor(Number(maxOrders) || 500)));
+  const safePageSize = Math.max(1, Math.min(250, Math.floor(Number(pageSize) || 100)));
+  const query = `
+    query getOrderFlowOpenOrders($first: Int!, $after: String) {
+      orders(first: $first, after: $after, query: "status:open", sortKey: CREATED_AT, reverse: false) {
+        edges {
+          cursor
+          node {
+            id
+            name
+            createdAt
+            updatedAt
+            note
+            tags
+            ${ORDER_WORKFLOW_STATUS_FIELDS}
+            lineItems(first: 10) {
+              edges {
+                node {
+                  id
+                  title
+                  sku
+                  quantity
+                  currentQuantity
+                  variantTitle
+                  variant {
+                    barcode
+                  }
+                }
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  `;
+
+  const orders = [];
+  const seenOrderIds = new Set();
+  let after = null;
+  let hasNextPage = true;
+  let pagesFetched = 0;
+
+  while (hasNextPage && orders.length < safeMaxOrders) {
+    const first = Math.min(safePageSize, safeMaxOrders - orders.length);
+    const response = await client.graphql(query, {
+      variables: {
+        first,
+        after,
+      },
+    });
+    pagesFetched += 1;
+
+    const connection = response.data?.orders || {};
+    const edges = Array.isArray(connection.edges) ? connection.edges : [];
+    edges.forEach((edge) => {
+      const order = summarizeOrderFlowShopifyOrder(edge?.node);
+      if (!order?.id || seenOrderIds.has(order.id)) return;
+      seenOrderIds.add(order.id);
+      orders.push(order);
+    });
+
+    hasNextPage = Boolean(connection.pageInfo?.hasNextPage);
+    after = connection.pageInfo?.endCursor || edges[edges.length - 1]?.cursor || null;
+    if (hasNextPage && !after) break;
+  }
+
+  return {
+    orders,
+    pagesFetched,
+    hasMore: hasNextPage && orders.length >= safeMaxOrders,
+    maxOrders: safeMaxOrders,
+  };
+}
+
+function isOrderFlowTrackerTerminal(tracker) {
+  const workflowStatus = String(tracker?.workflowStatus || '').trim().toUpperCase();
+  return Boolean(tracker?.currentStageIsTerminal) || ORDER_FLOW_TERMINAL_WORKFLOW_STATUSES.has(workflowStatus);
+}
+
+function getOrderFlowIssueKey({ orderId, barcode, type, stageKey }) {
+  const sourceRef = String(orderId || barcode || '').trim();
+  const normalizedType = String(type || '').trim();
+  const normalizedStageKey = String(stageKey || '').trim();
+  const rawKey = [sourceRef, normalizedType, normalizedStageKey].join('|');
+  return `of_${crypto.createHash('sha256').update(rawKey).digest('hex').slice(0, 32)}`;
+}
+
+function buildOrderFlowIssue({
+  type,
+  severity,
+  reason,
+  shopifyOrder = null,
+  tracker = null,
+  nowMs,
+  thresholdWorkingDays = null,
+  source = 'shopify',
+}) {
+  const stage = getOrderFlowTrackerStage(tracker, shopifyOrder);
+  const orderId = String(shopifyOrder?.id || tracker?.orderId || '').trim();
+  const orderNumber = String(shopifyOrder?.orderNumber || tracker?.orderNumber || '').trim();
+  const barcode = normalizeScanBarcode(shopifyOrder?.barcode || tracker?.barcode || orderNumber);
+  const createdAt = shopifyOrder?.createdAt || tracker?.orderCreatedAt || null;
+  const lastEventAt = tracker?.lastEventAt || tracker?.updatedAt || null;
+  const ageWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, createdAt);
+  const idleWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, lastEventAt);
+  const ageCalendarHours = getOrderFlowElapsedCalendarHours(nowMs, createdAt);
+  const idleCalendarHours = getOrderFlowElapsedCalendarHours(nowMs, lastEventAt);
+  const tags = Array.from(new Set([
+    ...normalizeOrderTags(shopifyOrder?.tags),
+  ])).sort((left, right) => left.localeCompare(right));
+  const issueKey = getOrderFlowIssueKey({
+    orderId,
+    barcode,
+    type,
+    stageKey: stage.key,
+  });
+
+  return {
+    issueKey,
+    type,
+    severity,
+    reason,
+    source,
+    orderId,
+    orderNumber,
+    barcode,
+    createdAt,
+    updatedAt: tracker?.updatedAt || shopifyOrder?.updatedAt || null,
+    lastEventAt,
+    ageWorkingDays: ageWorkingDays == null ? null : Number(ageWorkingDays.toFixed(2)),
+    idleWorkingDays: idleWorkingDays == null ? null : Number(idleWorkingDays.toFixed(2)),
+    ageCalendarHours: ageCalendarHours == null ? null : Number(ageCalendarHours.toFixed(1)),
+    idleCalendarHours: idleCalendarHours == null ? null : Number(idleCalendarHours.toFixed(1)),
+    thresholdWorkingDays,
+    currentStage: stage,
+    trackerExists: Boolean(tracker),
+    shopifyOpen: Boolean(shopifyOrder),
+    tags,
+    financialStatus: String(shopifyOrder?.financialStatus || '').trim(),
+    fulfillmentStatus: String(shopifyOrder?.fulfillmentStatus || tracker?.workflowStatus || '').trim(),
+    itemCount: Math.max(0, Number(shopifyOrder?.itemCount || 0)),
+    firstItemTitle: String(shopifyOrder?.firstItemTitle || '').trim(),
+    lastStaff: getOrderFlowLatestStaff(tracker),
+  };
+}
+
+function sortOrderFlowIssues(left, right) {
+  const severityRank = { critical: 0, warning: 1, info: 2 };
+  const severityDiff = (severityRank[left.severity] ?? 9) - (severityRank[right.severity] ?? 9);
+  if (severityDiff !== 0) return severityDiff;
+
+  const leftAge = Math.max(Number(left.idleWorkingDays || 0), Number(left.ageWorkingDays || 0));
+  const rightAge = Math.max(Number(right.idleWorkingDays || 0), Number(right.ageWorkingDays || 0));
+  if (rightAge !== leftAge) return rightAge - leftAge;
+
+  return String(left.orderNumber || '').localeCompare(String(right.orderNumber || ''));
+}
+
+async function buildOrderFlowOverview({ client, shop, query = {} }) {
+  const nowIso = new Date().toISOString();
+  const nowMs = Date.now();
+  const maxOpenOrders = Math.max(50, Math.min(1000, Math.floor(Number(query.maxOpenOrders) || 500)));
+  const maxTrackers = Math.max(50, Math.min(2000, Math.floor(Number(query.maxTrackers) || 1000)));
+  const legacyNewOrderWorkingDays = Number.isFinite(Number(query.newOrderHours))
+    ? Number(query.newOrderHours) / 24
+    : null;
+  const legacyStaleWorkingDays = Number.isFinite(Number(query.staleHours))
+    ? Number(query.staleHours) / 24
+    : null;
+  const newOrderWorkingDays = parseOrderFlowWorkingDays(
+    query.newOrderWorkingDays ?? legacyNewOrderWorkingDays,
+    ORDER_FLOW_DEFAULT_NEW_ORDER_WORKING_DAYS,
+    { min: 0.25, max: 30 }
+  );
+  const fallbackStaleWorkingDays = parseOrderFlowWorkingDays(
+    query.staleWorkingDays ?? legacyStaleWorkingDays,
+    ORDER_FLOW_DEFAULT_STAGE_THRESHOLD_WORKING_DAYS,
+    { min: 0.25, max: 60 }
+  );
+  const stageWorkingDays = parseOrderFlowStageWorkingDays(query.stageWorkingDays);
+
+  const openOrderResult = await listOrderFlowOpenOrders({
+    client,
+    maxOrders: maxOpenOrders,
+    pageSize: query.pageSize,
+  });
+  const openOrders = openOrderResult.orders;
+  const openOrdersById = new Map(openOrders.map((order) => [order.id, order]));
+  const trackers = sessionsStore.listOrderTrackers({
+    shop,
+    includeTerminal: false,
+    limit: maxTrackers,
+  });
+  const trackersByOrderId = new Map(trackers.map((tracker) => [String(tracker.orderId || '').trim(), tracker]));
+  const issues = [];
+  const issueKeys = new Set();
+
+  const addIssue = (issue) => {
+    if (!issue?.orderId || !issue?.type) return;
+    const key = `${issue.orderId}:${issue.type}`;
+    if (issueKeys.has(key)) return;
+    issueKeys.add(key);
+    issues.push(issue);
+  };
+
+  openOrders.forEach((order) => {
+    const tracker = trackersByOrderId.get(order.id) || null;
+    const tags = normalizeOrderTags(order.tags).map((tag) => tag.toLowerCase());
+    const isNewOrder = tags.includes('new_order');
+    const orderAgeWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, order.createdAt) || 0;
+
+    if (isNewOrder && orderAgeWorkingDays >= newOrderWorkingDays) {
+      addIssue(buildOrderFlowIssue({
+        type: 'unstarted',
+        severity: 'critical',
+        reason: tracker
+          ? 'Open Shopify order is still tagged new_order and has not moved out of the Monitor flow.'
+          : 'Open Shopify order is still tagged new_order and has no local tracker, so it may never have entered the picking flow.',
+        shopifyOrder: order,
+        tracker,
+        nowMs,
+        thresholdWorkingDays: newOrderWorkingDays,
+        source: 'shopify',
+      }));
+      return;
+    }
+
+    if (!tracker && orderAgeWorkingDays >= newOrderWorkingDays) {
+      addIssue(buildOrderFlowIssue({
+        type: 'untracked',
+        severity: 'critical',
+        reason: 'Open Shopify order has no local tracker record, so it may be outside the internal flow.',
+        shopifyOrder: order,
+        tracker,
+        nowMs,
+        thresholdWorkingDays: newOrderWorkingDays,
+        source: 'shopify',
+      }));
+      return;
+    }
+
+    if (!tracker || isOrderFlowTrackerTerminal(tracker)) {
+      return;
+    }
+
+    const stageKey = String(tracker.currentStageKey || '').trim();
+    const idleWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, tracker.lastEventAt || tracker.updatedAt) || 0;
+
+    const thresholdWorkingDays = getOrderFlowStageThresholdWorkingDays(stageKey, stageWorkingDays, fallbackStaleWorkingDays);
+    if (idleWorkingDays >= thresholdWorkingDays) {
+      addIssue(buildOrderFlowIssue({
+        type: 'stale_stage',
+        severity: idleWorkingDays >= thresholdWorkingDays * 2 ? 'critical' : 'warning',
+        reason: `No recorded movement in ${tracker.currentStageLabel || stageKey} for ${idleWorkingDays.toFixed(2)} working days.`,
+        shopifyOrder: order,
+        tracker,
+        nowMs,
+        thresholdWorkingDays,
+        source: 'tracker',
+      }));
+    }
+  });
+
+  trackers.forEach((tracker) => {
+    if (!tracker?.orderId || openOrdersById.has(tracker.orderId) || isOrderFlowTrackerTerminal(tracker)) {
+      return;
+    }
+
+    const stageKey = String(tracker.currentStageKey || '').trim();
+    const idleWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, tracker.lastEventAt || tracker.updatedAt) || 0;
+    const thresholdWorkingDays = getOrderFlowStageThresholdWorkingDays(stageKey, stageWorkingDays, fallbackStaleWorkingDays);
+    if (idleWorkingDays < thresholdWorkingDays) return;
+
+    addIssue(buildOrderFlowIssue({
+      type: 'stale_stage',
+      severity: idleWorkingDays >= thresholdWorkingDays * 2 ? 'critical' : 'warning',
+      reason: `Local tracker has not moved in ${tracker.currentStageLabel || stageKey} for ${idleWorkingDays.toFixed(2)} working days.`,
+      tracker,
+      nowMs,
+      thresholdWorkingDays,
+      source: 'local_tracker',
+    }));
+  });
+
+  issues.sort(sortOrderFlowIssues);
+
+  const stageCounts = trackers.reduce((acc, tracker) => {
+    if (!tracker?.currentStageKey || isOrderFlowTrackerTerminal(tracker)) return acc;
+    const key = String(tracker.currentStageKey);
+    acc[key] = (acc[key] || 0) + 1;
+    return acc;
+  }, {});
+  const snoozesByIssueKey = new Map(
+    sessionsStore.listOrderFlowSnoozes({ shop, includeDeleted: true })
+      .map((snooze) => [snooze.issueKey, snooze])
+  );
+  const activeIssues = [];
+  const snoozedIssues = [];
+
+  issues.forEach((issue) => {
+    const snooze = snoozesByIssueKey.get(issue.issueKey);
+    if (snooze?.deletedAt) {
+      return;
+    }
+
+    if (!snooze) {
+      activeIssues.push(issue);
+      return;
+    }
+
+    snoozedIssues.push({
+      ...issue,
+      snoozed: {
+        by: snooze.snoozedBy || '',
+        at: snooze.snoozedAt || null,
+      },
+    });
+  });
+
+  return {
+    generatedAt: nowIso,
+    shop,
+    thresholds: {
+      unit: 'working_days',
+      workingDayDefinition: 'Monday-Friday calendar days',
+      newOrderWorkingDays,
+      fallbackStaleWorkingDays,
+      stageWorkingDays: {
+        ...stageWorkingDays,
+      },
+    },
+    scan: {
+      openOrdersScanned: openOrders.length,
+      openOrderPagesFetched: openOrderResult.pagesFetched,
+      openOrderHasMore: openOrderResult.hasMore,
+      maxOpenOrders: openOrderResult.maxOrders,
+      activeTrackersScanned: trackers.length,
+      maxTrackers,
+    },
+    summary: {
+      issueCount: activeIssues.length,
+      criticalCount: activeIssues.filter((issue) => issue.severity === 'critical').length,
+      warningCount: activeIssues.filter((issue) => issue.severity === 'warning').length,
+      untrackedCount: activeIssues.filter((issue) => issue.type === 'untracked').length,
+      unstartedCount: activeIssues.filter((issue) => issue.type === 'unstarted').length,
+      staleStageCount: activeIssues.filter((issue) => issue.type === 'stale_stage').length,
+      snoozedCount: snoozedIssues.length,
+      openOrdersScanned: openOrders.length,
+      activeTrackersScanned: trackers.length,
+      stageCounts,
+    },
+    issues: activeIssues,
+    snoozed: {
+      count: snoozedIssues.length,
+      issues: snoozedIssues,
+    },
+  };
+}
+
 function summarizeShippingLabel(label) {
   if (!label) return null;
   const packages = Array.isArray(label.packages)
@@ -1366,6 +1927,18 @@ function collectPrintQueueCardSkus(items = []) {
     .filter(Boolean);
 }
 
+function getPrintQueueKeyFromRequest(req) {
+  return normalizePrintQueueKey(req?.body?.queueKey || req?.body?.queue || req?.query?.queueKey || req?.query?.queue);
+}
+
+function getPrintQueueLabel(queueKey) {
+  return getPrintQueueConfig(queueKey).label;
+}
+
+function getPrintQueueTypeLabel(queueKey) {
+  return getPrintQueueConfig(queueKey).shortLabel;
+}
+
 function extractGoogleDriveFolderId(value) {
   const text = String(value || '').trim();
   if (!text) return '';
@@ -1601,6 +2174,15 @@ function formatPrintPutAwayAwaitingPartsChat({ item, matches, staff }) {
 }
 
 function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
+  const makeQueueResult = (queueKey) => ({
+    queueKey,
+    label: getPrintQueueLabel(queueKey),
+    addedSkus: [],
+    alreadyQueuedSkus: [],
+    blockedByQueued: [],
+    createdCount: 0,
+    createdPartCount: 0,
+  });
   const result = {
     addedSkus: [],
     alreadyQueuedSkus: [],
@@ -1609,6 +2191,10 @@ function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
     missingSkus: [],
     createdCount: 0,
     createdPartCount: 0,
+    queues: {
+      sls: makeQueueResult('sls'),
+      fdm: makeQueueResult('fdm'),
+    },
     error: null,
   };
 
@@ -1617,18 +2203,20 @@ function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
     return result;
   }
 
-  const activePrintQueueItems = sessionsStore.getActivePrintQueueItems({ shop: normalizedShop });
-  const activePrintQueueCardSkus = new Set(collectPrintQueueCardSkus(activePrintQueueItems));
+  const activePrintQueueCardSkusByQueue = new Map(
+    Object.keys(PRINT_QUEUE_CONFIGS).map((queueKey) => [
+      queueKey,
+      new Set(collectPrintQueueCardSkus(sessionsStore.getActivePrintQueueItems({
+        shop: normalizedShop,
+        queueKey,
+      }))),
+    ])
+  );
   const queueItemsToCreate = [];
 
   (Array.isArray(items) ? items : []).forEach((item) => {
     const sku = normalizeSku(item?.sku || item?.partSku);
     if (!sku) return;
-
-    if (activePrintQueueCardSkus.has(sku)) {
-      result.alreadyQueuedSkus.push(sku);
-      return;
-    }
 
     const sheetRow = skuMap.get(sku);
     if (!sheetRow) {
@@ -1636,12 +2224,23 @@ function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
       return;
     }
 
-    if (!isPrintableSheetRow(sheetRow)) {
+    const queueKey = getPrintQueueKeyForSheetRow(sheetRow);
+    if (!queueKey || !isPrintableSheetRow(sheetRow, queueKey)) {
       result.notPrintableSkus.push(sku);
       return;
     }
 
-    const queueItems = buildPrintQueueItemsForCatalogSku({ skuMap, sku });
+    const activePrintQueueCardSkus = activePrintQueueCardSkusByQueue.get(queueKey) || new Set();
+    const queueResult = result.queues[queueKey] || makeQueueResult(queueKey);
+    result.queues[queueKey] = queueResult;
+
+    if (activePrintQueueCardSkus.has(sku)) {
+      result.alreadyQueuedSkus.push(sku);
+      queueResult.alreadyQueuedSkus.push(sku);
+      return;
+    }
+
+    const queueItems = buildPrintQueueItemsForCatalogSku({ skuMap, sku, queueKey });
     if (!queueItems.length) {
       result.notPrintableSkus.push(sku);
       return;
@@ -1649,7 +2248,9 @@ function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
 
     queueItemsToCreate.push(...queueItems);
     result.addedSkus.push(sku);
+    queueResult.addedSkus.push(sku);
     collectPrintQueueCardSkus(queueItems).forEach((queueSku) => activePrintQueueCardSkus.add(queueSku));
+    activePrintQueueCardSkusByQueue.set(queueKey, activePrintQueueCardSkus);
   });
 
   if (queueItemsToCreate.length === 0) {
@@ -1666,6 +2267,13 @@ function syncAwaitingPartsToPrintQueue({ shop, staff, items, skuMap }) {
   result.createdPartCount = createdItems.reduce((count, item) => (
     count + 1 + (Array.isArray(item.childItems) ? item.childItems.length : 0)
   ), 0);
+  createdItems.forEach((item) => {
+    const queueKey = normalizePrintQueueKey(item?.queueKey);
+    const queueResult = result.queues[queueKey] || makeQueueResult(queueKey);
+    queueResult.createdCount += 1;
+    queueResult.createdPartCount += 1 + (Array.isArray(item.childItems) ? item.childItems.length : 0);
+    result.queues[queueKey] = queueResult;
+  });
 
   return result;
 }
@@ -3355,13 +3963,18 @@ router.get('/api/print-catalog', async (req, res) => {
     const auth = resolveAuthenticatedRequest(req, res);
     if (!auth) return;
 
+    const queueKey = getPrintQueueKeyFromRequest(req);
+    const queueConfig = getPrintQueueConfig(queueKey);
     const pickListSheet = await fetchPickListSheet();
     const items = buildPrintCatalogFromSheet({
       skuMap: pickListSheet.skuMap,
+      queueKey,
     });
 
     return res.json({
       success: true,
+      queueKey,
+      queue: queueConfig,
       items,
       sheetFetchedAt: pickListSheet.fetchedAt,
       sheetSkuCount: pickListSheet.sourceRowCount,
@@ -3411,8 +4024,11 @@ router.get('/api/print-queue', async (req, res) => {
     const auth = resolveAuthenticatedRequest(req, res);
     if (!auth) return;
 
+    const queueKey = getPrintQueueKeyFromRequest(req);
+    const queueConfig = getPrintQueueConfig(queueKey);
     const items = sessionsStore.getPrintQueueItems({
       shop: auth.shop,
+      queueKey,
       completeLimit: 80,
     });
     const itemsWithAwaitingParts = attachAwaitingPartsMatchesToPrintQueueItems({
@@ -3422,6 +4038,8 @@ router.get('/api/print-queue', async (req, res) => {
 
     return res.json({
       success: true,
+      queueKey,
+      queue: queueConfig,
       stages: PRINT_QUEUE_STAGES,
       items: itemsWithAwaitingParts,
     });
@@ -3439,6 +4057,7 @@ router.post('/api/print-queue/catalog', async (req, res) => {
     const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
     if (!auth) return;
 
+    const queueKey = getPrintQueueKeyFromRequest(req);
     const sku = normalizeSku(req.body?.sku);
     if (!sku) {
       return res.status(400).json({
@@ -3456,10 +4075,10 @@ router.post('/api/print-queue/catalog', async (req, res) => {
       });
     }
 
-    if (!isPrintableSheetRow(sheetRow)) {
+    if (!isPrintableSheetRow(sheetRow, queueKey)) {
       return res.status(400).json({
         success: false,
-        error: `SKU ${sku} is not an SLS or Adapter item`,
+        error: `SKU ${sku} is not a ${getPrintQueueTypeLabel(queueKey)} item`,
       });
     }
 
@@ -3471,12 +4090,13 @@ router.post('/api/print-queue/catalog', async (req, res) => {
       skuMap: pickListSheet.skuMap,
       sku,
       quantity: requestedQuantity,
+      queueKey,
     });
 
     if (!queueItems.length) {
       return res.status(400).json({
         success: false,
-        error: `No eligible SLS or Adapter print jobs found for ${sku}`,
+        error: `No eligible ${getPrintQueueTypeLabel(queueKey)} print jobs found for ${sku}`,
       });
     }
 
@@ -3498,6 +4118,8 @@ router.post('/api/print-queue/catalog', async (req, res) => {
       requestedQuantity,
       sheetFetchedAt: pickListSheet.fetchedAt,
       sheetSkuCount: pickListSheet.sourceRowCount,
+      queueKey,
+      queue: getPrintQueueConfig(queueKey),
     });
   } catch (err) {
     console.error('Error in /api/print-queue/catalog:', err);
@@ -3513,6 +4135,7 @@ router.post('/api/print-queue/custom', async (req, res) => {
     const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
     if (!auth) return;
 
+    const queueKey = getPrintQueueKeyFromRequest(req);
     const title = String(req.body?.title || '').trim();
     if (!title) {
       return res.status(400).json({
@@ -3534,6 +4157,7 @@ router.post('/api/print-queue/custom', async (req, res) => {
       shop: auth.shop,
       createdBy: auth.userId,
       items: [{
+        queueKey,
         sourceType: 'custom',
         title,
         typeRaw: 'CUSTOM',
@@ -3547,6 +4171,8 @@ router.post('/api/print-queue/custom', async (req, res) => {
 
     return res.json({
       success: true,
+      queueKey,
+      queue: getPrintQueueConfig(queueKey),
       createdItems,
       createdCount: createdItems.length,
     });
@@ -3920,8 +4546,17 @@ router.post('/api/print-queue/preform-build', async (req, res) => {
     const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
     if (!auth) return;
 
+    const queueKey = getPrintQueueKeyFromRequest(req);
+    if (queueKey !== DEFAULT_PRINT_QUEUE_KEY) {
+      return res.status(400).json({
+        success: false,
+        error: 'PreForm build preparation is only available for the SLS / Adapter print queue.',
+      });
+    }
+
     const queueItems = sessionsStore.getActivePrintQueueItems({
       shop: auth.shop,
+      queueKey,
     });
     const needsPrintedItems = queueItems.filter((item) => item.stageKey === DEFAULT_PRINT_QUEUE_STAGE);
     if (!needsPrintedItems.length) {
@@ -5328,6 +5963,131 @@ router.get('/api/pick-list/bag-labels/printer-capabilities', async (req, res) =>
   } catch (err) {
     console.error('Error in /api/pick-list/bag-labels/printer-capabilities:', err);
     return res.status(500).json({ success: false, error: err.message || 'Failed to load bag label printer capabilities' });
+  }
+});
+
+router.get('/api/order-flow/overview', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const client = shopifyClient(auth.session);
+    const overview = await buildOrderFlowOverview({
+      client,
+      shop: auth.shop,
+      query: req.query || {},
+    });
+
+    return res.json({
+      success: true,
+      ...overview,
+    });
+  } catch (err) {
+    console.error('Error in /api/order-flow/overview:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to load Monitor overview',
+    });
+  }
+});
+
+router.post('/api/order-flow/snooze', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const issueKey = String(req.body?.issueKey || '').trim();
+    if (!issueKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing issueKey',
+      });
+    }
+
+    const snooze = sessionsStore.snoozeOrderFlowIssue({
+      shop: auth.shop,
+      issueKey,
+      orderId: req.body?.orderId || null,
+      orderNumber: req.body?.orderNumber || null,
+      issueType: req.body?.type || null,
+      stageKey: req.body?.stageKey || null,
+      reason: req.body?.reason || null,
+      snoozedBy: auth.userId,
+    });
+
+    return res.json({
+      success: true,
+      snooze,
+    });
+  } catch (err) {
+    console.error('Error in /api/order-flow/snooze:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to snooze warning',
+    });
+  }
+});
+
+router.post('/api/order-flow/unsnooze', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const issueKey = String(req.body?.issueKey || '').trim();
+    if (!issueKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing issueKey',
+      });
+    }
+
+    const restoredCount = sessionsStore.unsnoozeOrderFlowIssue({
+      shop: auth.shop,
+      issueKey,
+    });
+
+    return res.json({
+      success: true,
+      restoredCount,
+    });
+  } catch (err) {
+    console.error('Error in /api/order-flow/unsnooze:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to restore warning',
+    });
+  }
+});
+
+router.post('/api/order-flow/delete', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const issueKey = String(req.body?.issueKey || '').trim();
+    if (!issueKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing issueKey',
+      });
+    }
+
+    const deletedCount = sessionsStore.deleteOrderFlowIssue({
+      shop: auth.shop,
+      issueKey,
+      deletedBy: auth.userId,
+    });
+
+    return res.json({
+      success: true,
+      deletedCount,
+    });
+  } catch (err) {
+    console.error('Error in /api/order-flow/delete:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to delete warning',
+    });
   }
 });
 

@@ -3,6 +3,7 @@
   const authStatusUrl = '/api/auth/status';
   const originalFetch = window.fetch.bind(window);
   let redirecting = false;
+  let authStatusPromise = null;
 
   function isLoginPage() {
     return loginPaths.has(window.location.pathname || '/');
@@ -52,6 +53,49 @@
     window.location.replace(buildAuthUrl() || buildLoginUrl());
   }
 
+  function getAuthStatus() {
+    if (!authStatusPromise) {
+      authStatusPromise = originalFetch(authStatusUrl, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      }).then(async (response) => {
+        if (response.status === 401) {
+          redirectToLogin();
+          return { authenticated: false };
+        }
+
+        if (!response.ok) {
+          return { authenticated: false, unavailable: true };
+        }
+
+        return response.json();
+      }).catch(() => {
+        // Leave transient network/server failures to the page. Only confirmed 401s redirect.
+        return { authenticated: false, unavailable: true };
+      });
+    }
+
+    return authStatusPromise;
+  }
+
+  async function logout() {
+    let loginUrl = '/';
+
+    try {
+      const response = await originalFetch('/auth/logout', {
+        method: 'POST',
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      const data = await response.json().catch(() => null);
+      loginUrl = data?.loginUrl || loginUrl;
+    } catch (_err) {
+      loginUrl = '/auth/logout';
+    }
+
+    window.location.assign(loginUrl);
+  }
+
   function getSameOriginApiPath(input) {
     try {
       const url = input instanceof Request
@@ -74,19 +118,12 @@
   };
 
   window.authGuard = {
+    getAuthStatus,
+    logout,
     redirectToLogin,
   };
 
   if (isLoginPage()) return;
 
-  originalFetch(authStatusUrl, {
-    credentials: 'same-origin',
-    cache: 'no-store',
-  }).then((response) => {
-    if (response.status === 401) {
-      redirectToLogin();
-    }
-  }).catch(() => {
-    // Leave transient network/server failures to the page. Only confirmed 401s redirect.
-  });
+  getAuthStatus();
 }());

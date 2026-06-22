@@ -3,39 +3,107 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Login</title>
+  <title>AIRTAC Employee Login</title>
   <link rel="stylesheet" href="/css/style.css" />
   <script src="/js/theme-secret.js" defer></script>
 </head>
 <body class="login">
 
-<div class="loginContainer">
-  <h1>AIRTAC</h1>
-  <p>Shopify Scanner Login</p>
+<main class="login-shell">
+  <section class="login-panel" aria-labelledby="loginTitle">
+    <div class="login-brand-row">
+      <span class="login-brand-mark" aria-hidden="true">A</span>
+      <div>
+        <p class="login-brand-name">AIRTAC</p>
+        <p class="login-brand-subtitle">Operations Console</p>
+      </div>
+    </div>
 
-  <form id="loginForm">
-    <input
-      type="text"
-      id="shop"
-      placeholder="your-store.myshopify.com"
-      value="airtacuk.myshopify.com"
-      required
-    />
-    <button type="submit">Log in</button>
-  </form>
+    <div class="login-copy">
+      <p class="login-eyebrow">Employee Access</p>
+      <h1 id="loginTitle">Sign in with Shopify</h1>
+      <p>Use an authorized Shopify staff account to open AIRTAC employee tools.</p>
+    </div>
 
-  <script>
-    const form = document.getElementById('loginForm');
-    form.addEventListener('submit', e => {
-      e.preventDefault();
-      const shop = document.getElementById('shop').value.trim();
-      if (!shop) return alert('Enter your Shopify store domain');
-      const params = new URLSearchParams(window.location.search);
-      const returnTo = params.get('returnTo') || '/scan.html';
-      window.location.href = `/auth?shop=${encodeURIComponent(shop)}&returnTo=${encodeURIComponent(returnTo)}`;
-    });
-  </script>
-</div>
+    <form id="loginForm" class="login-form">
+      <label class="login-field" for="shop">
+        <span>Shopify store</span>
+        <input
+          type="text"
+          id="shop"
+          placeholder="your-store.myshopify.com"
+          value="airtacuk.myshopify.com"
+          autocomplete="organization"
+          autocapitalize="none"
+          spellcheck="false"
+          required
+        />
+      </label>
+      <p id="loginReturnTo" class="login-return">Continuing to Scanner.</p>
+      <button type="submit" class="login-submit">Continue with Shopify</button>
+      <p class="login-footnote">Access is managed through Shopify authorization.</p>
+    </form>
+  </section>
 
+  <aside class="login-status-panel" aria-label="Available employee tools">
+    <p class="login-status-eyebrow">Workspace</p>
+    <h2>Employee tools</h2>
+    <ul class="login-tool-list">
+      <li>Order picking and verification</li>
+      <li>Order flow oversight</li>
+      <li>Scanner mode</li>
+      <li>Part Explorer</li>
+      <li>SLS, adapter, and FDM print queues</li>
+    </ul>
+  </aside>
+</main>
+
+<script>
+  const form = document.getElementById('loginForm');
+  const returnLabel = document.getElementById('loginReturnTo');
+  const destinationLabels = {
+    '/pick_list.html': 'Orders',
+    '/order_flow.html': 'Monitor',
+    '/putting_away.html': 'Part Explorer',
+    '/awaiting_parts.html': 'Awaiting Parts',
+    '/print_queue.html': 'Print Queue',
+    '/fdm_print_queue.html': 'FDM Print Queue',
+    '/print_config.html': 'Print Config',
+    '/scan.html': 'Scanner',
+    '/scan_usb.html': 'Scanner',
+    '/scan_photo.html': 'Photo Scanner',
+  };
+
+  function getReturnTo() {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('returnTo') || '/scan.html';
+  }
+
+  function normalizeShopDomain(value) {
+    return value
+      .trim()
+      .replace(/^https?:\/\//i, '')
+      .replace(/\/.*$/, '');
+  }
+
+  function setReturnLabel() {
+    try {
+      const returnTo = getReturnTo();
+      const path = new URL(returnTo, window.location.origin).pathname;
+      returnLabel.textContent = `Continuing to ${destinationLabels[path] || 'employee tools'}.`;
+    } catch (_err) {
+      returnLabel.textContent = 'Continuing to employee tools.';
+    }
+  }
+
+  setReturnLabel();
+
+  form.addEventListener('submit', e => {
+    e.preventDefault();
+    const shop = normalizeShopDomain(document.getElementById('shop').value);
+    if (!shop) return alert('Enter your Shopify store domain');
+    window.location.href = `/auth?shop=${encodeURIComponent(shop)}&returnTo=${encodeURIComponent(getReturnTo())}`;
+  });
+</script>
 </body>
 </html>

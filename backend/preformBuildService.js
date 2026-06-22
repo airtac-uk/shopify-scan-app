@@ -376,9 +376,14 @@ function scoreDriveFileForSku(file, sku, allowedExtensions) {
   const name = String(file?.name || '').trim().toUpperCase();
   const stem = getFileStem(name);
   const compactStem = compactName(stem);
+  const compactFileName = compactName(name);
+  const is3mf = extension === '3mf';
 
-  if (stem === skuText) return 120;
-  if (compactStem === compactSku) return 100;
+  if (stem === skuText) return is3mf ? 320 : 220;
+  if (compactStem === compactSku) return is3mf ? 300 : 200;
+  if (compactSku && (compactStem.includes(compactSku) || compactFileName.includes(compactSku))) {
+    return is3mf ? 260 : 120;
+  }
   return -1;
 }
 

@@ -3,6 +3,28 @@ const PRINT_CATALOG_RESULT_LIMIT = 80;
 const PRINT_CATALOG_FEEDBACK_MS = 3500;
 const STL_PREVIEW_CACHE_LIMIT = 24;
 const PREFORM_DOWNLOAD_ACTIONS_STORAGE_KEY = 'printQueue.latestPreformDownloadActions';
+const PRINT_QUEUE_CONFIGS = {
+  sls: {
+    key: 'sls',
+    label: 'Print Queue',
+    shortLabel: 'SLS / Adapter',
+    emptyCatalogLabel: 'No SLS or adapter SKUs found in the sheet.',
+    supportsPreformBuild: true,
+  },
+  fdm: {
+    key: 'fdm',
+    label: 'FDM Print Queue',
+    shortLabel: 'FDM',
+    emptyCatalogLabel: 'No FDM SKUs found in the sheet.',
+    supportsPreformBuild: false,
+  },
+};
+
+const PRINT_QUEUE_KEY = (() => {
+  const raw = String(document.body?.dataset?.printQueueKey || 'sls').trim().toLowerCase();
+  return raw === 'fdm' ? 'fdm' : 'sls';
+})();
+const PRINT_QUEUE_CONFIG = PRINT_QUEUE_CONFIGS[PRINT_QUEUE_KEY] || PRINT_QUEUE_CONFIGS.sls;
 
 let printQueueStages = [
   { key: 'needs_printed', label: 'Needs Printed' },
@@ -29,6 +51,12 @@ let activeStlPreviewRenderers = [];
 let stlPreviewLibraryPromise = null;
 let stlPreviewRenderSession = 0;
 let latestPreformBuildDownloadActions = loadLatestPreformBuildDownloadActions();
+
+function withQueueParam(pathname) {
+  const url = new URL(pathname, window.location.origin);
+  url.searchParams.set('queue', PRINT_QUEUE_KEY);
+  return `${url.pathname}${url.search}`;
+}
 
 function loadLatestPreformBuildDownloadActions() {
   try {
@@ -182,7 +210,7 @@ function setLoading(isLoading) {
 
   if (spinner) spinner.style.display = printQueueLoading ? 'inline-block' : 'none';
   if (refreshBtn) refreshBtn.disabled = printQueueLoading;
-  if (buildBtn) buildBtn.disabled = printQueueLoading;
+  if (buildBtn) buildBtn.disabled = printQueueLoading || !PRINT_QUEUE_CONFIG.supportsPreformBuild;
 }
 
 function updateLastUpdatedLabel() {
@@ -232,6 +260,7 @@ function getCatalogLocationForSku(sku) {
 function renderStlDownloadLink(sku, label = 'STL') {
   const normalizedSku = String(sku || '').trim().toUpperCase();
   if (!normalizedSku) return '';
+  const linkLabel = label === 'STL' && PRINT_QUEUE_KEY === 'fdm' ? 'File' : label;
 
   return `
     <a
@@ -241,7 +270,7 @@ function renderStlDownloadLink(sku, label = 'STL') {
       rel="noopener"
       draggable="false"
       title="Download ${escapeHtmlAttribute(normalizedSku)} STL/3MF from Google Drive"
-    >${escapeHtml(label)}</a>
+    >${escapeHtml(linkLabel)}</a>
   `;
 }
 
@@ -363,7 +392,7 @@ function parseCatalogSearchQuery(query) {
       return;
     }
 
-    const bareType = normalizedToken === 'SLS' || normalizedToken === 'ADAPTER';
+    const bareType = normalizedToken === 'SLS' || normalizedToken === 'ADAPTER' || normalizedToken === 'FDM';
     if (bareType) {
       parsed.filters.push((item) => normalizeSearchText(item.typeRaw).includes(normalizedToken));
       return;
@@ -624,7 +653,7 @@ function renderPutAwayPart(part, index) {
   const fileLink = part.customFileUrl
     ? `<a class="print-queue-file-link" href="${escapeHtmlAttribute(part.customFileUrl)}" target="_blank" rel="noopener">Open File</a>`
     : '';
-  const stlLink = part.sku ? renderStlDownloadLink(part.sku, 'Download STL') : '';
+  const stlLink = part.sku ? renderStlDownloadLink(part.sku, PRINT_QUEUE_KEY === 'fdm' ? 'Download File' : 'Download STL') : '';
 
   return `
     <article class="print-put-away-part">
@@ -965,7 +994,7 @@ function renderCatalog() {
   const search = String(searchInput?.value || '').trim();
 
   if (printCatalogItems.length === 0) {
-    container.innerHTML = '<p class="pick-list-empty">No SLS or adapter SKUs found in the sheet.</p>';
+    container.innerHTML = `<p class="pick-list-empty">${escapeHtml(PRINT_QUEUE_CONFIG.emptyCatalogLabel)}</p>`;
     return;
   }
 
@@ -1274,7 +1303,7 @@ function renderBoard() {
 }
 
 async function fetchPrintCatalog() {
-  const response = await fetch('/api/print-catalog', {
+  const response = await fetch(withQueueParam('/api/print-catalog'), {
     headers: { Accept: 'application/json' },
   });
   const data = await readJsonResponse(response, 'Failed to load print catalog');
@@ -1283,7 +1312,8 @@ async function fetchPrintCatalog() {
   const sheetStatus = document.getElementById('printCatalogSheetStatus');
   if (sheetStatus) {
     const fetchedAt = data.sheetFetchedAt ? formatTimestamp(data.sheetFetchedAt) : '-';
-    sheetStatus.textContent = `Sheet rows: ${data.sheetSkuCount ?? '-'} / ${fetchedAt}`;
+    const label = data.queue?.catalogLabel || `${PRINT_QUEUE_CONFIG.shortLabel} rows`;
+    sheetStatus.textContent = `${label}: ${data.sheetSkuCount ?? '-'} sheet rows / ${fetchedAt}`;
   }
 
   renderCatalog();
@@ -1296,7 +1326,7 @@ async function fetchPrintQueue({ silent = false, includeCatalog = false } = {}) 
   if (!silent) setStatus('Loading print queue...', 'info');
 
   try {
-    const queueResponse = await fetch('/api/print-queue', {
+    const queueResponse = await fetch(withQueueParam('/api/print-queue'), {
       headers: { Accept: 'application/json' },
     });
     const queueData = await readJsonResponse(queueResponse, 'Failed to load print queue');
@@ -1330,7 +1360,7 @@ async function fetchPrintQueue({ silent = false, includeCatalog = false } = {}) 
     renderCatalog();
     updateLastUpdatedLabel();
     if (!silent) {
-      setStatus(`Loaded ${printQueueItems.length} print jobs.`, 'success');
+      setStatus(`Loaded ${printQueueItems.length} ${PRINT_QUEUE_CONFIG.label} jobs.`, 'success');
     }
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
@@ -1350,13 +1380,13 @@ async function addCatalogSkuToQueue(sku, quantity = null) {
   setStatus(`Adding ${normalizedSku} x${requestedQuantity}...`, 'info');
 
   try {
-    const response = await fetch('/api/print-queue/catalog', {
+    const response = await fetch(withQueueParam('/api/print-queue/catalog'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({ sku: normalizedSku, quantity: requestedQuantity }),
+      body: JSON.stringify({ sku: normalizedSku, quantity: requestedQuantity, queueKey: PRINT_QUEUE_KEY }),
     });
     const data = await readJsonResponse(response, 'Failed to add SKU to print queue');
 
@@ -1370,7 +1400,7 @@ async function addCatalogSkuToQueue(sku, quantity = null) {
     renderCatalog();
     const addedPartCount = Number(data.createdPartCount || data.createdCount || 0);
     setStatus(
-      `Added ${data.createdCount || 0} build card with ${addedPartCount} ${addedPartCount === 1 ? 'part' : 'parts'} for ${normalizedSku} at x${requestedQuantity}.`,
+      `Added ${data.createdCount || 0} ${PRINT_QUEUE_CONFIG.label} card with ${addedPartCount} ${addedPartCount === 1 ? 'part' : 'parts'} for ${normalizedSku} at x${requestedQuantity}.`,
       'success'
     );
   } catch (err) {
@@ -1414,7 +1444,7 @@ async function addCustomPrintJob(event) {
   setStatus(`Adding ${title}...`, 'info');
 
   try {
-    const response = await fetch('/api/print-queue/custom', {
+    const response = await fetch(withQueueParam('/api/print-queue/custom'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
@@ -1423,6 +1453,7 @@ async function addCustomPrintJob(event) {
       body: JSON.stringify({
         title,
         quantity,
+        queueKey: PRINT_QUEUE_KEY,
         customFileName: title,
         customFileUrl,
         notes,
@@ -1729,18 +1760,22 @@ function formatPreformBuildSummary(data) {
 
 async function preparePreformBuild() {
   if (printQueueLoading) return;
+  if (!PRINT_QUEUE_CONFIG.supportsPreformBuild) {
+    setStatus('PreForm build preparation is only available for the SLS / Adapter print queue.', 'error');
+    return;
+  }
 
   setLoading(true);
   setStatus('Preparing SLS build from Needs Printed...', 'info');
 
   try {
-    const response = await fetch('/api/print-queue/preform-build', {
+    const response = await fetch(withQueueParam('/api/print-queue/preform-build'), {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify({ moveToInBuild: true }),
+      body: JSON.stringify({ moveToInBuild: true, queueKey: PRINT_QUEUE_KEY }),
     });
     const data = await readJsonResponse(response, 'Failed to prepare SLS build');
 
@@ -1968,6 +2003,12 @@ document.addEventListener('DOMContentLoaded', () => {
   const putAwayModal = document.getElementById('printPutAwayModal');
   const putAwayCancelBtn = document.getElementById('printPutAwayCancelBtn');
   const putAwayConfirmBtn = document.getElementById('printPutAwayConfirmBtn');
+
+  document.body?.classList.toggle('print-queue-page--fdm', PRINT_QUEUE_KEY === 'fdm');
+  if (buildBtn && !PRINT_QUEUE_CONFIG.supportsPreformBuild) {
+    buildBtn.hidden = true;
+    buildBtn.disabled = true;
+  }
 
   if (refreshBtn) {
     refreshBtn.addEventListener('click', () => {

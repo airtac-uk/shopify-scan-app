@@ -23,6 +23,11 @@ if (!fs.existsSync(path.dirname(dbPath))) {
 const db = new Database(dbPath);
 console.log('Better-SQLite3 DB connected at', dbPath);
 
+function normalizePrintQueueKey(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized === 'fdm' ? 'fdm' : 'sls';
+}
+
 // Create table if not exists
 db.prepare(`
   CREATE TABLE IF NOT EXISTS sessions (
@@ -167,6 +172,16 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_order_trackers_shop_stage_last_event
+  ON order_trackers (shop, currentStageKey, currentStageIsTerminal, lastEventAt ASC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_order_trackers_shop_updated
+  ON order_trackers (shop, updatedAt DESC)
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS order_tracker_events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     shop TEXT NOT NULL,
@@ -225,9 +240,50 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE TABLE IF NOT EXISTS order_flow_snoozes (
+    shop TEXT NOT NULL,
+    issueKey TEXT NOT NULL,
+    orderId TEXT,
+    orderNumber TEXT,
+    issueType TEXT,
+    stageKey TEXT,
+    reason TEXT,
+    snoozedBy TEXT,
+    snoozedAt TEXT NOT NULL,
+    deletedBy TEXT,
+    deletedAt TEXT,
+    PRIMARY KEY (shop, issueKey)
+  )
+`).run();
+
+const orderFlowSnoozeColumns = db.prepare(`
+  PRAGMA table_info(order_flow_snoozes)
+`).all();
+
+if (!orderFlowSnoozeColumns.some((column) => column?.name === 'deletedBy')) {
+  db.prepare(`
+    ALTER TABLE order_flow_snoozes
+    ADD COLUMN deletedBy TEXT
+  `).run();
+}
+
+if (!orderFlowSnoozeColumns.some((column) => column?.name === 'deletedAt')) {
+  db.prepare(`
+    ALTER TABLE order_flow_snoozes
+    ADD COLUMN deletedAt TEXT
+  `).run();
+}
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_order_flow_snoozes_shop_snoozedAt
+  ON order_flow_snoozes (shop, snoozedAt DESC)
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS print_queue_items (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     shop TEXT NOT NULL,
+    queueKey TEXT NOT NULL DEFAULT 'sls',
     sourceType TEXT NOT NULL,
     sku TEXT,
     rootSku TEXT,
@@ -291,24 +347,57 @@ if (!printQueueItemColumns.some((column) => column?.name === 'removedBy')) {
   `).run();
 }
 
+if (!printQueueItemColumns.some((column) => column?.name === 'queueKey')) {
+  db.prepare(`
+    ALTER TABLE print_queue_items
+    ADD COLUMN queueKey TEXT NOT NULL DEFAULT 'sls'
+  `).run();
+}
+
+db.prepare(`
+  UPDATE print_queue_items
+  SET queueKey = 'sls'
+  WHERE queueKey IS NULL OR TRIM(queueKey) = ''
+`).run();
+
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_stage
-  ON print_queue_items (shop, stageKey, updatedAt DESC)
+  ON print_queue_items (shop, queueKey, stageKey, updatedAt DESC)
 `).run();
 
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_open
-  ON print_queue_items (shop, completedAt, updatedAt DESC)
+  ON print_queue_items (shop, queueKey, completedAt, updatedAt DESC)
 `).run();
 
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_put_away
-  ON print_queue_items (shop, putAwayAt, completedAt, updatedAt DESC)
+  ON print_queue_items (shop, queueKey, putAwayAt, completedAt, updatedAt DESC)
 `).run();
 
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_removed
-  ON print_queue_items (shop, removedAt, updatedAt DESC)
+  ON print_queue_items (shop, queueKey, removedAt, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_queue_stage
+  ON print_queue_items (shop, queueKey, stageKey, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_queue_open
+  ON print_queue_items (shop, queueKey, completedAt, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_queue_put_away
+  ON print_queue_items (shop, queueKey, putAwayAt, completedAt, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_queue_removed
+  ON print_queue_items (shop, queueKey, removedAt, updatedAt DESC)
 `).run();
 
 db.prepare(`
@@ -455,6 +544,7 @@ function buildPrintQueueItemRecord(row) {
   return {
     id: Number(row.id),
     shop: String(row.shop || ''),
+    queueKey: normalizePrintQueueKey(row.queueKey),
     sourceType: String(row.sourceType || ''),
     sku: normalizeBarcode(row.sku),
     rootSku: normalizeBarcode(row.rootSku),
@@ -1739,6 +1829,7 @@ module.exports = {
     const safeCreatedBy = createdBy ? String(createdBy).trim() : null;
     const normalizedItems = (Array.isArray(items) ? items : [])
       .map((item) => {
+        const queueKey = normalizePrintQueueKey(item?.queueKey);
         const sourceType = String(item?.sourceType || 'catalog').trim().toLowerCase() === 'custom'
           ? 'custom'
           : 'catalog';
@@ -1765,6 +1856,7 @@ module.exports = {
           : [];
 
         return {
+          queueKey,
           sourceType,
           sku,
           rootSku,
@@ -1787,9 +1879,9 @@ module.exports = {
 
     const insertStmt = db.prepare(`
       INSERT INTO print_queue_items (
-        shop, sourceType, sku, rootSku, parentSku, title, typeRaw, location, quantity, rsq,
+        shop, queueKey, sourceType, sku, rootSku, parentSku, title, typeRaw, location, quantity, rsq,
         stageKey, childItemsJson, customFileName, customFileUrl, notes, createdBy, createdAt, updatedAt, completedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `);
     const getStmt = db.prepare(`
       SELECT *
@@ -1803,6 +1895,7 @@ module.exports = {
         const completedAt = item.stageKey === 'complete' ? nowIso : null;
         const result = insertStmt.run(
           normalizedShop,
+          item.queueKey,
           item.sourceType,
           item.sku || null,
           item.rootSku || null,
@@ -1831,46 +1924,51 @@ module.exports = {
     return insertedRows.filter(Boolean);
   },
 
-  getPrintQueueItems({ shop, completeLimit = 80 } = {}) {
+  getPrintQueueItems({ shop, queueKey = 'sls', completeLimit = 80 } = {}) {
     const normalizedShop = String(shop || '').trim();
+    const normalizedQueueKey = normalizePrintQueueKey(queueKey);
     if (!normalizedShop) return [];
 
     const openRows = db.prepare(`
       SELECT *
       FROM print_queue_items
       WHERE shop = ?
+        AND queueKey = ?
         AND putAwayAt IS NULL
         AND removedAt IS NULL
         AND completedAt IS NULL
       ORDER BY updatedAt DESC, id DESC
-    `).all(normalizedShop);
+    `).all(normalizedShop, normalizedQueueKey);
 
     const completedRows = db.prepare(`
       SELECT *
       FROM print_queue_items
       WHERE shop = ?
+        AND queueKey = ?
         AND putAwayAt IS NULL
         AND removedAt IS NULL
         AND completedAt IS NOT NULL
       ORDER BY completedAt DESC, id DESC
       LIMIT ?
-    `).all(normalizedShop, Math.max(0, Math.floor(Number(completeLimit) || 0)));
+    `).all(normalizedShop, normalizedQueueKey, Math.max(0, Math.floor(Number(completeLimit) || 0)));
 
     return [...openRows, ...completedRows].map(buildPrintQueueItemRecord).filter(Boolean);
   },
 
-  getActivePrintQueueItems({ shop } = {}) {
+  getActivePrintQueueItems({ shop, queueKey = 'sls' } = {}) {
     const normalizedShop = String(shop || '').trim();
+    const normalizedQueueKey = normalizePrintQueueKey(queueKey);
     if (!normalizedShop) return [];
 
     const rows = db.prepare(`
       SELECT *
       FROM print_queue_items
       WHERE shop = ?
+        AND queueKey = ?
         AND putAwayAt IS NULL
         AND removedAt IS NULL
       ORDER BY updatedAt DESC, id DESC
-    `).all(normalizedShop);
+    `).all(normalizedShop, normalizedQueueKey);
 
     return rows.map(buildPrintQueueItemRecord).filter(Boolean);
   },
@@ -2161,6 +2259,137 @@ module.exports = {
     `).get(normalizedOrderId);
 
     return buildOrderTrackerRecord(tracker);
+  },
+
+  listOrderTrackers({ shop, includeTerminal = false, limit = 500 } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const safeLimit = Math.min(2000, Math.max(1, Math.floor(Number(limit) || 500)));
+    if (!normalizedShop) return [];
+
+    const terminalClause = includeTerminal ? '' : 'AND currentStageIsTerminal = 0';
+    const rows = db.prepare(`
+      SELECT *
+      FROM order_trackers
+      WHERE shop = ?
+        ${terminalClause}
+      ORDER BY lastEventAt ASC, updatedAt ASC
+      LIMIT ?
+    `).all(normalizedShop, safeLimit);
+
+    return rows.map(buildOrderTrackerRecord).filter(Boolean);
+  },
+
+  listOrderFlowSnoozes({ shop, includeDeleted = false } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) return [];
+
+    const deletedClause = includeDeleted ? '' : 'AND deletedAt IS NULL';
+    const rows = db.prepare(`
+      SELECT *
+      FROM order_flow_snoozes
+      WHERE shop = ?
+        ${deletedClause}
+      ORDER BY snoozedAt DESC
+    `).all(normalizedShop);
+
+    return rows.map((row) => ({
+      issueKey: String(row.issueKey || '').trim(),
+      orderId: String(row.orderId || '').trim(),
+      orderNumber: String(row.orderNumber || '').trim(),
+      issueType: String(row.issueType || '').trim(),
+      stageKey: String(row.stageKey || '').trim(),
+      reason: String(row.reason || '').trim(),
+      snoozedBy: String(row.snoozedBy || '').trim(),
+      snoozedAt: row.snoozedAt || null,
+      deletedBy: String(row.deletedBy || '').trim(),
+      deletedAt: row.deletedAt || null,
+    })).filter((row) => row.issueKey);
+  },
+
+  snoozeOrderFlowIssue({
+    shop,
+    issueKey,
+    orderId = null,
+    orderNumber = null,
+    issueType = null,
+    stageKey = null,
+    reason = null,
+    snoozedBy = null,
+    snoozedAt = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedIssueKey = String(issueKey || '').trim();
+    if (!normalizedShop || !normalizedIssueKey) return null;
+
+    const nowIso = snoozedAt || new Date().toISOString();
+    db.prepare(`
+      INSERT INTO order_flow_snoozes (
+        shop, issueKey, orderId, orderNumber, issueType, stageKey, reason, snoozedBy, snoozedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      ON CONFLICT(shop, issueKey) DO UPDATE SET
+        orderId = excluded.orderId,
+        orderNumber = excluded.orderNumber,
+        issueType = excluded.issueType,
+        stageKey = excluded.stageKey,
+        reason = excluded.reason,
+        snoozedBy = excluded.snoozedBy,
+        snoozedAt = excluded.snoozedAt
+    `).run(
+      normalizedShop,
+      normalizedIssueKey,
+      orderId ? String(orderId).trim() : null,
+      orderNumber ? String(orderNumber).trim() : null,
+      issueType ? String(issueType).trim() : null,
+      stageKey ? String(stageKey).trim() : null,
+      reason ? String(reason).trim() : null,
+      snoozedBy ? String(snoozedBy).trim() : null,
+      nowIso
+    );
+
+    return this.listOrderFlowSnoozes({ shop: normalizedShop })
+      .find((snooze) => snooze.issueKey === normalizedIssueKey) || null;
+  },
+
+  unsnoozeOrderFlowIssue({ shop, issueKey } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedIssueKey = String(issueKey || '').trim();
+    if (!normalizedShop || !normalizedIssueKey) return 0;
+
+    const result = db.prepare(`
+      DELETE FROM order_flow_snoozes
+      WHERE shop = ?
+        AND issueKey = ?
+    `).run(normalizedShop, normalizedIssueKey);
+
+    return Number(result?.changes || 0);
+  },
+
+  deleteOrderFlowIssue({ shop, issueKey, deletedBy = null, deletedAt = null } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedIssueKey = String(issueKey || '').trim();
+    if (!normalizedShop || !normalizedIssueKey) return 0;
+
+    const nowIso = deletedAt || new Date().toISOString();
+    const safeDeletedBy = deletedBy ? String(deletedBy).trim() : null;
+    const updateResult = db.prepare(`
+      UPDATE order_flow_snoozes
+      SET deletedAt = ?,
+          deletedBy = ?
+      WHERE shop = ?
+        AND issueKey = ?
+    `).run(nowIso, safeDeletedBy, normalizedShop, normalizedIssueKey);
+
+    if (Number(updateResult?.changes || 0) > 0) {
+      return Number(updateResult.changes || 0);
+    }
+
+    const insertResult = db.prepare(`
+      INSERT INTO order_flow_snoozes (
+        shop, issueKey, snoozedBy, snoozedAt, deletedBy, deletedAt
+      ) VALUES (?, ?, ?, ?, ?, ?)
+    `).run(normalizedShop, normalizedIssueKey, safeDeletedBy, nowIso, safeDeletedBy, nowIso);
+
+    return Number(insertResult?.changes || 0);
   },
 
   getLatestOrderTrackerStaffByStage({ shop, orderId, stageKey }) {
