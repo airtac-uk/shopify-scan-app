@@ -28,6 +28,13 @@ function normalizePrintQueueKey(value) {
   return normalized === 'fdm' ? 'fdm' : 'sls';
 }
 
+function normalizeOrderFlowExceptionStack(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'wholesale') return 'wholesale';
+  if (normalized === 'proto' || normalized === 'prototype') return 'proto';
+  return 'snoozed';
+}
+
 // Create table if not exists
 db.prepare(`
   CREATE TABLE IF NOT EXISTS sessions (
@@ -255,6 +262,7 @@ db.prepare(`
     reason TEXT,
     snoozedBy TEXT,
     snoozedAt TEXT NOT NULL,
+    stack TEXT NOT NULL DEFAULT 'snoozed',
     deletedBy TEXT,
     deletedAt TEXT,
     PRIMARY KEY (shop, issueKey)
@@ -279,9 +287,21 @@ if (!orderFlowSnoozeColumns.some((column) => column?.name === 'deletedAt')) {
   `).run();
 }
 
+if (!orderFlowSnoozeColumns.some((column) => column?.name === 'stack')) {
+  db.prepare(`
+    ALTER TABLE order_flow_snoozes
+    ADD COLUMN stack TEXT NOT NULL DEFAULT 'snoozed'
+  `).run();
+}
+
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_order_flow_snoozes_shop_snoozedAt
   ON order_flow_snoozes (shop, snoozedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_order_flow_snoozes_shop_stack_snoozedAt
+  ON order_flow_snoozes (shop, stack, snoozedAt DESC)
 `).run();
 
 db.prepare(`
@@ -576,25 +596,70 @@ const DAILY_OPERATION_METRICS = [
   },
 ];
 
-function getDailyOperationPeriodBounds(nowValue = new Date()) {
-  const now = nowValue instanceof Date ? nowValue : new Date(nowValue);
-  const safeNow = Number.isNaN(now.getTime()) ? new Date() : now;
+function parseDailyOperationDate(value, fallbackDate = new Date()) {
+  const rawValue = String(value || '').trim();
+  const fallback = fallbackDate instanceof Date && !Number.isNaN(fallbackDate.getTime())
+    ? fallbackDate
+    : new Date();
+  if (!rawValue) {
+    return new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
+  }
+
+  const match = rawValue.match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if (match) {
+    const year = Number(match[1]);
+    const month = Number(match[2]);
+    const day = Number(match[3]);
+    const parsed = new Date(year, month - 1, day);
+    if (
+      parsed.getFullYear() === year &&
+      parsed.getMonth() === month - 1 &&
+      parsed.getDate() === day
+    ) {
+      return parsed;
+    }
+  }
+
+  const parsed = new Date(rawValue);
+  if (!Number.isNaN(parsed.getTime())) {
+    return new Date(parsed.getFullYear(), parsed.getMonth(), parsed.getDate());
+  }
+
+  return new Date(fallback.getFullYear(), fallback.getMonth(), fallback.getDate());
+}
+
+function getDailyOperationPeriodBounds({ date = null, now = new Date() } = {}) {
+  const nowDate = now instanceof Date ? now : new Date(now);
+  const safeNow = Number.isNaN(nowDate.getTime()) ? new Date() : nowDate;
+  const selectedStart = parseDailyOperationDate(date, safeNow);
+  const selectedEnd = new Date(selectedStart);
+  selectedEnd.setDate(selectedStart.getDate() + 1);
+
   const todayStart = new Date(
     safeNow.getFullYear(),
     safeNow.getMonth(),
     safeNow.getDate()
   );
-  const yesterdayStart = new Date(todayStart);
-  yesterdayStart.setDate(todayStart.getDate() - 1);
+  const isToday = selectedStart.getTime() === todayStart.getTime();
+  const periodEnd = isToday && safeNow < selectedEnd ? safeNow : selectedEnd;
+  const yesterdayStart = new Date(selectedStart);
+  yesterdayStart.setDate(selectedStart.getDate() - 1);
 
-  const weekStart = new Date(todayStart);
-  const daysSinceMonday = (todayStart.getDay() + 6) % 7;
-  weekStart.setDate(todayStart.getDate() - daysSinceMonday);
+  const weekStart = new Date(selectedStart);
+  const daysSinceMonday = (selectedStart.getDay() + 6) % 7;
+  weekStart.setDate(selectedStart.getDate() - daysSinceMonday);
 
   return {
-    nowIso: safeNow.toISOString(),
-    todayStartIso: todayStart.toISOString(),
+    generatedAtIso: safeNow.toISOString(),
+    selectedDate: [
+      selectedStart.getFullYear(),
+      String(selectedStart.getMonth() + 1).padStart(2, '0'),
+      String(selectedStart.getDate()).padStart(2, '0'),
+    ].join('-'),
+    todayStartIso: selectedStart.toISOString(),
+    todayEndIso: periodEnd.toISOString(),
     yesterdayStartIso: yesterdayStart.toISOString(),
+    yesterdayEndIso: selectedStart.toISOString(),
     weekStartIso: weekStart.toISOString(),
   };
 }
@@ -2358,7 +2423,7 @@ module.exports = {
     return rows.map(buildOrderTrackerRecord).filter(Boolean);
   },
 
-  getDailyOperationsSummary({ shop, now = new Date() } = {}) {
+  getDailyOperationsSummary({ shop, date = null, now = new Date() } = {}) {
     const normalizedShop = String(shop || '').trim();
     if (!normalizedShop) {
       return {
@@ -2369,66 +2434,203 @@ module.exports = {
       };
     }
 
-    const bounds = getDailyOperationPeriodBounds(now);
-
-    const countForPeriod = (metric, startIso, endIso) => {
-      const stageKeys = Array.isArray(metric.stageKeys)
-        ? metric.stageKeys.map((stageKey) => String(stageKey || '').trim()).filter(Boolean)
-        : [];
-      if (!stageKeys.length) return 0;
-
-      const placeholders = stageKeys.map(() => '?').join(', ');
-      const row = db.prepare(`
-        SELECT
-          COUNT(*) AS eventCount,
-          COUNT(DISTINCT orderId) AS orderCount
-        FROM order_tracker_events
-        WHERE shop = ?
-          AND createdAt >= ?
-          AND createdAt < ?
-          AND stageKey IN (${placeholders})
-      `).get(normalizedShop, startIso, endIso, ...stageKeys);
-
-      return metric.countMode === 'events'
-        ? Number(row?.eventCount || 0)
-        : Number(row?.orderCount || 0);
-    };
-
+    const bounds = getDailyOperationPeriodBounds({ date, now });
     const allStageKeys = Array.from(new Set(
       DAILY_OPERATION_METRICS.flatMap((metric) => metric.stageKeys || [])
     ));
+
+    const trendStart = new Date(bounds.todayStartIso);
+    trendStart.setDate(trendStart.getDate() - 6);
+    const queryStartIso = [bounds.yesterdayStartIso, bounds.weekStartIso, trendStart.toISOString()]
+      .sort()[0];
     const stagePlaceholders = allStageKeys.map(() => '?').join(', ');
-    const topStaff = allStageKeys.length
+    const rawRows = allStageKeys.length
       ? db.prepare(`
           SELECT
-            COALESCE(NULLIF(TRIM(staff), ''), 'Unknown') AS staff,
-            COUNT(*) AS count
-          FROM order_tracker_events
-          WHERE shop = ?
-            AND createdAt >= ?
-            AND createdAt < ?
-            AND stageKey IN (${stagePlaceholders})
-          GROUP BY COALESCE(NULLIF(TRIM(staff), ''), 'Unknown')
-          ORDER BY count DESC, staff ASC
-          LIMIT 8
-        `).all(normalizedShop, bounds.todayStartIso, bounds.nowIso, ...allStageKeys)
-          .map((row) => ({
-            staff: String(row.staff || 'Unknown').trim() || 'Unknown',
-            count: Number(row.count || 0),
-          }))
+            e.id AS id,
+            e.orderId AS orderId,
+            e.stageKey AS stageKey,
+            e.stageLabel AS stageLabel,
+            e.staff AS staff,
+            e.createdAt AS createdAt,
+            ot.orderNumber AS orderNumber,
+            ot.barcode AS barcode
+          FROM order_tracker_events e
+          LEFT JOIN order_trackers ot
+            ON ot.shop = e.shop
+           AND ot.orderId = e.orderId
+          WHERE e.shop = ?
+            AND e.createdAt >= ?
+            AND e.createdAt < ?
+            AND e.stageKey IN (${stagePlaceholders})
+          ORDER BY e.createdAt ASC, e.id ASC
+        `).all(normalizedShop, queryStartIso, bounds.todayEndIso, ...allStageKeys)
       : [];
+    const rows = rawRows
+      .map((row) => {
+        const time = Date.parse(row.createdAt || '');
+        return {
+          id: Number(row.id || 0),
+          orderId: String(row.orderId || '').trim(),
+          orderNumber: String(row.orderNumber || '').trim(),
+          barcode: normalizeBarcode(row.barcode),
+          stageKey: String(row.stageKey || '').trim(),
+          stageLabel: String(row.stageLabel || row.stageKey || '').trim(),
+          staff: String(row.staff || '').trim() || 'Unknown',
+          createdAt: row.createdAt || null,
+          time,
+        };
+      })
+      .filter((row) => row.stageKey && Number.isFinite(row.time));
+
+    const getRowsForMetric = (metric, startIso, endIso) => {
+      const stageKeys = new Set((Array.isArray(metric.stageKeys) ? metric.stageKeys : [])
+        .map((stageKey) => String(stageKey || '').trim())
+        .filter(Boolean));
+      const startMs = Date.parse(startIso);
+      const endMs = Date.parse(endIso);
+      if (!stageKeys.size || !Number.isFinite(startMs) || !Number.isFinite(endMs)) return [];
+      return rows.filter((row) => (
+        stageKeys.has(row.stageKey) &&
+        row.time >= startMs &&
+        row.time < endMs
+      ));
+    };
+
+    const countRows = (metric, metricRows) => {
+      if (metric.countMode === 'events') return metricRows.length;
+      return new Set(metricRows.map((row) => row.orderId).filter(Boolean)).size;
+    };
+
+    const buildHourly = (metric, metricRows) => {
+      const buckets = Array.from({ length: 24 }, (_item, hour) => ({
+        hour,
+        label: `${String(hour).padStart(2, '0')}:00`,
+        count: 0,
+      }));
+      const orderHourKeys = new Set();
+
+      metricRows.forEach((row) => {
+        const dateValue = new Date(row.time);
+        const hour = dateValue.getHours();
+        if (!Number.isInteger(hour) || hour < 0 || hour > 23) return;
+
+        if (metric.countMode === 'events') {
+          buckets[hour].count += 1;
+          return;
+        }
+
+        const key = `${hour}:${row.orderId}`;
+        if (!row.orderId || orderHourKeys.has(key)) return;
+        orderHourKeys.add(key);
+        buckets[hour].count += 1;
+      });
+
+      return buckets;
+    };
+
+    const buildStaff = (metric, metricRows) => {
+      const staffCounts = new Map();
+      const staffOrderKeys = new Set();
+      metricRows.forEach((row) => {
+        const staff = row.staff || 'Unknown';
+        if (metric.countMode !== 'events') {
+          const key = `${staff}:${row.orderId}`;
+          if (!row.orderId || staffOrderKeys.has(key)) return;
+          staffOrderKeys.add(key);
+        }
+        staffCounts.set(staff, (staffCounts.get(staff) || 0) + 1);
+      });
+
+      return Array.from(staffCounts.entries())
+        .map(([staff, count]) => ({ staff, count }))
+        .sort((left, right) => {
+          const countDiff = right.count - left.count;
+          return countDiff || left.staff.localeCompare(right.staff);
+        })
+        .slice(0, 10);
+    };
+
+    const buildRecentOrders = (metric, metricRows) => {
+      const seen = new Set();
+      return [...metricRows]
+        .sort((left, right) => {
+          const timeDiff = right.time - left.time;
+          return timeDiff || right.id - left.id;
+        })
+        .filter((row) => {
+          if (metric.countMode === 'events') return true;
+          const key = row.orderId || `${row.orderNumber}:${row.stageKey}`;
+          if (!key || seen.has(key)) return false;
+          seen.add(key);
+          return true;
+        })
+        .slice(0, 12)
+        .map((row) => ({
+          orderId: row.orderId,
+          orderNumber: row.orderNumber || row.barcode || row.orderId,
+          barcode: row.barcode,
+          stageKey: row.stageKey,
+          stageLabel: row.stageLabel,
+          staff: row.staff,
+          createdAt: row.createdAt,
+        }));
+    };
+
+    const buildTrend = (metric) => Array.from({ length: 7 }, (_item, index) => {
+      const start = new Date(trendStart);
+      start.setDate(trendStart.getDate() + index);
+      const end = new Date(start);
+      end.setDate(start.getDate() + 1);
+      const rowsForDay = getRowsForMetric(metric, start.toISOString(), end.toISOString());
+      return {
+        date: [
+          start.getFullYear(),
+          String(start.getMonth() + 1).padStart(2, '0'),
+          String(start.getDate()).padStart(2, '0'),
+        ].join('-'),
+        label: new Intl.DateTimeFormat('en-GB', {
+          weekday: 'short',
+          day: 'numeric',
+          month: 'short',
+        }).format(start),
+        count: countRows(metric, rowsForDay),
+      };
+    });
+
+    const todayAllRows = rows.filter((row) => (
+      row.time >= Date.parse(bounds.todayStartIso) &&
+      row.time < Date.parse(bounds.todayEndIso)
+    ));
+    const topStaff = Array.from(todayAllRows.reduce((acc, row) => {
+      const staff = row.staff || 'Unknown';
+      acc.set(staff, (acc.get(staff) || 0) + 1);
+      return acc;
+    }, new Map()).entries())
+      .map(([staff, count]) => ({ staff, count }))
+      .sort((left, right) => {
+        const countDiff = right.count - left.count;
+        return countDiff || left.staff.localeCompare(right.staff);
+      })
+      .slice(0, 8);
 
     return {
-      generatedAt: bounds.nowIso,
+      generatedAt: bounds.generatedAtIso,
       periods: {
+        selectedDate: bounds.selectedDate,
         todayStart: bounds.todayStartIso,
+        todayEnd: bounds.todayEndIso,
         yesterdayStart: bounds.yesterdayStartIso,
+        yesterdayEnd: bounds.yesterdayEndIso,
         weekStart: bounds.weekStartIso,
       },
       metrics: DAILY_OPERATION_METRICS.map((metric) => {
-        const today = countForPeriod(metric, bounds.todayStartIso, bounds.nowIso);
-        const yesterday = countForPeriod(metric, bounds.yesterdayStartIso, bounds.todayStartIso);
-        const week = countForPeriod(metric, bounds.weekStartIso, bounds.nowIso);
+        const todayRows = getRowsForMetric(metric, bounds.todayStartIso, bounds.todayEndIso);
+        const yesterdayRows = getRowsForMetric(metric, bounds.yesterdayStartIso, bounds.yesterdayEndIso);
+        const weekRows = getRowsForMetric(metric, bounds.weekStartIso, bounds.todayEndIso);
+        const today = countRows(metric, todayRows);
+        const yesterday = countRows(metric, yesterdayRows);
+        const week = countRows(metric, weekRows);
         return {
           key: metric.key,
           label: metric.label,
@@ -2438,6 +2640,10 @@ module.exports = {
           delta: today - yesterday,
           countMode: metric.countMode,
           stageKeys: [...metric.stageKeys],
+          hourly: buildHourly(metric, todayRows),
+          trend: buildTrend(metric),
+          staff: buildStaff(metric, todayRows),
+          recentOrders: buildRecentOrders(metric, todayRows),
         };
       }),
       topStaff,
@@ -2466,6 +2672,7 @@ module.exports = {
       reason: String(row.reason || '').trim(),
       snoozedBy: String(row.snoozedBy || '').trim(),
       snoozedAt: row.snoozedAt || null,
+      stack: normalizeOrderFlowExceptionStack(row.stack),
       deletedBy: String(row.deletedBy || '').trim(),
       deletedAt: row.deletedAt || null,
     })).filter((row) => row.issueKey);
@@ -2481,16 +2688,18 @@ module.exports = {
     reason = null,
     snoozedBy = null,
     snoozedAt = null,
+    stack = 'snoozed',
   } = {}) {
     const normalizedShop = String(shop || '').trim();
     const normalizedIssueKey = String(issueKey || '').trim();
     if (!normalizedShop || !normalizedIssueKey) return null;
 
     const nowIso = snoozedAt || new Date().toISOString();
+    const normalizedStack = normalizeOrderFlowExceptionStack(stack);
     db.prepare(`
       INSERT INTO order_flow_snoozes (
-        shop, issueKey, orderId, orderNumber, issueType, stageKey, reason, snoozedBy, snoozedAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        shop, issueKey, orderId, orderNumber, issueType, stageKey, reason, snoozedBy, snoozedAt, stack, deletedBy, deletedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
       ON CONFLICT(shop, issueKey) DO UPDATE SET
         orderId = excluded.orderId,
         orderNumber = excluded.orderNumber,
@@ -2498,7 +2707,10 @@ module.exports = {
         stageKey = excluded.stageKey,
         reason = excluded.reason,
         snoozedBy = excluded.snoozedBy,
-        snoozedAt = excluded.snoozedAt
+        snoozedAt = excluded.snoozedAt,
+        stack = excluded.stack,
+        deletedBy = NULL,
+        deletedAt = NULL
     `).run(
       normalizedShop,
       normalizedIssueKey,
@@ -2508,7 +2720,8 @@ module.exports = {
       stageKey ? String(stageKey).trim() : null,
       reason ? String(reason).trim() : null,
       snoozedBy ? String(snoozedBy).trim() : null,
-      nowIso
+      nowIso,
+      normalizedStack
     );
 
     return this.listOrderFlowSnoozes({ shop: normalizedShop })
@@ -2550,9 +2763,9 @@ module.exports = {
 
     const insertResult = db.prepare(`
       INSERT INTO order_flow_snoozes (
-        shop, issueKey, snoozedBy, snoozedAt, deletedBy, deletedAt
-      ) VALUES (?, ?, ?, ?, ?, ?)
-    `).run(normalizedShop, normalizedIssueKey, safeDeletedBy, nowIso, safeDeletedBy, nowIso);
+        shop, issueKey, snoozedBy, snoozedAt, stack, deletedBy, deletedAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?)
+    `).run(normalizedShop, normalizedIssueKey, safeDeletedBy, nowIso, 'snoozed', safeDeletedBy, nowIso);
 
     return Number(insertResult?.changes || 0);
   },

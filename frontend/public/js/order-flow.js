@@ -1,6 +1,11 @@
 const ORDER_FLOW_POLL_MS = 60000;
 const ORDER_FLOW_SETTINGS_KEY = 'orderFlow.settings.v2';
 const ORDER_FLOW_STAGE_FILTER_PREFIX = 'stage:';
+const ORDER_FLOW_EXCEPTION_STACKS = {
+  snoozed: { label: 'Snoozed', verb: 'Snoozing' },
+  wholesale: { label: 'Wholesale', verb: 'Moving to Wholesale' },
+  proto: { label: 'Proto', verb: 'Moving to Proto' },
+};
 const ORDER_FLOW_OPERATIONAL_STAGE_LABELS = {
   received: 'New Order',
   queued: 'Racked',
@@ -74,6 +79,25 @@ function formatWorkingDays(value) {
   const rounded = Number(days.toFixed(2));
   const label = rounded === 1 ? 'working day' : 'working days';
   return `${rounded.toLocaleString('en-GB', { maximumFractionDigits: 2 })} ${label}`;
+}
+
+function formatOrderValue(value) {
+  const amount = Number(value?.amount);
+  const currencyCode = String(value?.currencyCode || '').trim().toUpperCase();
+  if (!Number.isFinite(amount) || !currencyCode) return '';
+
+  try {
+    return new Intl.NumberFormat('en-GB', {
+      style: 'currency',
+      currency: currencyCode,
+      maximumFractionDigits: 2,
+    }).format(amount);
+  } catch (err) {
+    return `${currencyCode} ${amount.toLocaleString('en-GB', {
+      minimumFractionDigits: 2,
+      maximumFractionDigits: 2,
+    })}`;
+  }
 }
 
 function setStatus(message, type = 'info') {
@@ -247,12 +271,41 @@ function buildOrderViewerUrl(issue) {
   return `/pick_list.html?${params.toString()}`;
 }
 
+function getOrderFlowStackKeys() {
+  return Object.keys(ORDER_FLOW_EXCEPTION_STACKS);
+}
+
+function normalizeOrderFlowStackKey(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return ORDER_FLOW_EXCEPTION_STACKS[normalized] ? normalized : '';
+}
+
+function getStackIssues(stackKey) {
+  const normalizedStackKey = normalizeOrderFlowStackKey(stackKey);
+  if (!normalizedStackKey) return [];
+
+  const stack = orderFlowData?.exceptionStacks?.[normalizedStackKey];
+  if (Array.isArray(stack?.issues)) return stack.issues;
+
+  if (normalizedStackKey === 'snoozed' && Array.isArray(orderFlowData?.snoozed?.issues)) {
+    return orderFlowData.snoozed.issues;
+  }
+
+  return [];
+}
+
+function getStackCount(stackKey) {
+  const normalizedStackKey = normalizeOrderFlowStackKey(stackKey);
+  if (!normalizedStackKey) return 0;
+  const stack = orderFlowData?.exceptionStacks?.[normalizedStackKey];
+  if (Number.isFinite(Number(stack?.count))) return Number(stack.count);
+  return getStackIssues(normalizedStackKey).length;
+}
+
 function getAllRenderedIssues() {
   const issues = Array.isArray(orderFlowData?.issues) ? orderFlowData.issues : [];
-  const snoozedIssues = Array.isArray(orderFlowData?.snoozed?.issues)
-    ? orderFlowData.snoozed.issues
-    : [];
-  return [...issues, ...snoozedIssues];
+  const stackedIssues = getOrderFlowStackKeys().flatMap((stackKey) => getStackIssues(stackKey));
+  return [...issues, ...stackedIssues];
 }
 
 function findIssueByKey(issueKey) {
@@ -264,11 +317,9 @@ function findIssueByKey(issueKey) {
 
 function getFilteredIssues() {
   const issues = Array.isArray(orderFlowData?.issues) ? orderFlowData.issues : [];
-  const snoozedIssues = Array.isArray(orderFlowData?.snoozed?.issues)
-    ? orderFlowData.snoozed.issues
-    : [];
+  const stackFilterKey = normalizeOrderFlowStackKey(orderFlowActiveFilter);
   if (orderFlowActiveFilter === 'all') return issues;
-  if (orderFlowActiveFilter === 'snoozed') return snoozedIssues;
+  if (stackFilterKey) return getStackIssues(stackFilterKey);
   if (orderFlowActiveFilter.startsWith(ORDER_FLOW_STAGE_FILTER_PREFIX)) {
     const stageKey = orderFlowActiveFilter.slice(ORDER_FLOW_STAGE_FILTER_PREFIX.length);
     return issues.filter((issue) => issue.type === 'stale_stage' && getIssueStageKey(issue) === stageKey);
@@ -292,6 +343,8 @@ function renderOverview() {
     { label: 'New Orders', value: summary.unstartedCount || 0 },
     { label: 'No Tracker', value: summary.untrackedCount || 0 },
     { label: 'Stuck Statuses', value: summary.staleStageCount || 0 },
+    { label: 'Wholesale', value: summary.wholesaleCount || getStackCount('wholesale') },
+    { label: 'Proto', value: summary.protoCount || getStackCount('proto') },
     { label: 'Snoozed', value: summary.snoozedCount || 0 },
     { label: 'Open Orders Scanned', value: summary.openOrdersScanned || 0 },
   ];
@@ -328,9 +381,6 @@ function renderFilters() {
   const container = document.getElementById('orderFlowFilters');
   if (!container) return;
   const issues = Array.isArray(orderFlowData?.issues) ? orderFlowData.issues : [];
-  const snoozedIssues = Array.isArray(orderFlowData?.snoozed?.issues)
-    ? orderFlowData.snoozed.issues
-    : [];
   const staleStageCounts = issues
     .filter((issue) => issue.type === 'stale_stage')
     .reduce((acc, issue) => {
@@ -365,7 +415,11 @@ function renderFilters() {
     { key: 'untracked', label: 'No Tracker', count: issues.filter((issue) => issue.type === 'untracked').length },
     ...stageFilters,
     { key: 'warning', label: 'Warnings', count: issues.filter((issue) => issue.severity === 'warning').length },
-    { key: 'snoozed', label: 'Snoozed', count: snoozedIssues.length },
+    ...getOrderFlowStackKeys().map((stackKey) => ({
+      key: stackKey,
+      label: ORDER_FLOW_EXCEPTION_STACKS[stackKey].label,
+      count: getStackCount(stackKey),
+    })),
   ];
 
   container.innerHTML = filters.map((filter) => `
@@ -398,7 +452,7 @@ function renderIssueTags(issue) {
   `;
 }
 
-function renderIssue(issue, { snoozed = false } = {}) {
+function renderIssue(issue, { stackKey = '' } = {}) {
   const orderLabel = issue.orderNumber || issue.barcode || 'Unknown order';
   const viewerUrl = buildOrderViewerUrl(issue);
   const stageLabel = getIssueStageLabel(issue);
@@ -407,10 +461,15 @@ function renderIssue(issue, { snoozed = false } = {}) {
   const ageLabel = issue.ageWorkingDays == null ? '-' : formatWorkingDays(issue.ageWorkingDays);
   const thresholdLabel = issue.thresholdWorkingDays == null ? '-' : formatWorkingDays(issue.thresholdWorkingDays);
   const itemTitle = String(issue.firstItemTitle || '').trim();
+  const itemCount = Math.max(0, Number(issue.itemCount || 0));
+  const orderValueLabel = formatOrderValue(issue.orderValue);
   const sourceLabel = issue.source === 'local_tracker' ? 'Local tracker' : 'Shopify scan';
-  const snoozedAt = issue.snoozed?.at ? formatTimestamp(issue.snoozed.at) : '';
-  const snoozedBy = String(issue.snoozed?.by || '').trim();
-  const actionButtons = snoozed
+  const activeStackKey = normalizeOrderFlowStackKey(stackKey || issue.exceptionStack?.key || '');
+  const stackConfig = activeStackKey ? ORDER_FLOW_EXCEPTION_STACKS[activeStackKey] : null;
+  const stackedAt = issue.exceptionStack?.at || issue.snoozed?.at || null;
+  const stackedBy = String(issue.exceptionStack?.by || issue.snoozed?.by || '').trim();
+  const stackedAtLabel = stackedAt ? formatTimestamp(stackedAt) : '';
+  const actionButtons = activeStackKey
     ? `
         <button
           type="button"
@@ -428,10 +487,21 @@ function renderIssue(issue, { snoozed = false } = {}) {
         </button>
       `
     : `
+        ${getOrderFlowStackKeys().filter((availableStackKey) => availableStackKey !== 'snoozed').map((availableStackKey) => `
+          <button
+            type="button"
+            class="order-flow-secondary-action"
+            data-order-flow-stack="${escapeHtmlAttribute(issue.issueKey)}"
+            data-order-flow-stack-value="${escapeHtmlAttribute(availableStackKey)}"
+          >
+            ${escapeHtml(ORDER_FLOW_EXCEPTION_STACKS[availableStackKey].label)}
+          </button>
+        `).join('')}
         <button
           type="button"
           class="order-flow-secondary-action"
-          data-order-flow-snooze="${escapeHtmlAttribute(issue.issueKey)}"
+          data-order-flow-stack="${escapeHtmlAttribute(issue.issueKey)}"
+          data-order-flow-stack-value="snoozed"
         >
           Snooze
         </button>
@@ -452,15 +522,17 @@ function renderIssue(issue, { snoozed = false } = {}) {
         <p class="order-flow-issue__reason">${escapeHtml(issue.reason || 'Order needs review.')}</p>
         <div class="order-flow-issue__meta">
           <span>Stage <strong>${escapeHtml(stageLabel)}</strong></span>
+          ${orderValueLabel ? `<span>Value <strong>${escapeHtml(orderValueLabel)}</strong></span>` : ''}
+          ${itemCount ? `<span>Items <strong>${escapeHtml(itemCount)}</strong></span>` : ''}
           <span>Idle <strong>${escapeHtml(idleLabel)}</strong></span>
           <span>Age <strong>${escapeHtml(ageLabel)}</strong></span>
           <span>Limit <strong>${escapeHtml(thresholdLabel)}</strong></span>
           <span>${escapeHtml(sourceLabel)}</span>
           ${issue.lastStaff ? `<span>Last staff <strong>${escapeHtml(issue.lastStaff)}</strong></span>` : ''}
-          ${snoozedAt ? `<span>Snoozed <strong>${escapeHtml(snoozedAt)}</strong></span>` : ''}
-          ${snoozedBy ? `<span>By <strong>${escapeHtml(snoozedBy)}</strong></span>` : ''}
+          ${stackedAtLabel && stackConfig ? `<span>${escapeHtml(stackConfig.label)} <strong>${escapeHtml(stackedAtLabel)}</strong></span>` : ''}
+          ${stackedBy ? `<span>By <strong>${escapeHtml(stackedBy)}</strong></span>` : ''}
         </div>
-        ${itemTitle ? `<p class="order-flow-issue__item">${escapeHtml(itemTitle)}${issue.itemCount ? ` - ${escapeHtml(issue.itemCount)} items` : ''}</p>` : ''}
+        ${itemTitle ? `<p class="order-flow-issue__item">${escapeHtml(itemTitle)}</p>` : ''}
         ${renderIssueTags(issue)}
       </div>
       <div class="order-flow-issue__action">
@@ -481,8 +553,9 @@ function renderIssues() {
     return;
   }
 
+  const stackFilterKey = normalizeOrderFlowStackKey(orderFlowActiveFilter);
   container.innerHTML = issues
-    .map((issue) => renderIssue(issue, { snoozed: orderFlowActiveFilter === 'snoozed' }))
+    .map((issue) => renderIssue(issue, { stackKey: stackFilterKey || issue.exceptionStack?.key || '' }))
     .join('');
 }
 
@@ -493,25 +566,29 @@ function renderOrderFlow() {
   renderIssues();
 }
 
-async function updateOrderFlowSnooze(issueKey, shouldSnooze) {
+async function updateOrderFlowExceptionStack(issueKey, stackKey = '') {
   if (orderFlowLoading) return;
 
   const issue = findIssueByKey(issueKey);
   if (!issue?.issueKey) return;
 
+  const normalizedStackKey = normalizeOrderFlowStackKey(stackKey);
+  const shouldStack = Boolean(normalizedStackKey);
+  const stackLabel = shouldStack ? ORDER_FLOW_EXCEPTION_STACKS[normalizedStackKey].label : '';
   setLoading(true);
-  setStatus(shouldSnooze ? 'Snoozing warning...' : 'Restoring warning...', 'info');
+  setStatus(shouldStack ? `${ORDER_FLOW_EXCEPTION_STACKS[normalizedStackKey].verb}...` : 'Restoring warning...', 'info');
 
   try {
-    const response = await fetch(shouldSnooze ? '/api/order-flow/snooze' : '/api/order-flow/unsnooze', {
+    const response = await fetch(shouldStack ? '/api/order-flow/stack' : '/api/order-flow/unsnooze', {
       method: 'POST',
       headers: {
         'Content-Type': 'application/json',
         Accept: 'application/json',
       },
-      body: JSON.stringify(shouldSnooze
+      body: JSON.stringify(shouldStack
         ? {
             issueKey: issue.issueKey,
+            stack: normalizedStackKey,
             orderId: issue.orderId,
             orderNumber: issue.orderNumber,
             type: issue.type,
@@ -524,12 +601,12 @@ async function updateOrderFlowSnooze(issueKey, shouldSnooze) {
     });
     const data = await response.json().catch(() => ({}));
     if (!response.ok || !data.success) {
-      throw new Error(data.error || (shouldSnooze ? 'Failed to snooze warning' : 'Failed to restore warning'));
+      throw new Error(data.error || (shouldStack ? 'Failed to move warning' : 'Failed to restore warning'));
     }
 
     setLoading(false);
     await fetchOrderFlow({ silent: true });
-    setStatus(shouldSnooze ? 'Warning moved to Snoozed.' : 'Warning restored to active exceptions.', 'success');
+    setStatus(shouldStack ? `Warning moved to ${stackLabel}.` : 'Warning restored to active exceptions.', 'success');
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
   } finally {
@@ -543,7 +620,9 @@ async function deleteOrderFlowIssue(issueKey) {
   const issue = findIssueByKey(issueKey);
   if (!issue?.issueKey) return;
 
-  const confirmed = window.confirm('Delete this snoozed warning forever? It will not return unless the order creates a different warning.');
+  const stackKey = normalizeOrderFlowStackKey(issue.exceptionStack?.key || orderFlowActiveFilter);
+  const stackLabel = stackKey ? ORDER_FLOW_EXCEPTION_STACKS[stackKey].label : 'stacked';
+  const confirmed = window.confirm(`Delete this ${stackLabel} warning forever? It will not return unless the order creates a different warning.`);
   if (!confirmed) return;
 
   setLoading(true);
@@ -635,14 +714,14 @@ document.addEventListener('DOMContentLoaded', () => {
   if (layout) {
     layout.addEventListener('click', (event) => {
       const target = event.target instanceof Element ? event.target : null;
-      const snoozeButton = target?.closest('[data-order-flow-snooze]');
+      const stackButton = target?.closest('[data-order-flow-stack]');
       const unsnoozeButton = target?.closest('[data-order-flow-unsnooze]');
       const deleteButton = target?.closest('[data-order-flow-delete]');
-      if (!snoozeButton && !unsnoozeButton && !deleteButton) return;
+      if (!stackButton && !unsnoozeButton && !deleteButton) return;
 
       event.preventDefault();
       const issueKey = String(
-        snoozeButton?.getAttribute('data-order-flow-snooze')
+        stackButton?.getAttribute('data-order-flow-stack')
           || unsnoozeButton?.getAttribute('data-order-flow-unsnooze')
           || deleteButton?.getAttribute('data-order-flow-delete')
           || ''
@@ -653,7 +732,10 @@ document.addEventListener('DOMContentLoaded', () => {
         return;
       }
 
-      updateOrderFlowSnooze(issueKey, Boolean(snoozeButton));
+      updateOrderFlowExceptionStack(
+        issueKey,
+        stackButton ? stackButton.getAttribute('data-order-flow-stack-value') : ''
+      );
     });
   }
 

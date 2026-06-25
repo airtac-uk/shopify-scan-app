@@ -386,11 +386,30 @@ const ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS = {
   on_hold: 3,
   partially_fulfilled: 3,
 };
+const ORDER_FLOW_EXCEPTION_STACK_LABELS = {
+  snoozed: 'Snoozed',
+  wholesale: 'Wholesale',
+  proto: 'Proto',
+};
 const ORDER_WORKFLOW_STATUS_FIELDS = `
               displayFulfillmentStatus
               displayFinancialStatus
               cancelledAt
               cancelReason
+              currentSubtotalLineItemsQuantity
+              subtotalLineItemsQuantity
+              currentTotalPriceSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
+              totalPriceSet {
+                shopMoney {
+                  amount
+                  currencyCode
+                }
+              }
 `;
 const TRACKER_METAFIELD_NAMESPACE = String(process.env.SHOPIFY_TRACKER_METAFIELD_NAMESPACE || 'airtac').trim();
 const TRACKER_METAFIELD_KEY = String(process.env.SHOPIFY_TRACKER_METAFIELD_KEY || 'tracker_token').trim();
@@ -1046,6 +1065,13 @@ function getOrderFlowStageThresholdWorkingDays(
   return Number.isFinite(stageThreshold) && stageThreshold > 0 ? stageThreshold : fallbackWorkingDays;
 }
 
+function normalizeOrderFlowExceptionStack(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (normalized === 'wholesale') return 'wholesale';
+  if (normalized === 'proto' || normalized === 'prototype') return 'proto';
+  return 'snoozed';
+}
+
 function getOrderFlowDateMs(value) {
   const date = value ? new Date(value) : null;
   if (!date || Number.isNaN(date.getTime())) return null;
@@ -1116,12 +1142,42 @@ function getOrderFlowTrackerStage(tracker, shopifyOrder = null) {
   };
 }
 
+function getOrderFlowMoneyBagValue(...moneyBags) {
+  for (const moneyBag of moneyBags) {
+    const money = moneyBag?.shopMoney || moneyBag?.presentmentMoney || moneyBag || null;
+    const amount = Number(money?.amount);
+    const currencyCode = String(money?.currencyCode || money?.currency || '').trim().toUpperCase();
+    if (Number.isFinite(amount) && currencyCode) {
+      return {
+        amount,
+        currencyCode,
+      };
+    }
+  }
+  return null;
+}
+
+function getOrderFlowLineItemCount(lineItems) {
+  return (Array.isArray(lineItems) ? lineItems : [])
+    .reduce((sum, item) => sum + Math.max(0, Number(item?.quantity) || 0), 0);
+}
+
+function getOrderFlowFirstItemTitle(lineItems) {
+  const firstItem = (Array.isArray(lineItems) ? lineItems : [])
+    .find((item) => String(item?.title || '').trim());
+  return String(firstItem?.title || '').trim();
+}
+
 function summarizeOrderFlowShopifyOrder(order) {
   if (!order?.id) return null;
   const lineItems = Array.isArray(order.lineItems?.edges)
     ? buildCurrentOrderLineItems(order.lineItems.edges)
     : [];
-  const itemCount = lineItems.reduce((sum, item) => sum + Math.max(0, Number(item.quantity) || 0), 0);
+  const orderLevelItemCount = Number(order.currentSubtotalLineItemsQuantity ?? order.subtotalLineItemsQuantity);
+  const orderValue = getOrderFlowMoneyBagValue(order.currentTotalPriceSet, order.totalPriceSet);
+  const itemCount = Number.isFinite(orderLevelItemCount)
+    ? Math.max(0, orderLevelItemCount)
+    : getOrderFlowLineItemCount(lineItems);
   return {
     id: String(order.id || '').trim(),
     orderNumber: String(order.name || '').trim(),
@@ -1134,7 +1190,8 @@ function summarizeOrderFlowShopifyOrder(order) {
     cancelledAt: order.cancelledAt || null,
     cancelReason: String(order.cancelReason || '').trim(),
     itemCount,
-    firstItemTitle: String(lineItems[0]?.title || '').trim(),
+    orderValue,
+    firstItemTitle: getOrderFlowFirstItemTitle(lineItems),
     orderNote: stripAppOrderNoteBlocks(order.note),
   };
 }
@@ -1218,9 +1275,118 @@ async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100
   };
 }
 
+async function listOrderFlowOrdersByIds({ client, orderIds = [], chunkSize = 50 } = {}) {
+  const ids = Array.from(new Set(
+    (Array.isArray(orderIds) ? orderIds : [])
+      .map((orderId) => String(orderId || '').trim())
+      .filter(Boolean)
+  ));
+  if (!ids.length) return [];
+
+  const safeChunkSize = Math.max(1, Math.min(100, Math.floor(Number(chunkSize) || 50)));
+  const query = `
+    query getOrderFlowOrdersByIds($ids: [ID!]!) {
+      nodes(ids: $ids) {
+        ... on Order {
+          id
+          name
+          createdAt
+          updatedAt
+          note
+          tags
+          ${ORDER_WORKFLOW_STATUS_FIELDS}
+          lineItems(first: 10) {
+            edges {
+              node {
+                id
+                title
+                sku
+                quantity
+                currentQuantity
+                variantTitle
+                variant {
+                  barcode
+                }
+              }
+            }
+          }
+        }
+      }
+    }
+  `;
+  const orders = [];
+
+  for (let index = 0; index < ids.length; index += safeChunkSize) {
+    const chunk = ids.slice(index, index + safeChunkSize);
+    const response = await client.graphql(query, {
+      variables: {
+        ids: chunk,
+      },
+    });
+    const nodes = Array.isArray(response.data?.nodes) ? response.data.nodes : [];
+    nodes.forEach((node) => {
+      const order = summarizeOrderFlowShopifyOrder(node);
+      if (order?.id) orders.push(order);
+    });
+  }
+
+  return orders;
+}
+
 function isOrderFlowTrackerTerminal(tracker) {
   const workflowStatus = String(tracker?.workflowStatus || '').trim().toUpperCase();
   return Boolean(tracker?.currentStageIsTerminal) || ORDER_FLOW_TERMINAL_WORKFLOW_STATUSES.has(workflowStatus);
+}
+
+function isOrderFlowShopifyOrderTerminal(order) {
+  if (!order) return false;
+  if (order.cancelledAt) return true;
+  const fulfillmentStatus = String(order.fulfillmentStatus || order.displayFulfillmentStatus || '')
+    .trim()
+    .toUpperCase();
+  return ORDER_FLOW_TERMINAL_WORKFLOW_STATUSES.has(fulfillmentStatus);
+}
+
+function syncOrderFlowTerminalTracker({ shop, tracker, shopifyOrder }) {
+  if (!shop || !tracker?.orderId || !shopifyOrder || !isOrderFlowShopifyOrderTerminal(shopifyOrder)) {
+    return false;
+  }
+
+  const terminalStage = deriveTrackerStage({
+    explicitTag: '',
+    tags: shopifyOrder.tags,
+    cancelledAt: shopifyOrder.cancelledAt,
+    displayFulfillmentStatus: shopifyOrder.fulfillmentStatus || shopifyOrder.displayFulfillmentStatus,
+    orderNote: shopifyOrder.orderNote || shopifyOrder.note || '',
+  });
+  if (!terminalStage?.isTerminal) return false;
+
+  if (isOrderFlowTrackerTerminal(tracker)) {
+    return true;
+  }
+
+  try {
+    sessionsStore.saveOrderTrackerSnapshot({
+      shop,
+      orderId: tracker.orderId || shopifyOrder.id,
+      barcode: tracker.barcode || shopifyOrder.barcode || shopifyOrder.orderNumber,
+      orderNumber: tracker.orderNumber || shopifyOrder.orderNumber,
+      orderCreatedAt: tracker.orderCreatedAt || shopifyOrder.createdAt || null,
+      currentStage: terminalStage,
+      workflowStatus: shopifyOrder.cancelledAt
+        ? 'CANCELLED'
+        : String(shopifyOrder.fulfillmentStatus || shopifyOrder.displayFulfillmentStatus || '').trim(),
+      lineItems: Array.isArray(tracker.lineItems) ? tracker.lineItems : [],
+      legacyEvents: [],
+      appendEventIfStageChanged: true,
+      sourceTag: terminalStage.key,
+      staff: null,
+    });
+  } catch (err) {
+    console.error('Order Flow terminal tracker sync failed:', err);
+  }
+
+  return true;
 }
 
 function getOrderFlowIssueKey({ orderId, barcode, type, stageKey }) {
@@ -1242,6 +1408,7 @@ function buildOrderFlowIssue({
   source = 'shopify',
 }) {
   const stage = getOrderFlowTrackerStage(tracker, shopifyOrder);
+  const trackerLineItems = Array.isArray(tracker?.lineItems) ? tracker.lineItems : [];
   const orderId = String(shopifyOrder?.id || tracker?.orderId || '').trim();
   const orderNumber = String(shopifyOrder?.orderNumber || tracker?.orderNumber || '').trim();
   const barcode = normalizeScanBarcode(shopifyOrder?.barcode || tracker?.barcode || orderNumber);
@@ -1280,12 +1447,13 @@ function buildOrderFlowIssue({
     thresholdWorkingDays,
     currentStage: stage,
     trackerExists: Boolean(tracker),
-    shopifyOpen: Boolean(shopifyOrder),
+    shopifyOpen: source !== 'local_tracker' && Boolean(shopifyOrder),
     tags,
     financialStatus: String(shopifyOrder?.financialStatus || '').trim(),
     fulfillmentStatus: String(shopifyOrder?.fulfillmentStatus || tracker?.workflowStatus || '').trim(),
-    itemCount: Math.max(0, Number(shopifyOrder?.itemCount || 0)),
-    firstItemTitle: String(shopifyOrder?.firstItemTitle || '').trim(),
+    itemCount: Math.max(0, Number(shopifyOrder?.itemCount ?? getOrderFlowLineItemCount(trackerLineItems)) || 0),
+    orderValue: shopifyOrder?.orderValue || null,
+    firstItemTitle: String(shopifyOrder?.firstItemTitle || getOrderFlowFirstItemTitle(trackerLineItems)).trim(),
     lastStaff: getOrderFlowLatestStaff(tracker),
   };
 }
@@ -1338,6 +1506,22 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
     limit: maxTrackers,
   });
   const trackersByOrderId = new Map(trackers.map((tracker) => [String(tracker.orderId || '').trim(), tracker]));
+  const trackerOrderIdsMissingFromOpenOrders = trackers
+    .map((tracker) => String(tracker.orderId || '').trim())
+    .filter((orderId) => orderId && !openOrdersById.has(orderId));
+  let trackedShopifyOrders = [];
+  if (trackerOrderIdsMissingFromOpenOrders.length) {
+    try {
+      trackedShopifyOrders = await listOrderFlowOrdersByIds({
+        client,
+        orderIds: trackerOrderIdsMissingFromOpenOrders,
+      });
+    } catch (err) {
+      console.error('Order Flow tracker status refresh failed:', err);
+    }
+  }
+  const trackedShopifyOrdersById = new Map(trackedShopifyOrders.map((order) => [order.id, order]));
+  const terminalTrackerOrderIds = new Set();
   const issues = [];
   const issueKeys = new Set();
 
@@ -1351,6 +1535,13 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
 
   openOrders.forEach((order) => {
     const tracker = trackersByOrderId.get(order.id) || null;
+    if (isOrderFlowShopifyOrderTerminal(order)) {
+      if (syncOrderFlowTerminalTracker({ shop, tracker, shopifyOrder: order })) {
+        terminalTrackerOrderIds.add(String(tracker?.orderId || order.id || '').trim());
+      }
+      return;
+    }
+
     const tags = normalizeOrderTags(order.tags).map((tag) => tag.toLowerCase());
     const isNewOrder = tags.includes('new_order');
     const orderAgeWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, order.createdAt) || 0;
@@ -1408,7 +1599,16 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
   });
 
   trackers.forEach((tracker) => {
-    if (!tracker?.orderId || openOrdersById.has(tracker.orderId) || isOrderFlowTrackerTerminal(tracker)) {
+    const orderId = String(tracker?.orderId || '').trim();
+    if (!orderId || openOrdersById.has(orderId) || isOrderFlowTrackerTerminal(tracker)) {
+      return;
+    }
+
+    const refreshedShopifyOrder = trackedShopifyOrdersById.get(orderId) || null;
+    if (isOrderFlowShopifyOrderTerminal(refreshedShopifyOrder)) {
+      if (syncOrderFlowTerminalTracker({ shop, tracker, shopifyOrder: refreshedShopifyOrder })) {
+        terminalTrackerOrderIds.add(orderId);
+      }
       return;
     }
 
@@ -1421,6 +1621,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       type: 'stale_stage',
       severity: idleWorkingDays >= thresholdWorkingDays * 2 ? 'critical' : 'warning',
       reason: `Local tracker has not moved in ${tracker.currentStageLabel || stageKey} for ${idleWorkingDays.toFixed(2)} working days.`,
+      shopifyOrder: refreshedShopifyOrder,
       tracker,
       nowMs,
       thresholdWorkingDays,
@@ -1431,17 +1632,30 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
   issues.sort(sortOrderFlowIssues);
 
   const stageCounts = trackers.reduce((acc, tracker) => {
-    if (!tracker?.currentStageKey || isOrderFlowTrackerTerminal(tracker)) return acc;
+    const orderId = String(tracker?.orderId || '').trim();
+    if (!tracker?.currentStageKey || terminalTrackerOrderIds.has(orderId) || isOrderFlowTrackerTerminal(tracker)) return acc;
     const key = String(tracker.currentStageKey);
     acc[key] = (acc[key] || 0) + 1;
     return acc;
   }, {});
+  const activeTrackerCount = trackers.filter((tracker) => {
+    const orderId = String(tracker?.orderId || '').trim();
+    return orderId && !terminalTrackerOrderIds.has(orderId) && !isOrderFlowTrackerTerminal(tracker);
+  }).length;
   const snoozesByIssueKey = new Map(
     sessionsStore.listOrderFlowSnoozes({ shop, includeDeleted: true })
       .map((snooze) => [snooze.issueKey, snooze])
   );
   const activeIssues = [];
-  const snoozedIssues = [];
+  const exceptionStacks = Object.keys(ORDER_FLOW_EXCEPTION_STACK_LABELS).reduce((acc, stackKey) => {
+    acc[stackKey] = {
+      key: stackKey,
+      label: ORDER_FLOW_EXCEPTION_STACK_LABELS[stackKey],
+      count: 0,
+      issues: [],
+    };
+    return acc;
+  }, {});
 
   issues.forEach((issue) => {
     const snooze = snoozesByIssueKey.get(issue.issueKey);
@@ -1454,13 +1668,28 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       return;
     }
 
-    snoozedIssues.push({
+    const stackKey = normalizeOrderFlowExceptionStack(snooze.stack);
+    const stackLabel = ORDER_FLOW_EXCEPTION_STACK_LABELS[stackKey] || ORDER_FLOW_EXCEPTION_STACK_LABELS.snoozed;
+    const stackedIssue = {
       ...issue,
-      snoozed: {
+      exceptionStack: {
+        key: stackKey,
+        label: stackLabel,
         by: snooze.snoozedBy || '',
         at: snooze.snoozedAt || null,
       },
-    });
+    };
+    if (stackKey === 'snoozed') {
+      stackedIssue.snoozed = {
+        by: snooze.snoozedBy || '',
+        at: snooze.snoozedAt || null,
+      };
+    }
+    exceptionStacks[stackKey].issues.push(stackedIssue);
+  });
+
+  Object.values(exceptionStacks).forEach((stack) => {
+    stack.count = stack.issues.length;
   });
 
   return {
@@ -1480,7 +1709,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       openOrderPagesFetched: openOrderResult.pagesFetched,
       openOrderHasMore: openOrderResult.hasMore,
       maxOpenOrders: openOrderResult.maxOrders,
-      activeTrackersScanned: trackers.length,
+      activeTrackersScanned: activeTrackerCount,
       maxTrackers,
     },
     summary: {
@@ -1490,15 +1719,18 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       untrackedCount: activeIssues.filter((issue) => issue.type === 'untracked').length,
       unstartedCount: activeIssues.filter((issue) => issue.type === 'unstarted').length,
       staleStageCount: activeIssues.filter((issue) => issue.type === 'stale_stage').length,
-      snoozedCount: snoozedIssues.length,
+      snoozedCount: exceptionStacks.snoozed.count,
+      wholesaleCount: exceptionStacks.wholesale.count,
+      protoCount: exceptionStacks.proto.count,
       openOrdersScanned: openOrders.length,
-      activeTrackersScanned: trackers.length,
+      activeTrackersScanned: activeTrackerCount,
       stageCounts,
     },
     issues: activeIssues,
+    exceptionStacks,
     snoozed: {
-      count: snoozedIssues.length,
-      issues: snoozedIssues,
+      count: exceptionStacks.snoozed.count,
+      issues: exceptionStacks.snoozed.issues,
     },
   };
 }
@@ -6053,6 +6285,7 @@ router.get('/api/dashboard/daily-output', async (req, res) => {
 
     const summary = sessionsStore.getDailyOperationsSummary({
       shop: auth.shop,
+      date: req.query?.date || null,
     });
 
     return res.json({
@@ -6090,6 +6323,7 @@ router.post('/api/order-flow/snooze', async (req, res) => {
       stageKey: req.body?.stageKey || null,
       reason: req.body?.reason || null,
       snoozedBy: auth.userId,
+      stack: 'snoozed',
     });
 
     return res.json({
@@ -6101,6 +6335,46 @@ router.post('/api/order-flow/snooze', async (req, res) => {
     return res.status(500).json({
       success: false,
       error: err.message || 'Failed to snooze warning',
+    });
+  }
+});
+
+router.post('/api/order-flow/stack', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const issueKey = String(req.body?.issueKey || '').trim();
+    const stack = normalizeOrderFlowExceptionStack(req.body?.stack);
+    if (!issueKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing issueKey',
+      });
+    }
+
+    const snooze = sessionsStore.snoozeOrderFlowIssue({
+      shop: auth.shop,
+      issueKey,
+      orderId: req.body?.orderId || null,
+      orderNumber: req.body?.orderNumber || null,
+      issueType: req.body?.type || null,
+      stageKey: req.body?.stageKey || null,
+      reason: req.body?.reason || null,
+      snoozedBy: auth.userId,
+      stack,
+    });
+
+    return res.json({
+      success: true,
+      stack,
+      exception: snooze,
+    });
+  } catch (err) {
+    console.error('Error in /api/order-flow/stack:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Failed to move warning',
     });
   }
 });
