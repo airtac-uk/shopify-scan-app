@@ -30,6 +30,7 @@ const protectedEmployeePages = new Set([
   '/order_flow.html',
   '/putting_away.html',
   '/awaiting_parts.html',
+  '/hyp_ar_production.html',
   '/print_queue.html',
   '/fdm_print_queue.html',
   '/print_config.html',

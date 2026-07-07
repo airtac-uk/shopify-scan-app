@@ -529,6 +529,72 @@ db.prepare(`
   ON shipping_labels (shop, barcode, createdAt DESC)
 `).run();
 
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS hyp_receivers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop TEXT NOT NULL,
+    orderId TEXT NOT NULL,
+    orderNumber TEXT NOT NULL,
+    orderCreatedAt TEXT,
+    sourceKey TEXT NOT NULL,
+    lineItemId TEXT,
+    unitIndex INTEGER NOT NULL,
+    receiverCode TEXT NOT NULL UNIQUE,
+    sku TEXT NOT NULL,
+    title TEXT,
+    variantTitle TEXT,
+    currentStageKey TEXT NOT NULL,
+    currentStageLabel TEXT NOT NULL,
+    workflowStatus TEXT,
+    createdAt TEXT NOT NULL,
+    updatedAt TEXT NOT NULL,
+    stageStartedAt TEXT NOT NULL,
+    archivedAt TEXT,
+    archiveReason TEXT,
+    UNIQUE (shop, orderId, sourceKey)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_hyp_receivers_shop_active_stage
+  ON hyp_receivers (shop, archivedAt, currentStageKey, updatedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_hyp_receivers_shop_order
+  ON hyp_receivers (shop, orderId, id ASC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_hyp_receivers_shop_code
+  ON hyp_receivers (shop, receiverCode)
+`).run();
+
+db.prepare(`
+  CREATE TABLE IF NOT EXISTS hyp_receiver_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    shop TEXT NOT NULL,
+    receiverId INTEGER NOT NULL,
+    receiverCode TEXT NOT NULL,
+    orderId TEXT NOT NULL,
+    orderNumber TEXT NOT NULL,
+    stageKey TEXT NOT NULL,
+    stageLabel TEXT NOT NULL,
+    staff TEXT,
+    createdAt TEXT NOT NULL
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_hyp_receiver_events_shop_order_created
+  ON hyp_receiver_events (shop, orderId, createdAt ASC, id ASC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_hyp_receiver_events_shop_receiver_created
+  ON hyp_receiver_events (shop, receiverId, createdAt ASC, id ASC)
+`).run();
+
 function normalizeBarcode(barcode) {
   return String(barcode || '').trim().toUpperCase();
 }
@@ -849,6 +915,68 @@ function normalizeQcFailReasonRecord(row) {
   };
 }
 
+function normalizeHypReceiverRecord(row) {
+  if (!row) return null;
+
+  return {
+    id: Number(row.id),
+    shop: String(row.shop || '').trim(),
+    orderId: String(row.orderId || '').trim(),
+    orderNumber: String(row.orderNumber || '').trim(),
+    orderCreatedAt: row.orderCreatedAt || null,
+    sourceKey: String(row.sourceKey || '').trim(),
+    lineItemId: String(row.lineItemId || '').trim(),
+    unitIndex: Math.max(1, Number(row.unitIndex) || 1),
+    receiverCode: String(row.receiverCode || '').trim(),
+    sku: normalizeBarcode(row.sku),
+    title: String(row.title || '').trim(),
+    variantTitle: String(row.variantTitle || '').trim(),
+    currentStageKey: String(row.currentStageKey || 'op1').trim(),
+    currentStageLabel: String(row.currentStageLabel || 'OP1').trim(),
+    workflowStatus: String(row.workflowStatus || '').trim(),
+    createdAt: row.createdAt || null,
+    updatedAt: row.updatedAt || null,
+    stageStartedAt: row.stageStartedAt || null,
+    archivedAt: row.archivedAt || null,
+    archiveReason: String(row.archiveReason || '').trim(),
+  };
+}
+
+function normalizeHypReceiverEventRecord(row) {
+  if (!row) return null;
+
+  return {
+    id: Number(row.id),
+    shop: String(row.shop || '').trim(),
+    receiverId: Number(row.receiverId),
+    receiverCode: String(row.receiverCode || '').trim(),
+    orderId: String(row.orderId || '').trim(),
+    orderNumber: String(row.orderNumber || '').trim(),
+    stageKey: String(row.stageKey || '').trim(),
+    stageLabel: String(row.stageLabel || '').trim(),
+    staff: String(row.staff || '').trim(),
+    createdAt: row.createdAt || null,
+  };
+}
+
+function getMaxHypReceiverCodeNumber() {
+  const row = db.prepare(`
+    SELECT receiverCode
+    FROM hyp_receivers
+    WHERE receiverCode GLOB 'HYP-[0-9]*'
+    ORDER BY CAST(SUBSTR(receiverCode, 5) AS INTEGER) DESC
+    LIMIT 1
+  `).get();
+
+  const match = String(row?.receiverCode || '').match(/^HYP-(\d+)$/);
+  return Math.max(0, Number(match?.[1]) || 0);
+}
+
+function buildHypReceiverCode(number) {
+  const safeNumber = Math.max(1, Math.floor(Number(number) || 1));
+  return `HYP-${String(safeNumber).padStart(4, '0')}`;
+}
+
 module.exports = {
   /**
    * Save session for a shop
@@ -900,6 +1028,370 @@ module.exports = {
       expires: row.expires ? new Date(row.expires) : null,
       associated_user: row.associatedUser ? JSON.parse(row.associatedUser) : null,
     }));
+  },
+
+  upsertHypReceiversForOrder({
+    shop,
+    orderId,
+    orderNumber,
+    orderCreatedAt = null,
+    workflowStatus = null,
+    receivers = [],
+    initialStageKey = 'op1',
+    initialStageLabel = 'OP1',
+    reactivateArchived = true,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedOrderId = String(orderId || '').trim();
+    const normalizedOrderNumber = String(orderNumber || '').trim();
+    if (!normalizedShop || !normalizedOrderId || !normalizedOrderNumber) return [];
+
+    const nowIso = new Date().toISOString();
+    const safeWorkflowStatus = workflowStatus ? String(workflowStatus).trim() : null;
+    const normalizedReceivers = (Array.isArray(receivers) ? receivers : [])
+      .map((receiver) => ({
+        sourceKey: String(receiver?.sourceKey || '').trim(),
+        lineItemId: String(receiver?.lineItemId || '').trim() || null,
+        unitIndex: Math.max(1, Math.floor(Number(receiver?.unitIndex) || 1)),
+        sku: normalizeBarcode(receiver?.sku),
+        title: String(receiver?.title || '').trim(),
+        variantTitle: String(receiver?.variantTitle || '').trim(),
+      }))
+      .filter((receiver) => receiver.sourceKey && receiver.sku);
+
+    if (!normalizedReceivers.length) return [];
+
+    const existingRows = db.prepare(`
+      SELECT *
+      FROM hyp_receivers
+      WHERE shop = ?
+        AND orderId = ?
+    `).all(normalizedShop, normalizedOrderId);
+    const existingBySourceKey = new Map(
+      existingRows.map((row) => [String(row.sourceKey || '').trim(), row])
+    );
+
+    const insertStmt = db.prepare(`
+      INSERT INTO hyp_receivers (
+        shop, orderId, orderNumber, orderCreatedAt, sourceKey, lineItemId, unitIndex,
+        receiverCode, sku, title, variantTitle, currentStageKey, currentStageLabel,
+        workflowStatus, createdAt, updatedAt, stageStartedAt, archivedAt, archiveReason
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+    `);
+    const updateStmt = db.prepare(`
+      UPDATE hyp_receivers
+      SET orderNumber = ?,
+          orderCreatedAt = COALESCE(orderCreatedAt, ?),
+          lineItemId = ?,
+          unitIndex = ?,
+          sku = ?,
+          title = ?,
+          variantTitle = ?,
+          workflowStatus = ?,
+          updatedAt = ?,
+          archivedAt = CASE WHEN ? THEN NULL ELSE archivedAt END,
+          archiveReason = CASE WHEN ? THEN NULL ELSE archiveReason END
+      WHERE shop = ?
+        AND orderId = ?
+        AND sourceKey = ?
+    `);
+    const insertEventStmt = db.prepare(`
+      INSERT INTO hyp_receiver_events (
+        shop, receiverId, receiverCode, orderId, orderNumber, stageKey, stageLabel, staff, createdAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+    `);
+
+    const tx = db.transaction(() => {
+      let nextCodeNumber = getMaxHypReceiverCodeNumber() + 1;
+
+      normalizedReceivers.forEach((receiver) => {
+        const existing = existingBySourceKey.get(receiver.sourceKey);
+        if (existing) {
+          updateStmt.run(
+            normalizedOrderNumber,
+            orderCreatedAt || null,
+            receiver.lineItemId,
+            receiver.unitIndex,
+            receiver.sku,
+            receiver.title || null,
+            receiver.variantTitle || null,
+            safeWorkflowStatus,
+            nowIso,
+            reactivateArchived ? 1 : 0,
+            reactivateArchived ? 1 : 0,
+            normalizedShop,
+            normalizedOrderId,
+            receiver.sourceKey
+          );
+          return;
+        }
+
+        let inserted = false;
+        let insertedId = null;
+        let receiverCode = '';
+        while (!inserted) {
+          receiverCode = buildHypReceiverCode(nextCodeNumber);
+          nextCodeNumber += 1;
+
+          try {
+            const result = insertStmt.run(
+              normalizedShop,
+              normalizedOrderId,
+              normalizedOrderNumber,
+              orderCreatedAt || null,
+              receiver.sourceKey,
+              receiver.lineItemId,
+              receiver.unitIndex,
+              receiverCode,
+              receiver.sku,
+              receiver.title || null,
+              receiver.variantTitle || null,
+              initialStageKey,
+              initialStageLabel,
+              safeWorkflowStatus,
+              nowIso,
+              nowIso,
+              nowIso
+            );
+            insertedId = Number(result.lastInsertRowid);
+            inserted = true;
+          } catch (err) {
+            if (!String(err?.message || '').includes('UNIQUE constraint failed: hyp_receivers.receiverCode')) {
+              throw err;
+            }
+          }
+        }
+
+        insertEventStmt.run(
+          normalizedShop,
+          insertedId,
+          receiverCode,
+          normalizedOrderId,
+          normalizedOrderNumber,
+          initialStageKey,
+          initialStageLabel,
+          nowIso
+        );
+      });
+    });
+
+    tx();
+
+    return this.getHypReceiversForOrder({
+      shop: normalizedShop,
+      orderId: normalizedOrderId,
+      includeArchived: true,
+    });
+  },
+
+  archiveMissingHypReceiversForOrder({
+    shop,
+    orderId,
+    activeSourceKeys = [],
+    reason = 'removed',
+    archivedAt = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!normalizedShop || !normalizedOrderId) return 0;
+
+    const sourceKeys = Array.from(new Set((Array.isArray(activeSourceKeys) ? activeSourceKeys : [])
+      .map((sourceKey) => String(sourceKey || '').trim())
+      .filter(Boolean)));
+    const nowIso = archivedAt || new Date().toISOString();
+    const safeReason = String(reason || 'removed').trim() || 'removed';
+
+    if (sourceKeys.length === 0) {
+      const result = db.prepare(`
+        UPDATE hyp_receivers
+        SET archivedAt = ?,
+            archiveReason = ?,
+            updatedAt = ?
+        WHERE shop = ?
+          AND orderId = ?
+          AND archivedAt IS NULL
+      `).run(nowIso, safeReason, nowIso, normalizedShop, normalizedOrderId);
+      return Number(result?.changes || 0);
+    }
+
+    const placeholders = sourceKeys.map(() => '?').join(', ');
+    const result = db.prepare(`
+      UPDATE hyp_receivers
+      SET archivedAt = ?,
+          archiveReason = ?,
+          updatedAt = ?
+      WHERE shop = ?
+        AND orderId = ?
+        AND archivedAt IS NULL
+        AND sourceKey NOT IN (${placeholders})
+    `).run(nowIso, safeReason, nowIso, normalizedShop, normalizedOrderId, ...sourceKeys);
+
+    return Number(result?.changes || 0);
+  },
+
+  archiveHypReceiversForOrder({
+    shop,
+    orderId,
+    reason = 'fulfilled',
+    workflowStatus = null,
+    archivedAt = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!normalizedShop || !normalizedOrderId) return 0;
+
+    const nowIso = archivedAt || new Date().toISOString();
+    const safeReason = String(reason || 'fulfilled').trim() || 'fulfilled';
+    const safeWorkflowStatus = workflowStatus ? String(workflowStatus).trim() : null;
+
+    const result = db.prepare(`
+      UPDATE hyp_receivers
+      SET archivedAt = COALESCE(archivedAt, ?),
+          archiveReason = COALESCE(NULLIF(archiveReason, ''), ?),
+          workflowStatus = COALESCE(?, workflowStatus),
+          updatedAt = ?
+      WHERE shop = ?
+        AND orderId = ?
+        AND archivedAt IS NULL
+    `).run(nowIso, safeReason, safeWorkflowStatus, nowIso, normalizedShop, normalizedOrderId);
+
+    return Number(result?.changes || 0);
+  },
+
+  listHypReceivers({ shop, includeArchived = false, limit = 2000 } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const safeLimit = Math.max(1, Math.min(5000, Math.floor(Number(limit) || 2000)));
+    if (!normalizedShop) return [];
+
+    const archivedClause = includeArchived ? '' : 'AND archivedAt IS NULL';
+    const rows = db.prepare(`
+      SELECT *
+      FROM hyp_receivers
+      WHERE shop = ?
+        ${archivedClause}
+      ORDER BY
+        CASE WHEN archivedAt IS NULL THEN 0 ELSE 1 END ASC,
+        orderCreatedAt ASC,
+        orderNumber ASC,
+        id ASC
+      LIMIT ?
+    `).all(normalizedShop, safeLimit);
+
+    return rows.map(normalizeHypReceiverRecord).filter(Boolean);
+  },
+
+  getHypReceiverById({ shop, id } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0) return null;
+
+    const row = db.prepare(`
+      SELECT *
+      FROM hyp_receivers
+      WHERE shop = ?
+        AND id = ?
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+
+    return normalizeHypReceiverRecord(row);
+  },
+
+  getHypReceiversForOrder({ shop, orderId, includeArchived = false } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!normalizedShop || !normalizedOrderId) return [];
+
+    const archivedClause = includeArchived ? '' : 'AND archivedAt IS NULL';
+    const rows = db.prepare(`
+      SELECT *
+      FROM hyp_receivers
+      WHERE shop = ?
+        AND orderId = ?
+        ${archivedClause}
+      ORDER BY id ASC
+    `).all(normalizedShop, normalizedOrderId);
+
+    return rows.map(normalizeHypReceiverRecord).filter(Boolean);
+  },
+
+  getHypReceiverEventsForOrder({ shop, orderId } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedOrderId = String(orderId || '').trim();
+    if (!normalizedShop || !normalizedOrderId) return [];
+
+    return db.prepare(`
+      SELECT *
+      FROM hyp_receiver_events
+      WHERE shop = ?
+        AND orderId = ?
+      ORDER BY createdAt ASC, id ASC
+    `).all(normalizedShop, normalizedOrderId)
+      .map(normalizeHypReceiverEventRecord)
+      .filter(Boolean);
+  },
+
+  updateHypReceiverStage({
+    shop,
+    id,
+    stageKey,
+    stageLabel,
+    staff = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    const normalizedStageKey = String(stageKey || '').trim();
+    const normalizedStageLabel = String(stageLabel || '').trim();
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0 || !normalizedStageKey || !normalizedStageLabel) {
+      return null;
+    }
+
+    const existing = this.getHypReceiverById({ shop: normalizedShop, id: normalizedId });
+    if (!existing || existing.archivedAt) return null;
+
+    if (existing.currentStageKey === normalizedStageKey) {
+      return existing;
+    }
+
+    const nowIso = new Date().toISOString();
+    const safeStaff = staff ? String(staff).trim() : null;
+    const tx = db.transaction(() => {
+      db.prepare(`
+        UPDATE hyp_receivers
+        SET currentStageKey = ?,
+            currentStageLabel = ?,
+            updatedAt = ?,
+            stageStartedAt = ?
+        WHERE shop = ?
+          AND id = ?
+          AND archivedAt IS NULL
+      `).run(
+        normalizedStageKey,
+        normalizedStageLabel,
+        nowIso,
+        nowIso,
+        normalizedShop,
+        normalizedId
+      );
+
+      db.prepare(`
+        INSERT INTO hyp_receiver_events (
+          shop, receiverId, receiverCode, orderId, orderNumber, stageKey, stageLabel, staff, createdAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `).run(
+        normalizedShop,
+        normalizedId,
+        existing.receiverCode,
+        existing.orderId,
+        existing.orderNumber,
+        normalizedStageKey,
+        normalizedStageLabel,
+        safeStaff,
+        nowIso
+      );
+    });
+
+    tx();
+    return this.getHypReceiverById({ shop: normalizedShop, id: normalizedId });
   },
 
   recordWaitingQcEvent({ barcode, staff, createdAt }) {

@@ -75,6 +75,16 @@ const {
 const {
   buildPackingOrderLabelPdf,
 } = require('./packingLabelService');
+const {
+  HYP_AR_STAGES,
+  normalizeHypArStageKey,
+  getHypArStage,
+  buildHypArReceiverUnits,
+  getShopifyWorkflowStatus,
+  getHypArArchiveReasonForOrder,
+  buildHypArStageCounts,
+  buildHypArOp1SkuSummary,
+} = require('./hypArProductionService');
 
 router.use(cookieParser());
 
@@ -3168,6 +3178,385 @@ async function persistOrderTrackerSnapshot({
   };
 }
 
+function getSafeHypArOrderQuery(value, fallback = 'status:open') {
+  const rawValue = String(value || '').trim();
+  return (rawValue || fallback).replace(/"/g, '\\"');
+}
+
+function getSafeHypArOrderSortKey(value) {
+  const normalized = String(value || '').trim().toUpperCase();
+  return normalized === 'UPDATED_AT' ? 'UPDATED_AT' : 'CREATED_AT';
+}
+
+const HYP_AR_HISTORICAL_ORDER_SEARCH_QUERIES = [
+  'HYP-AR status:any',
+  'HYPAR status:any',
+  'HYP AR status:any',
+  'sku:HYP-AR* status:any',
+  'sku:HYPAR* status:any',
+  'sku:HYP* status:any',
+];
+
+async function listHypArOpenOrders({
+  client,
+  maxOrders = 1000,
+  pageSize = 100,
+  shopifyQuery = 'status:open',
+  sortKey = 'CREATED_AT',
+  reverse = false,
+} = {}) {
+  const safeMaxOrders = Math.max(1, Math.min(2000, Math.floor(Number(maxOrders) || 1000)));
+  const safePageSize = Math.max(1, Math.min(250, Math.floor(Number(pageSize) || 100)));
+  const safeShopifyQuery = getSafeHypArOrderQuery(shopifyQuery, 'status:open');
+  const safeSortKey = getSafeHypArOrderSortKey(sortKey);
+  const safeReverse = reverse ? 'true' : 'false';
+  const query = `
+    query getHypArOpenOrders($first: Int!, $after: String) {
+      orders(first: $first, after: $after, query: "${safeShopifyQuery}", sortKey: ${safeSortKey}, reverse: ${safeReverse}) {
+        edges {
+          cursor
+          node {
+            id
+            name
+            createdAt
+            note
+            tags
+            ${ORDER_WORKFLOW_STATUS_FIELDS}
+            ${ORDER_TRACKER_METAFIELD_FIELD}
+            lineItems(first: 200) {
+              edges {
+                node {
+                  id
+                  title
+                  sku
+                  quantity
+                  currentQuantity
+                  discountedTotalSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  originalTotalSet {
+                    shopMoney {
+                      amount
+                      currencyCode
+                    }
+                  }
+                  variantTitle
+                  variant {
+                    barcode
+                  }
+                }
+              }
+            }
+          }
+        }
+        pageInfo {
+          hasNextPage
+          endCursor
+        }
+      }
+    }
+  `;
+
+  const orders = [];
+  const seenOrderIds = new Set();
+  let after = null;
+  let hasNextPage = true;
+  let pagesFetched = 0;
+
+  while (hasNextPage && orders.length < safeMaxOrders) {
+    const first = Math.min(safePageSize, safeMaxOrders - orders.length);
+    const response = await client.graphql(query, {
+      variables: { first, after },
+    });
+    pagesFetched += 1;
+
+    const connection = response.data?.orders || {};
+    const edges = Array.isArray(connection.edges) ? connection.edges : [];
+    edges.forEach((edge) => {
+      const order = edge?.node || null;
+      if (!order?.id || seenOrderIds.has(order.id)) return;
+      seenOrderIds.add(order.id);
+      orders.push(order);
+    });
+
+    hasNextPage = Boolean(connection.pageInfo?.hasNextPage);
+    after = hasNextPage ? connection.pageInfo?.endCursor || null : null;
+    if (hasNextPage && !after) break;
+  }
+
+  return {
+    orders,
+    pagesFetched,
+    hasMore: hasNextPage && orders.length >= safeMaxOrders,
+    maxOrders: safeMaxOrders,
+  };
+}
+
+async function listHypArHistoricalSearchOrders({ client, maxOrdersPerQuery = 1000 } = {}) {
+  const safeMaxOrdersPerQuery = Math.max(50, Math.min(2000, Math.floor(Number(maxOrdersPerQuery) || 1000)));
+  const ordersById = new Map();
+  const searches = [];
+
+  for (const shopifyQuery of HYP_AR_HISTORICAL_ORDER_SEARCH_QUERIES) {
+    try {
+      const result = await listHypArOpenOrders({
+        client,
+        maxOrders: safeMaxOrdersPerQuery,
+        shopifyQuery,
+        sortKey: 'UPDATED_AT',
+        reverse: true,
+      });
+      let matchedHypOrderCount = 0;
+
+      result.orders.forEach((order) => {
+        const lineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
+        const receiverUnits = buildHypArReceiverUnits(lineItems);
+        if (!receiverUnits.length || !order?.id) return;
+
+        matchedHypOrderCount += 1;
+        ordersById.set(order.id, order);
+      });
+
+      searches.push({
+        query: shopifyQuery,
+        scannedOrderCount: result.orders.length,
+        matchedHypOrderCount,
+        pagesFetched: result.pagesFetched,
+        hasMore: result.hasMore,
+        error: null,
+      });
+    } catch (err) {
+      console.error(`HYP-AR historical search failed for query "${shopifyQuery}":`, err);
+      searches.push({
+        query: shopifyQuery,
+        scannedOrderCount: 0,
+        matchedHypOrderCount: 0,
+        pagesFetched: 0,
+        hasMore: false,
+        error: err.message || 'Historical search failed',
+      });
+    }
+  }
+
+  return {
+    orders: Array.from(ordersById.values()),
+    searches,
+  };
+}
+
+async function syncHypArOrderFromShopify({ req, client, shop, order }) {
+  if (!client || !shop || !order?.id) {
+    return {
+      orderId: '',
+      receiverCount: 0,
+      createdOrUpdated: false,
+      archivedCount: 0,
+    };
+  }
+
+  const workflowStatus = getShopifyWorkflowStatus(order);
+  const archiveReason = getHypArArchiveReasonForOrder(order);
+  const lineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
+  const receiverUnits = buildHypArReceiverUnits(lineItems);
+  const activeSourceKeys = receiverUnits.map((receiver) => receiver.sourceKey);
+  let archivedCount = 0;
+  if (!archiveReason || receiverUnits.length > 0) {
+    archivedCount = sessionsStore.archiveMissingHypReceiversForOrder({
+      shop,
+      orderId: order.id,
+      activeSourceKeys,
+      reason: 'removed',
+    });
+  }
+
+  if (!receiverUnits.length) {
+    let terminalArchivedCount = 0;
+    if (archiveReason) {
+      terminalArchivedCount = sessionsStore.archiveHypReceiversForOrder({
+        shop,
+        orderId: order.id,
+        reason: archiveReason,
+        workflowStatus,
+      });
+    }
+
+    return {
+      orderId: order.id,
+      receiverCount: 0,
+      createdOrUpdated: false,
+      archivedCount: archivedCount + terminalArchivedCount,
+    };
+  }
+
+  await persistOrderTrackerSnapshot({
+    req,
+    client,
+    shop,
+    order,
+    barcode: normalizeScanBarcode(order.name || order.id),
+    lineItems,
+    explicitTag: '',
+    appendEventIfStageChanged: false,
+  });
+
+  const receivers = sessionsStore.upsertHypReceiversForOrder({
+    shop,
+    orderId: order.id,
+    orderNumber: order.name || order.id,
+    orderCreatedAt: order.createdAt || null,
+    workflowStatus,
+    receivers: receiverUnits,
+    initialStageKey: 'op1',
+    initialStageLabel: 'OP1',
+    reactivateArchived: !archiveReason,
+  });
+
+  let terminalArchivedCount = 0;
+  if (archiveReason) {
+    terminalArchivedCount = sessionsStore.archiveHypReceiversForOrder({
+      shop,
+      orderId: order.id,
+      reason: archiveReason,
+      workflowStatus,
+    });
+  }
+
+  return {
+    orderId: order.id,
+    receiverCount: receiverUnits.length,
+    createdOrUpdated: receivers.length > 0,
+    archivedCount: archivedCount + terminalArchivedCount,
+  };
+}
+
+async function syncHypArProductionFromShopify({
+  req,
+  client,
+  shop,
+  maxOpenOrders = 1000,
+  maxHistoricalOrders = 2000,
+  maxHistoricalSearchOrders = 1000,
+} = {}) {
+  const stats = {
+    scannedOpenOrders: 0,
+    openOrderPagesFetched: 0,
+    openOrderHasMore: false,
+    maxOpenOrders,
+    scannedHistoricalOrders: 0,
+    historicalOrderPagesFetched: 0,
+    historicalOrderHasMore: false,
+    maxHistoricalOrders,
+    targetedHistoricalSearches: [],
+    targetedHistoricalOrderCount: 0,
+    targetedHistoricalHypOrderCount: 0,
+    targetedHistoricalReceiverCount: 0,
+    maxHistoricalSearchOrders,
+    hypOrderCount: 0,
+    receiverCount: 0,
+    historicalHypOrderCount: 0,
+    historicalReceiverCount: 0,
+    archivedCount: 0,
+    refreshedTrackedOrderCount: 0,
+  };
+
+  const openResult = await listHypArOpenOrders({
+    client,
+    maxOrders: maxOpenOrders,
+  });
+  stats.scannedOpenOrders = openResult.orders.length;
+  stats.openOrderPagesFetched = openResult.pagesFetched;
+  stats.openOrderHasMore = openResult.hasMore;
+  stats.maxOpenOrders = openResult.maxOrders;
+
+  const seenOpenOrderIds = new Set();
+  for (const order of openResult.orders) {
+    if (!order?.id) continue;
+    seenOpenOrderIds.add(order.id);
+    const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+    stats.archivedCount += Number(result.archivedCount || 0);
+    if (result.receiverCount > 0) {
+      stats.hypOrderCount += 1;
+      stats.receiverCount += result.receiverCount;
+    }
+  }
+
+  const historicalResult = await listHypArOpenOrders({
+    client,
+    maxOrders: maxHistoricalOrders,
+    shopifyQuery: 'status:any',
+    sortKey: 'UPDATED_AT',
+    reverse: true,
+  });
+  stats.scannedHistoricalOrders = historicalResult.orders.length;
+  stats.historicalOrderPagesFetched = historicalResult.pagesFetched;
+  stats.historicalOrderHasMore = historicalResult.hasMore;
+  stats.maxHistoricalOrders = historicalResult.maxOrders;
+
+  for (const order of historicalResult.orders) {
+    if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
+    if (!getHypArArchiveReasonForOrder(order)) continue;
+
+    const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+    seenOpenOrderIds.add(order.id);
+    stats.archivedCount += Number(result.archivedCount || 0);
+    if (result.receiverCount > 0) {
+      stats.historicalHypOrderCount += 1;
+      stats.historicalReceiverCount += result.receiverCount;
+    }
+  }
+
+  const targetedHistoricalResult = await listHypArHistoricalSearchOrders({
+    client,
+    maxOrdersPerQuery: maxHistoricalSearchOrders,
+  });
+  stats.targetedHistoricalSearches = targetedHistoricalResult.searches;
+  stats.targetedHistoricalOrderCount = targetedHistoricalResult.orders.length;
+
+  for (const order of targetedHistoricalResult.orders) {
+    if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
+    if (!getHypArArchiveReasonForOrder(order)) continue;
+
+    const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+    seenOpenOrderIds.add(order.id);
+    stats.archivedCount += Number(result.archivedCount || 0);
+    if (result.receiverCount > 0) {
+      stats.targetedHistoricalHypOrderCount += 1;
+      stats.targetedHistoricalReceiverCount += result.receiverCount;
+    }
+  }
+
+  const activeReceivers = sessionsStore.listHypReceivers({
+    shop,
+    includeArchived: false,
+    limit: 5000,
+  });
+  const activeOrderIds = Array.from(new Set(
+    activeReceivers
+      .map((receiver) => String(receiver.orderId || '').trim())
+      .filter(Boolean)
+  ));
+
+  for (const orderId of activeOrderIds) {
+    if (seenOpenOrderIds.has(orderId)) continue;
+
+    try {
+      const order = await fetchOrderForTrackerById({ client, orderId });
+      if (!order?.id) continue;
+
+      const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+      stats.refreshedTrackedOrderCount += 1;
+      stats.archivedCount += Number(result.archivedCount || 0);
+    } catch (err) {
+      console.error(`Failed to refresh tracked HYP-AR order ${orderId}:`, err);
+    }
+  }
+
+  return stats;
+}
+
 function includesMissingBundleFieldError(err) {
   const raw = String(err?.message || '').toLowerCase();
   if (!raw.includes('lineitemgroup')) return false;
@@ -4238,6 +4627,134 @@ router.get('/api/awaiting-parts-summary', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /api/awaiting-parts-summary:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+function buildHypArProductionPayload({ shop, includeArchived = false, syncStats = null, syncError = null } = {}) {
+  const activeReceivers = sessionsStore.listHypReceivers({
+    shop,
+    includeArchived: false,
+    limit: 5000,
+  });
+  const visibleReceivers = includeArchived
+    ? sessionsStore.listHypReceivers({
+        shop,
+        includeArchived: true,
+        limit: 5000,
+      })
+    : activeReceivers;
+  const archivedCount = includeArchived
+    ? visibleReceivers.filter((receiver) => receiver.archivedAt).length
+    : sessionsStore.listHypReceivers({
+        shop,
+        includeArchived: true,
+        limit: 5000,
+      }).filter((receiver) => receiver.archivedAt).length;
+
+  return {
+    success: true,
+    includeArchived,
+    stages: HYP_AR_STAGES,
+    receivers: visibleReceivers,
+    summary: {
+      activeReceiverCount: activeReceivers.length,
+      archivedReceiverCount: archivedCount,
+      builtReceiverCount: activeReceivers.filter((receiver) => receiver.currentStageKey === 'built').length,
+      op1RequiredCount: activeReceivers.filter((receiver) => receiver.currentStageKey === 'op1').length,
+      stageCounts: buildHypArStageCounts(activeReceivers),
+      op1BySku: buildHypArOp1SkuSummary(activeReceivers),
+    },
+    syncStats,
+    syncError,
+  };
+}
+
+router.get('/api/hyp-ar-production', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const includeArchived = String(req.query.includeArchived || '').trim() === '1';
+    const shouldSync = String(req.query.sync || '1').trim() !== '0';
+    const maxOpenOrders = Math.max(50, Math.min(2000, Math.floor(Number(req.query.maxOpenOrders) || 1000)));
+    const maxHistoricalOrders = Math.max(50, Math.min(2000, Math.floor(Number(req.query.maxHistoricalOrders) || 2000)));
+    const maxHistoricalSearchOrders = Math.max(50, Math.min(2000, Math.floor(Number(req.query.maxHistoricalSearchOrders) || 1000)));
+    let syncStats = null;
+    let syncError = null;
+
+    if (shouldSync) {
+      try {
+        const client = shopifyClient(auth.session);
+        syncStats = await syncHypArProductionFromShopify({
+          req,
+          client,
+          shop: auth.shop,
+          maxOpenOrders,
+          maxHistoricalOrders,
+          maxHistoricalSearchOrders,
+        });
+      } catch (err) {
+        console.error('HYP-AR production sync failed:', err);
+        syncError = err.message || 'Failed to sync HYP-AR orders from Shopify';
+      }
+    }
+
+    return res.json(buildHypArProductionPayload({
+      shop: auth.shop,
+      includeArchived,
+      syncStats,
+      syncError,
+    }));
+  } catch (err) {
+    console.error('Error in /api/hyp-ar-production:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/hyp-ar-production/:id/stage', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const receiverId = Number(req.params.id);
+    const stageKey = normalizeHypArStageKey(req.body?.stageKey);
+    const stage = getHypArStage(stageKey);
+    if (!Number.isInteger(receiverId) || receiverId <= 0 || !stage) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing receiver or stage',
+      });
+    }
+
+    const receiver = sessionsStore.updateHypReceiverStage({
+      shop: auth.shop,
+      id: receiverId,
+      stageKey: stage.key,
+      stageLabel: stage.label,
+      staff: auth.userId,
+    });
+
+    if (!receiver) {
+      return res.status(404).json({
+        success: false,
+        error: 'Receiver not found or archived',
+      });
+    }
+
+    return res.json({
+      success: true,
+      receiver,
+      stages: HYP_AR_STAGES,
+    });
+  } catch (err) {
+    console.error('Error in /api/hyp-ar-production/:id/stage:', err);
     return res.status(500).json({
       success: false,
       error: err.message || 'Server error',
@@ -6660,9 +7177,23 @@ router.get('/api/order-tracker/:token', async (req, res) => {
 
     let trackingLinks = [];
     let awaitingPartsItems = [];
+    let hypReceivers = [];
+    let hypReceiverEvents = [];
     const currentStageKey = String(liveTrackerRecord?.currentStageKey || '').trim();
     if (currentStageKey === 'awaiting_parts') {
       awaitingPartsItems = sessionsStore.getOpenAwaitingPartsItemsForOrder({
+        shop: liveTrackerRecord.shop,
+        orderId: liveTrackerRecord.orderId,
+      });
+    }
+
+    hypReceivers = sessionsStore.getHypReceiversForOrder({
+      shop: liveTrackerRecord.shop,
+      orderId: liveTrackerRecord.orderId,
+      includeArchived: false,
+    });
+    if (hypReceivers.length > 0) {
+      hypReceiverEvents = sessionsStore.getHypReceiverEventsForOrder({
         shop: liveTrackerRecord.shop,
         orderId: liveTrackerRecord.orderId,
       });
@@ -6690,6 +7221,8 @@ router.get('/api/order-tracker/:token', async (req, res) => {
       tracker: buildPublicTrackerPayload(liveTrackerRecord, {
         trackingLinks,
         awaitingPartsItems,
+        hypReceivers,
+        hypReceiverEvents,
       }),
     });
   } catch (err) {

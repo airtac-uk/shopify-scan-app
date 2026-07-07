@@ -215,6 +215,10 @@ const ORDER_NOTE_STAGE_RULES = [
   { pattern: /^ON HOLD\b/i, stageKey: 'on_hold' },
 ];
 
+const {
+  buildHypArPublicProduction,
+} = require('./hypArProductionService');
+
 function normalizeTag(value) {
   return String(value || '').trim().toLowerCase();
 }
@@ -761,6 +765,14 @@ function buildPublicTrackerPayload(trackerRecord, options = {}) {
   const items = normalizeTrackerLineItems(trackerRecord?.lineItems);
   const storedStageDescription = String(trackerRecord?.currentStageDescription || '').trim();
   const baseStageDescription = storedStageDescription || currentStage.description;
+  const hypProduction = buildHypArPublicProduction({
+    receivers: options.hypReceivers,
+    events: options.hypReceiverEvents,
+  });
+  const useHypProduction = Boolean(hypProduction?.currentStage) && !currentStage.isTerminal;
+  const publicStage = useHypProduction
+    ? hypProduction.currentStage
+    : null;
   const trackingLinks = Array.isArray(options.trackingLinks)
     ? options.trackingLinks
         .map((trackingLink) => ({
@@ -779,31 +791,46 @@ function buildPublicTrackerPayload(trackerRecord, options = {}) {
       }))
     : [];
   const awaitingPartsItems = normalizeAwaitingPartsItems(options.awaitingPartsItems);
-  const currentStageDescription = currentStage.key === 'awaiting_parts'
+  const currentStageDescription = useHypProduction
+    ? publicStage.description
+    : currentStage.key === 'awaiting_parts'
     ? buildAwaitingPartsStageDescription(trackerRecord, awaitingPartsItems, baseStageDescription)
     : baseStageDescription;
+  const effectiveStage = useHypProduction
+    ? publicStage
+    : {
+        key: currentStage.key,
+        label: currentStage.label,
+        description: currentStageDescription,
+        tone: currentStage.tone,
+        progress: currentStage.progress,
+        isTerminal: currentStage.isTerminal,
+      };
+  const effectiveUpdatedAt = [trackerRecord?.updatedAt, hypProduction?.updatedAt]
+    .map((value) => String(value || '').trim())
+    .filter(Boolean)
+    .sort()
+    .pop() || trackerRecord?.updatedAt || null;
+  const effectiveTimeline = useHypProduction && Array.isArray(hypProduction?.timeline)
+    ? [...timeline, ...hypProduction.timeline]
+    : timeline;
 
   return {
     orderNumber: String(trackerRecord?.orderNumber || '').trim(),
     barcode: String(trackerRecord?.barcode || '').trim(),
-    updatedAt: trackerRecord?.updatedAt || null,
+    updatedAt: effectiveUpdatedAt,
     orderCreatedAt: trackerRecord?.orderCreatedAt || null,
     workflowStatus: trackerRecord?.workflowStatus || null,
-    currentStage: {
-      key: currentStage.key,
-      label: currentStage.label,
-      description: currentStageDescription,
-      tone: currentStage.tone,
-      progress: currentStage.progress,
-      isTerminal: currentStage.isTerminal,
-    },
-    milestones: buildMilestones(currentStage.key),
+    currentStage: effectiveStage,
+    milestones: useHypProduction
+      ? hypProduction.milestones
+      : buildMilestones(currentStage.key),
     items,
     awaitingPartsItems,
     trackingLinks,
-    tips: buildTips(items, currentStage.key),
-    quote: selectQuote(currentStage.key, `${trackerRecord?.orderNumber || ''}:${trackerRecord?.updatedAt || ''}`),
-    timeline,
+    tips: buildTips(items, effectiveStage.key),
+    quote: selectQuote(effectiveStage.key, `${trackerRecord?.orderNumber || ''}:${effectiveUpdatedAt || ''}`),
+    timeline: effectiveTimeline,
   };
 }
 

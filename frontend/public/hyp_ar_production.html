@@ -1,0 +1,66 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>HYP-AR Production</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body class="pick-list-page hyp-production-page">
+  <main class="pick-list-layout hyp-production-layout">
+    <header class="pick-list-topbar">
+      <div class="pick-list-link-row">
+        <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
+        <a href="/order_flow.html" class="pick-list-link">Monitor</a>
+        <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts</a>
+        <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
+        <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
+      </div>
+      <h1>HYP-AR Production</h1>
+    </header>
+
+    <section class="hyp-production-controls">
+      <div class="hyp-production-controls__head">
+        <div>
+          <p class="hyp-production-eyebrow">Receiver Control</p>
+          <p id="hypProductionUpdated" class="hyp-production-muted">Waiting for first load.</p>
+        </div>
+        <div class="hyp-production-actions">
+          <label class="hyp-production-toggle" for="hypShowArchived">
+            <input id="hypShowArchived" type="checkbox" />
+            Show archived
+          </label>
+          <span id="hypProductionSpinner" class="loader" style="display:none;"></span>
+          <button id="hypPrintActiveBtn" type="button">Print Active Labels</button>
+          <button id="hypRefreshBtn" type="button">Refresh</button>
+        </div>
+      </div>
+      <p id="hypProductionStatus" class="hyp-production-status" data-type="info">Ready.</p>
+    </section>
+
+    <section id="hypProductionOverview" class="hyp-production-summary-grid"></section>
+
+    <section class="hyp-production-panel">
+      <div class="hyp-production-panel__head">
+        <h2 class="pick-list-section-title">OP1 By Shopify SKU</h2>
+      </div>
+      <div id="hypOp1Summary" class="hyp-production-table-wrap"></div>
+    </section>
+
+    <section class="hyp-production-panel">
+      <div class="hyp-production-panel__head">
+        <h2 class="pick-list-section-title">Receiver Tracker</h2>
+      </div>
+      <div id="hypStageFilters" class="hyp-stage-filters"></div>
+      <div id="hypReceiverTable" class="hyp-production-table-wrap"></div>
+    </section>
+  </main>
+
+  <div id="hypPrintArea" class="hyp-print-area" aria-hidden="true"></div>
+
+  <script src="/js/auth-guard.js"></script>
+  <script src="/js/employee-shell.js"></script>
+  <script src="js/hyp-ar-production.js"></script>
+</body>
+</html>
