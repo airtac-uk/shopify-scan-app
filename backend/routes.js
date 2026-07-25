@@ -77,9 +77,12 @@ const {
 } = require('./packingLabelService');
 const {
   HYP_AR_STAGES,
+  HYP_AR_RECEIVER_PRODUCT_IDS,
   normalizeHypArStageKey,
+  normalizeShopifyProductId,
   getHypArStage,
   buildHypArReceiverUnits,
+  buildHypArExcludedSourceKeys,
   getShopifyWorkflowStatus,
   getHypArArchiveReasonForOrder,
   buildHypArStageCounts,
@@ -978,6 +981,9 @@ async function listNewOrderQueueOrders({ client, maxOrders = 1000, pageSize = 10
                   quantity
                   currentQuantity
                   variantTitle
+                  product {
+                    id
+                  }
                   variant {
                     barcode
                   }
@@ -1231,6 +1237,9 @@ async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100
                   quantity
                   currentQuantity
                   variantTitle
+                  product {
+                    id
+                  }
                   variant {
                     barcode
                   }
@@ -1314,6 +1323,9 @@ async function listOrderFlowOrdersByIds({ client, orderIds = [], chunkSize = 50 
                 quantity
                 currentQuantity
                 variantTitle
+                product {
+                  id
+                }
                 variant {
                   barcode
                 }
@@ -2106,6 +2118,7 @@ function buildCurrentOrderLineItems(edges = []) {
         sku: node.sku || '',
         quantity,
         variantTitle: node.variantTitle || '',
+        productId: node.product?.id || node.variant?.product?.id || '',
         upc: node.variant?.barcode || '',
         imageUrl: image.url,
         imageAltText: image.altText,
@@ -2626,8 +2639,14 @@ async function fetchOrderForTrackerById({ client, orderId }) {
                 }
               }
               variantTitle
+              product {
+                id
+              }
               variant {
                 barcode
+                product {
+                  id
+                }
               }
             }
           }
@@ -3188,7 +3207,42 @@ function getSafeHypArOrderSortKey(value) {
   return normalized === 'UPDATED_AT' ? 'UPDATED_AT' : 'CREATED_AT';
 }
 
+function getShopifyProductLegacyId(productId) {
+  const normalized = normalizeShopifyProductId(productId);
+  const match = normalized.match(/\/Product\/(\d+)$/i);
+  return match ? match[1] : '';
+}
+
+function sanitizeShopifySearchValue(value) {
+  return String(value || '')
+    .replace(/["\\]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function dedupeShopifyOrderQueries(queries = []) {
+  const seen = new Set();
+  return (Array.isArray(queries) ? queries : [])
+    .map((query) => String(query || '').trim())
+    .filter((query) => {
+      if (!query || seen.has(query)) return false;
+      seen.add(query);
+      return true;
+    });
+}
+
+function buildHypArProductIdOrderSearchQueries() {
+  return Array.from(HYP_AR_RECEIVER_PRODUCT_IDS || [])
+    .map(getShopifyProductLegacyId)
+    .filter(Boolean)
+    .flatMap((productId) => [
+      `product_id:"${productId}" status:any`,
+      `product_id:${productId} status:any`,
+    ]);
+}
+
 const HYP_AR_HISTORICAL_ORDER_SEARCH_QUERIES = [
+  ...buildHypArProductIdOrderSearchQueries(),
   'HYP-AR status:any',
   'HYPAR status:any',
   'HYP AR status:any',
@@ -3196,6 +3250,56 @@ const HYP_AR_HISTORICAL_ORDER_SEARCH_QUERIES = [
   'sku:HYPAR* status:any',
   'sku:HYP* status:any',
 ];
+
+async function fetchHypArReceiverProductSearchQueries({ client } = {}) {
+  if (!client) return [];
+
+  const queries = [];
+  const productQuery = `
+    query getHypArReceiverProduct($id: ID!) {
+      product(id: $id) {
+        id
+        title
+        variants(first: 250) {
+          edges {
+            node {
+              id
+              sku
+              title
+            }
+          }
+        }
+      }
+    }
+  `;
+
+  for (const productId of HYP_AR_RECEIVER_PRODUCT_IDS || []) {
+    try {
+      const response = await client.graphql(productQuery, {
+        variables: { id: normalizeShopifyProductId(productId) },
+      });
+      const product = response.data?.product;
+      if (!product?.id) continue;
+
+      const title = sanitizeShopifySearchValue(product.title);
+      if (title) {
+        queries.push(`"${title}" status:any`);
+      }
+
+      const variantEdges = Array.isArray(product.variants?.edges) ? product.variants.edges : [];
+      variantEdges.forEach((edge) => {
+        const sku = sanitizeShopifySearchValue(edge?.node?.sku);
+        if (sku) {
+          queries.push(`sku:"${sku}" status:any`);
+        }
+      });
+    } catch (err) {
+      console.error(`Failed to fetch HYP-AR receiver product ${productId}:`, err);
+    }
+  }
+
+  return dedupeShopifyOrderQueries(queries);
+}
 
 async function listHypArOpenOrders({
   client,
@@ -3244,8 +3348,14 @@ async function listHypArOpenOrders({
                     }
                   }
                   variantTitle
+                  product {
+                    id
+                  }
                   variant {
                     barcode
+                    product {
+                      id
+                    }
                   }
                 }
               }
@@ -3299,8 +3409,13 @@ async function listHypArHistoricalSearchOrders({ client, maxOrdersPerQuery = 100
   const safeMaxOrdersPerQuery = Math.max(50, Math.min(2000, Math.floor(Number(maxOrdersPerQuery) || 1000)));
   const ordersById = new Map();
   const searches = [];
+  const productSearchQueries = await fetchHypArReceiverProductSearchQueries({ client });
+  const searchQueries = dedupeShopifyOrderQueries([
+    ...HYP_AR_HISTORICAL_ORDER_SEARCH_QUERIES,
+    ...productSearchQueries,
+  ]);
 
-  for (const shopifyQuery of HYP_AR_HISTORICAL_ORDER_SEARCH_QUERIES) {
+  for (const shopifyQuery of searchQueries) {
     try {
       const result = await listHypArOpenOrders({
         client,
@@ -3362,6 +3477,13 @@ async function syncHypArOrderFromShopify({ req, client, shop, order }) {
   const lineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
   const receiverUnits = buildHypArReceiverUnits(lineItems);
   const activeSourceKeys = receiverUnits.map((receiver) => receiver.sourceKey);
+  const excludedSourceKeys = buildHypArExcludedSourceKeys(lineItems);
+  const excludedArchivedCount = sessionsStore.archiveHypReceiversBySourceKeys({
+    shop,
+    orderId: order.id,
+    sourceKeys: excludedSourceKeys,
+    reason: 'excluded_accessory',
+  });
   let archivedCount = 0;
   if (!archiveReason || receiverUnits.length > 0) {
     archivedCount = sessionsStore.archiveMissingHypReceiversForOrder({
@@ -3387,7 +3509,7 @@ async function syncHypArOrderFromShopify({ req, client, shop, order }) {
       orderId: order.id,
       receiverCount: 0,
       createdOrUpdated: false,
-      archivedCount: archivedCount + terminalArchivedCount,
+      archivedCount: excludedArchivedCount + archivedCount + terminalArchivedCount,
     };
   }
 
@@ -3428,7 +3550,7 @@ async function syncHypArOrderFromShopify({ req, client, shop, order }) {
     orderId: order.id,
     receiverCount: receiverUnits.length,
     createdOrUpdated: receivers.length > 0,
-    archivedCount: archivedCount + terminalArchivedCount,
+    archivedCount: excludedArchivedCount + archivedCount + terminalArchivedCount,
   };
 }
 
@@ -3517,7 +3639,6 @@ async function syncHypArProductionFromShopify({
 
   for (const order of targetedHistoricalResult.orders) {
     if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
-    if (!getHypArArchiveReasonForOrder(order)) continue;
 
     const result = await syncHypArOrderFromShopify({ req, client, shop, order });
     seenOpenOrderIds.add(order.id);
@@ -3639,18 +3760,23 @@ function getPickListOrderQuery({ includeBundleGroup, includePurchasingEntity = f
                       }
                     }
                     variantTitle
+                    product {
+                      id
+                    }
                     variant {
                       barcode
+                      product {
+                        id
+                        ${includeProductImages ? `
+                        featuredImage {
+                          url
+                          altText
+                        }` : ''}
+                      }
                       ${includeProductImages ? `
                       image {
                         url
                         altText
-                      }
-                      product {
-                        featuredImage {
-                          url
-                          altText
-                        }
                       }` : ''}
                     }
                     ${includeBundleGroup ? `
@@ -3838,6 +3964,9 @@ router.post('/api/tag-order', async (req, res) => {
                       }
                     }
                     variantTitle
+                    product {
+                      id
+                    }
                     variant {
                       id
                       barcode
@@ -4635,17 +4764,19 @@ router.get('/api/awaiting-parts-summary', async (req, res) => {
 });
 
 function buildHypArProductionPayload({ shop, includeArchived = false, syncStats = null, syncError = null } = {}) {
+  const hiddenArchiveReasons = new Set(['excluded_accessory', 'manual_deleted']);
+  const isVisibleReceiverRecord = (receiver) => !hiddenArchiveReasons.has(String(receiver?.archiveReason || '').trim());
   const activeReceivers = sessionsStore.listHypReceivers({
     shop,
     includeArchived: false,
     limit: 5000,
-  });
+  }).filter(isVisibleReceiverRecord);
   const visibleReceivers = includeArchived
     ? sessionsStore.listHypReceivers({
         shop,
         includeArchived: true,
         limit: 5000,
-      })
+      }).filter(isVisibleReceiverRecord)
     : activeReceivers;
   const archivedCount = includeArchived
     ? visibleReceivers.filter((receiver) => receiver.archivedAt).length
@@ -4653,7 +4784,7 @@ function buildHypArProductionPayload({ shop, includeArchived = false, syncStats 
         shop,
         includeArchived: true,
         limit: 5000,
-      }).filter((receiver) => receiver.archivedAt).length;
+      }).filter((receiver) => receiver.archivedAt && isVisibleReceiverRecord(receiver)).length;
 
   return {
     success: true,
@@ -4755,6 +4886,45 @@ router.post('/api/hyp-ar-production/:id/stage', async (req, res) => {
     });
   } catch (err) {
     console.error('Error in /api/hyp-ar-production/:id/stage:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.delete('/api/hyp-ar-production/:id', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const receiverId = Number(req.params.id);
+    if (!Number.isInteger(receiverId) || receiverId <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing receiver',
+      });
+    }
+
+    const receiver = sessionsStore.archiveHypReceiverById({
+      shop: auth.shop,
+      id: receiverId,
+      reason: 'manual_deleted',
+    });
+
+    if (!receiver) {
+      return res.status(404).json({
+        success: false,
+        error: 'Receiver not found',
+      });
+    }
+
+    return res.json({
+      success: true,
+      receiver,
+    });
+  } catch (err) {
+    console.error('Error in DELETE /api/hyp-ar-production/:id:', err);
     return res.status(500).json({
       success: false,
       error: err.message || 'Server error',

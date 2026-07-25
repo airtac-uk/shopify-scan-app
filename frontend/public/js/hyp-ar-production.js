@@ -57,6 +57,10 @@ function getReceiverOrderStatus(receiver = {}) {
     return { key: 'cancelled', label: 'Cancelled' };
   }
 
+  if (archiveReason === 'manual_deleted') {
+    return { key: 'deleted', label: 'Deleted' };
+  }
+
   if (archiveReason === 'fulfilled' || workflowStatus === 'FULFILLED' || workflowStatus === 'RESTOCKED') {
     return { key: 'fulfilled', label: workflowStatus === 'RESTOCKED' ? 'Restocked' : 'Fulfilled' };
   }
@@ -222,6 +226,17 @@ function mergeReceiverIntoProductionData(updatedReceiver) {
   return true;
 }
 
+function removeReceiverFromProductionData(receiverId) {
+  if (!receiverId || !hypProductionData) return false;
+
+  const receivers = Array.isArray(hypProductionData.receivers) ? hypProductionData.receivers : [];
+  const nextReceivers = receivers.filter((receiver) => String(receiver.id) !== String(receiverId));
+  if (nextReceivers.length === receivers.length) return false;
+
+  hypProductionData.receivers = nextReceivers;
+  return true;
+}
+
 function renderOverview(summary = {}) {
   const container = document.getElementById('hypProductionOverview');
   if (!container) return;
@@ -365,7 +380,7 @@ function renderReceiverTable(receivers = []) {
           <th>Shopify SKU</th>
           <th>Stage</th>
           <th>Updated</th>
-          <th>Label</th>
+          <th>Actions</th>
         </tr>
       </thead>
       <tbody>
@@ -404,13 +419,23 @@ function renderReceiverTable(receivers = []) {
                 ${archived ? `<small>Archived ${escapeHtml(formatTimestamp(receiver.archivedAt))}</small>` : ''}
               </td>
               <td>
-                <button
-                  type="button"
-                  class="hyp-label-btn"
-                  data-print-receiver-id="${escapeHtmlAttribute(receiver.id)}"
-                >
-                  Print
-                </button>
+                <div class="hyp-row-actions">
+                  <button
+                    type="button"
+                    class="hyp-label-btn"
+                    data-print-receiver-id="${escapeHtmlAttribute(receiver.id)}"
+                  >
+                    Print
+                  </button>
+                  <button
+                    type="button"
+                    class="hyp-delete-btn"
+                    data-delete-receiver-id="${escapeHtmlAttribute(receiver.id)}"
+                    data-delete-receiver-code="${escapeHtmlAttribute(receiver.receiverCode)}"
+                  >
+                    Delete
+                  </button>
+                </div>
               </td>
             </tr>
           `;
@@ -508,6 +533,38 @@ async function updateReceiverStage(receiverId, stageKey) {
   }
 }
 
+async function deleteReceiver(receiverId) {
+  if (hypProductionLoading) return;
+  const receiver = (hypProductionData?.receivers || [])
+    .find((item) => String(item.id) === String(receiverId));
+  if (!receiver) return;
+
+  const confirmed = window.confirm(`Delete ${receiver.receiverCode} from the HYP-AR tracker? Its code will stay reserved.`);
+  if (!confirmed) return;
+
+  setLoading(true);
+  setStatus(`Deleting ${receiver.receiverCode}...`, 'info');
+
+  try {
+    const response = await fetch(`/api/hyp-ar-production/${encodeURIComponent(receiverId)}`, {
+      method: 'DELETE',
+      headers: { Accept: 'application/json' },
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data?.success) {
+      throw new Error(data?.error || 'Failed to delete receiver');
+    }
+
+    removeReceiverFromProductionData(receiverId);
+    refreshProductionView({ updateTimestamp: true });
+    setStatus(`${receiver.receiverCode} deleted from the HYP-AR tracker.`, 'success');
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, 'error');
+  } finally {
+    setLoading(false);
+  }
+}
+
 function buildLabelMarkup(receivers) {
   return receivers.map((receiver) => `
     <section class="hyp-dymo-label">
@@ -575,6 +632,12 @@ function installEventHandlers() {
       const receiver = (hypProductionData?.receivers || [])
         .find((item) => String(item.id) === String(printButton.dataset.printReceiverId));
       if (receiver) printLabels([receiver]);
+      return;
+    }
+
+    const deleteButton = event.target.closest('[data-delete-receiver-id]');
+    if (deleteButton) {
+      deleteReceiver(deleteButton.dataset.deleteReceiverId);
     }
   });
 

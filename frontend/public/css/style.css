@@ -9465,7 +9465,8 @@ html.theme-light .order-flow-issue--warning .order-flow-severity {
 }
 
 .hyp-production-actions button,
-.hyp-label-btn {
+.hyp-label-btn,
+.hyp-delete-btn {
   width: auto;
   min-width: 0;
   margin: 0;
@@ -9476,6 +9477,7 @@ html.theme-light .order-flow-issue--warning .order-flow-severity {
 
 .hyp-production-actions button:disabled,
 .hyp-label-btn:disabled,
+.hyp-delete-btn:disabled,
 .hyp-stage-btn:disabled {
   cursor: not-allowed;
   opacity: 0.55;
@@ -9756,6 +9758,25 @@ html.theme-light .order-flow-issue--warning .order-flow-severity {
 
 .hyp-label-btn {
   background: #1f6feb;
+}
+
+.hyp-row-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 150px;
+}
+
+.hyp-delete-btn {
+  border: 1px solid #7c3434;
+  background: #351717;
+  color: #ffaaa5;
+}
+
+.hyp-delete-btn:hover,
+.hyp-delete-btn:focus-visible {
+  background: #4a1d1d;
+  color: #ffd2ce;
 }
 
 .hyp-print-area {

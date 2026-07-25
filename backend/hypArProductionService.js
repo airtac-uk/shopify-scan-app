@@ -48,6 +48,15 @@ const HYP_AR_STAGE_BY_KEY = HYP_AR_STAGES.reduce((acc, stage, index) => {
   return acc;
 }, {});
 
+const HYP_AR_RECEIVER_PRODUCT_IDS = new Set([
+  'gid://shopify/Product/15917023625589',
+]);
+
+const HYP_AR_EXCLUDED_PRODUCT_IDS = new Set([
+  'gid://shopify/Product/15890678153589',
+  'gid://shopify/Product/15932430451061',
+]);
+
 const SHOPIFY_TERMINAL_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
 
 function normalizeText(value) {
@@ -56,6 +65,18 @@ function normalizeText(value) {
 
 function normalizeSkuValue(value) {
   return normalizeText(value).toUpperCase();
+}
+
+function normalizeShopifyProductId(value) {
+  const rawValue = normalizeText(value);
+  if (!rawValue) return '';
+  if (/^gid:\/\/shopify\/Product\/\d+$/i.test(rawValue)) {
+    return rawValue.replace(/^gid:\/\/shopify\/Product\//i, 'gid://shopify/Product/');
+  }
+  if (/^\d+$/.test(rawValue)) {
+    return `gid://shopify/Product/${rawValue}`;
+  }
+  return rawValue;
 }
 
 function normalizeHypArStageKey(value) {
@@ -80,6 +101,14 @@ function getHypArStageIndex(stageKey) {
 }
 
 function isHypArLineItem(item = {}) {
+  const productId = normalizeShopifyProductId(item.productId || item.shopifyProductId);
+  if (productId && HYP_AR_EXCLUDED_PRODUCT_IDS.has(productId)) {
+    return false;
+  }
+  if (productId && HYP_AR_RECEIVER_PRODUCT_IDS.has(productId)) {
+    return true;
+  }
+
   const haystack = [
     item.sku,
     item.title,
@@ -89,14 +118,37 @@ function isHypArLineItem(item = {}) {
   return compact.includes('HYPAR');
 }
 
+function isExcludedHypArAccessoryLineItem(item = {}) {
+  const productId = normalizeShopifyProductId(item.productId || item.shopifyProductId);
+  return Boolean(productId && HYP_AR_EXCLUDED_PRODUCT_IDS.has(productId));
+}
+
+function buildHypArExcludedSourceKeys(lineItems = []) {
+  return (Array.isArray(lineItems) ? lineItems : [])
+    .filter(isExcludedHypArAccessoryLineItem)
+    .map((item, itemIndex) => {
+      const lineItemId = normalizeText(item?.id)
+        || `line-${itemIndex + 1}-${normalizeSkuValue(item?.sku) || normalizeText(item?.title)}`;
+      return lineItemId
+        ? Array.from({ length: Math.max(0, Math.floor(Number(item?.quantity) || 0)) }, (_unit, unitIndex) => `${lineItemId}:${unitIndex + 1}`)
+        : [];
+    })
+    .flat()
+    .filter(Boolean);
+}
+
 function buildHypArReceiverUnits(lineItems = []) {
   return (Array.isArray(lineItems) ? lineItems : [])
     .filter(isHypArLineItem)
     .flatMap((item, itemIndex) => {
       const quantity = Math.max(0, Math.floor(Number(item?.quantity) || 0));
-      const sku = normalizeSkuValue(item?.sku);
       const title = normalizeText(item?.title);
       const variantTitle = normalizeText(item?.variantTitle);
+      const productId = normalizeShopifyProductId(item?.productId || item?.shopifyProductId);
+      const sku = normalizeSkuValue(item?.sku)
+        || normalizeSkuValue(item?.variantSku)
+        || normalizeSkuValue(productId.replace(/^gid:\/\/shopify\/Product\//i, 'NO-SKU-'))
+        || normalizeSkuValue(title);
       const lineItemId = normalizeText(item?.id) || `line-${itemIndex + 1}-${sku || title}`;
 
       return Array.from({ length: quantity }, (_unit, unitIndex) => ({
@@ -106,9 +158,10 @@ function buildHypArReceiverUnits(lineItems = []) {
         sku,
         title,
         variantTitle,
+        productId,
       }));
     })
-    .filter((unit) => unit.sourceKey && unit.sku);
+    .filter((unit) => unit.sourceKey);
 }
 
 function getShopifyWorkflowStatus(order = {}) {
@@ -289,10 +342,15 @@ function buildHypArPublicProduction({ receivers = [], events = [] } = {}) {
 module.exports = {
   HYP_AR_STAGES,
   HYP_AR_STAGE_BY_KEY,
+  HYP_AR_RECEIVER_PRODUCT_IDS,
+  HYP_AR_EXCLUDED_PRODUCT_IDS,
   normalizeHypArStageKey,
+  normalizeShopifyProductId,
   getHypArStage,
   getHypArStageIndex,
   isHypArLineItem,
+  isExcludedHypArAccessoryLineItem,
+  buildHypArExcludedSourceKeys,
   buildHypArReceiverUnits,
   getShopifyWorkflowStatus,
   getHypArArchiveReasonForOrder,

@@ -540,6 +540,7 @@ db.prepare(`
     lineItemId TEXT,
     unitIndex INTEGER NOT NULL,
     receiverCode TEXT NOT NULL UNIQUE,
+    productId TEXT,
     sku TEXT NOT NULL,
     title TEXT,
     variantTitle TEXT,
@@ -569,6 +570,17 @@ db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_hyp_receivers_shop_code
   ON hyp_receivers (shop, receiverCode)
 `).run();
+
+const hypReceiverColumns = db.prepare(`
+  PRAGMA table_info(hyp_receivers)
+`).all();
+
+if (!hypReceiverColumns.some((column) => column?.name === 'productId')) {
+  db.prepare(`
+    ALTER TABLE hyp_receivers
+    ADD COLUMN productId TEXT
+  `).run();
+}
 
 db.prepare(`
   CREATE TABLE IF NOT EXISTS hyp_receiver_events (
@@ -928,6 +940,7 @@ function normalizeHypReceiverRecord(row) {
     lineItemId: String(row.lineItemId || '').trim(),
     unitIndex: Math.max(1, Number(row.unitIndex) || 1),
     receiverCode: String(row.receiverCode || '').trim(),
+    productId: String(row.productId || '').trim(),
     sku: normalizeBarcode(row.sku),
     title: String(row.title || '').trim(),
     variantTitle: String(row.variantTitle || '').trim(),
@@ -1053,11 +1066,17 @@ module.exports = {
         sourceKey: String(receiver?.sourceKey || '').trim(),
         lineItemId: String(receiver?.lineItemId || '').trim() || null,
         unitIndex: Math.max(1, Math.floor(Number(receiver?.unitIndex) || 1)),
-        sku: normalizeBarcode(receiver?.sku),
+        productId: String(receiver?.productId || '').trim() || null,
+        sku: normalizeBarcode(
+          receiver?.sku
+          || String(receiver?.productId || '').replace(/^gid:\/\/shopify\/Product\//i, 'NO-SKU-')
+          || receiver?.title
+          || 'HYP-AR'
+        ),
         title: String(receiver?.title || '').trim(),
         variantTitle: String(receiver?.variantTitle || '').trim(),
       }))
-      .filter((receiver) => receiver.sourceKey && receiver.sku);
+      .filter((receiver) => receiver.sourceKey);
 
     if (!normalizedReceivers.length) return [];
 
@@ -1074,9 +1093,9 @@ module.exports = {
     const insertStmt = db.prepare(`
       INSERT INTO hyp_receivers (
         shop, orderId, orderNumber, orderCreatedAt, sourceKey, lineItemId, unitIndex,
-        receiverCode, sku, title, variantTitle, currentStageKey, currentStageLabel,
+        receiverCode, productId, sku, title, variantTitle, currentStageKey, currentStageLabel,
         workflowStatus, createdAt, updatedAt, stageStartedAt, archivedAt, archiveReason
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
     `);
     const updateStmt = db.prepare(`
       UPDATE hyp_receivers
@@ -1084,13 +1103,20 @@ module.exports = {
           orderCreatedAt = COALESCE(orderCreatedAt, ?),
           lineItemId = ?,
           unitIndex = ?,
+          productId = ?,
           sku = ?,
           title = ?,
           variantTitle = ?,
           workflowStatus = ?,
           updatedAt = ?,
-          archivedAt = CASE WHEN ? THEN NULL ELSE archivedAt END,
-          archiveReason = CASE WHEN ? THEN NULL ELSE archiveReason END
+          archivedAt = CASE
+            WHEN ? AND COALESCE(archiveReason, '') NOT IN ('manual_deleted', 'excluded_accessory') THEN NULL
+            ELSE archivedAt
+          END,
+          archiveReason = CASE
+            WHEN ? AND COALESCE(archiveReason, '') NOT IN ('manual_deleted', 'excluded_accessory') THEN NULL
+            ELSE archiveReason
+          END
       WHERE shop = ?
         AND orderId = ?
         AND sourceKey = ?
@@ -1112,6 +1138,7 @@ module.exports = {
             orderCreatedAt || null,
             receiver.lineItemId,
             receiver.unitIndex,
+            receiver.productId,
             receiver.sku,
             receiver.title || null,
             receiver.variantTitle || null,
@@ -1143,6 +1170,7 @@ module.exports = {
               receiver.lineItemId,
               receiver.unitIndex,
               receiverCode,
+              receiver.productId,
               receiver.sku,
               receiver.title || null,
               receiver.variantTitle || null,
@@ -1229,6 +1257,36 @@ module.exports = {
     return Number(result?.changes || 0);
   },
 
+  archiveHypReceiversBySourceKeys({
+    shop,
+    orderId,
+    sourceKeys = [],
+    reason = 'excluded_accessory',
+    archivedAt = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedOrderId = String(orderId || '').trim();
+    const normalizedSourceKeys = Array.from(new Set((Array.isArray(sourceKeys) ? sourceKeys : [])
+      .map((sourceKey) => String(sourceKey || '').trim())
+      .filter(Boolean)));
+    if (!normalizedShop || !normalizedOrderId || normalizedSourceKeys.length === 0) return 0;
+
+    const nowIso = archivedAt || new Date().toISOString();
+    const safeReason = String(reason || 'excluded_accessory').trim() || 'excluded_accessory';
+    const placeholders = normalizedSourceKeys.map(() => '?').join(', ');
+    const result = db.prepare(`
+      UPDATE hyp_receivers
+      SET archivedAt = COALESCE(archivedAt, ?),
+          archiveReason = ?,
+          updatedAt = ?
+      WHERE shop = ?
+        AND orderId = ?
+        AND sourceKey IN (${placeholders})
+    `).run(nowIso, safeReason, nowIso, normalizedShop, normalizedOrderId, ...normalizedSourceKeys);
+
+    return Number(result?.changes || 0);
+  },
+
   archiveHypReceiversForOrder({
     shop,
     orderId,
@@ -1294,6 +1352,32 @@ module.exports = {
     `).get(normalizedShop, normalizedId);
 
     return normalizeHypReceiverRecord(row);
+  },
+
+  archiveHypReceiverById({
+    shop,
+    id,
+    reason = 'manual_deleted',
+    archivedAt = null,
+  } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0) return null;
+
+    const nowIso = archivedAt || new Date().toISOString();
+    const safeReason = String(reason || 'manual_deleted').trim() || 'manual_deleted';
+
+    const result = db.prepare(`
+      UPDATE hyp_receivers
+      SET archivedAt = COALESCE(archivedAt, ?),
+          archiveReason = ?,
+          updatedAt = ?
+      WHERE shop = ?
+        AND id = ?
+    `).run(nowIso, safeReason, nowIso, normalizedShop, normalizedId);
+
+    if (!result?.changes) return null;
+    return this.getHypReceiverById({ shop: normalizedShop, id: normalizedId });
   },
 
   getHypReceiversForOrder({ shop, orderId, includeArchived = false } = {}) {
