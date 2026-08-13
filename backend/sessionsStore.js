@@ -386,6 +386,14 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  UPDATE print_queue_items
+  SET stageKey = 'in_build'
+  WHERE queueKey = 'fdm'
+    AND stageKey IN ('pre_dye', 'post_dye')
+    AND removedAt IS NULL
+`).run();
+
+db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_print_queue_items_shop_stage
   ON print_queue_items (shop, queueKey, stageKey, updatedAt DESC)
 `).run();
@@ -2729,6 +2737,23 @@ module.exports = {
 
     tx();
     return insertedRows.filter(Boolean);
+  },
+
+  getPrintQueueItem({ shop, id } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0) return null;
+
+    const row = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+        AND removedAt IS NULL
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+
+    return buildPrintQueueItemRecord(row);
   },
 
   getPrintQueueItems({ shop, queueKey = 'sls', completeLimit = 80 } = {}) {

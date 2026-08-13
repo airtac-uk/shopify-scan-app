@@ -26,7 +26,22 @@ const PRINT_QUEUE_KEY = (() => {
 })();
 const PRINT_QUEUE_CONFIG = PRINT_QUEUE_CONFIGS[PRINT_QUEUE_KEY] || PRINT_QUEUE_CONFIGS.sls;
 
-let printQueueStages = [
+const PRINT_QUEUE_STAGE_CONFIGS = {
+  sls: [
+    { key: 'needs_printed', label: 'Needs Printed' },
+    { key: 'in_build', label: 'In Build' },
+    { key: 'pre_dye', label: 'Pre Dye' },
+    { key: 'post_dye', label: 'Post Dye' },
+    { key: 'complete', label: 'Complete' },
+  ],
+  fdm: [
+    { key: 'needs_printed', label: 'Needs Printed' },
+    { key: 'in_build', label: 'Printing' },
+    { key: 'complete', label: 'Complete' },
+  ],
+};
+
+let printQueueStages = PRINT_QUEUE_STAGE_CONFIGS[PRINT_QUEUE_KEY] || [
   { key: 'needs_printed', label: 'Needs Printed' },
   { key: 'in_build', label: 'In Build' },
   { key: 'pre_dye', label: 'Pre Dye' },
@@ -965,7 +980,7 @@ function renderOverview() {
       value: formatPartQuantity(sumQty(needsPrintedItems)),
     },
     {
-      label: 'In Build',
+      label: getStageLabel('in_build'),
       value: formatPartQuantity(sumQty(inBuildItems)),
     },
     {

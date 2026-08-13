@@ -29,12 +29,12 @@ const {
   buildInternalOrderTimeline,
 } = require('./orderTrackerService');
 const {
-  PRINT_QUEUE_STAGES,
   PRINT_QUEUE_CONFIGS,
   DEFAULT_PRINT_QUEUE_KEY,
   DEFAULT_PRINT_QUEUE_STAGE,
   normalizePrintQueueKey,
   getPrintQueueConfig,
+  getPrintQueueStages,
   normalizeStageKey,
   isPrintableSheetRow,
   getPrintQueueKeyForSheetRow,
@@ -5168,7 +5168,7 @@ router.get('/api/print-queue', async (req, res) => {
       success: true,
       queueKey,
       queue: queueConfig,
-      stages: PRINT_QUEUE_STAGES,
+      stages: getPrintQueueStages(queueKey),
       items: itemsWithAwaitingParts,
     });
   } catch (err) {
@@ -5760,11 +5760,29 @@ router.post('/api/print-queue/:id/stage', async (req, res) => {
     if (!auth) return;
 
     const id = Number(req.params.id);
-    const stageKey = normalizeStageKey(req.body?.stageKey);
-    if (!Number.isInteger(id) || id <= 0 || !stageKey) {
+    if (!Number.isInteger(id) || id <= 0) {
       return res.status(400).json({
         success: false,
-        error: 'Missing print item id or valid stage',
+        error: 'Missing print item id',
+      });
+    }
+
+    const existingItem = sessionsStore.getPrintQueueItem({
+      shop: auth.shop,
+      id,
+    });
+    if (!existingItem) {
+      return res.status(404).json({
+        success: false,
+        error: 'Print queue item not found',
+      });
+    }
+
+    const stageKey = normalizeStageKey(req.body?.stageKey, existingItem.queueKey);
+    if (!stageKey) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing valid stage for this print queue',
       });
     }
 

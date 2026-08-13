@@ -1,12 +1,20 @@
 const { normalizeSku, normalizePickType } = require('./pickListService');
 
-const PRINT_QUEUE_STAGES = [
+const SLS_PRINT_QUEUE_STAGES = [
   { key: 'needs_printed', label: 'Needs Printed' },
   { key: 'in_build', label: 'In Build' },
   { key: 'pre_dye', label: 'Pre Dye' },
   { key: 'post_dye', label: 'Post Dye' },
   { key: 'complete', label: 'Complete' },
 ];
+
+const FDM_PRINT_QUEUE_STAGES = [
+  { key: 'needs_printed', label: 'Needs Printed' },
+  { key: 'in_build', label: 'Printing' },
+  { key: 'complete', label: 'Complete' },
+];
+
+const PRINT_QUEUE_STAGES = SLS_PRINT_QUEUE_STAGES;
 
 const PRINT_QUEUE_CONFIGS = {
   sls: {
@@ -17,6 +25,7 @@ const PRINT_QUEUE_CONFIGS = {
     emptyCatalogLabel: 'No SLS or adapter SKUs found in the sheet.',
     supportsPreformBuild: true,
     typeMatches: ['SLS', 'ADAPTER'],
+    stages: SLS_PRINT_QUEUE_STAGES,
   },
   fdm: {
     key: 'fdm',
@@ -26,12 +35,22 @@ const PRINT_QUEUE_CONFIGS = {
     emptyCatalogLabel: 'No FDM SKUs found in the sheet.',
     supportsPreformBuild: false,
     typeMatches: ['FDM'],
+    stages: FDM_PRINT_QUEUE_STAGES,
   },
 };
 
 const DEFAULT_PRINT_QUEUE_KEY = 'sls';
 const PRINT_QUEUE_KEYS = new Set(Object.keys(PRINT_QUEUE_CONFIGS));
-const PRINT_QUEUE_STAGE_KEYS = new Set(PRINT_QUEUE_STAGES.map((stage) => stage.key));
+const PRINT_QUEUE_STAGE_KEYS = new Set(
+  Object.values(PRINT_QUEUE_CONFIGS)
+    .flatMap((config) => config.stages || [])
+    .map((stage) => stage.key)
+);
+const PRINT_QUEUE_STAGE_LOOKUP = new Map(
+  Object.values(PRINT_QUEUE_CONFIGS)
+    .flatMap((config) => config.stages || [])
+    .map((stage) => [stage.key, stage])
+);
 const DEFAULT_PRINT_QUEUE_STAGE = 'needs_printed';
 
 function normalizePrintQueueKey(value) {
@@ -43,14 +62,27 @@ function getPrintQueueConfig(value) {
   return PRINT_QUEUE_CONFIGS[normalizePrintQueueKey(value)] || PRINT_QUEUE_CONFIGS[DEFAULT_PRINT_QUEUE_KEY];
 }
 
-function normalizeStageKey(value) {
+function getPrintQueueStages(value = DEFAULT_PRINT_QUEUE_KEY) {
+  const config = getPrintQueueConfig(value);
+  return Array.isArray(config.stages) && config.stages.length ? config.stages : PRINT_QUEUE_STAGES;
+}
+
+function normalizeStageKey(value, queueKey = null) {
   const normalized = String(value || '').trim().toLowerCase();
+  if (queueKey != null) {
+    const stageKeys = new Set(getPrintQueueStages(queueKey).map((stage) => stage.key));
+    return stageKeys.has(normalized) ? normalized : '';
+  }
+
   return PRINT_QUEUE_STAGE_KEYS.has(normalized) ? normalized : '';
 }
 
-function getPrintQueueStage(value) {
-  const normalized = normalizeStageKey(value);
-  return PRINT_QUEUE_STAGES.find((stage) => stage.key === normalized) || null;
+function getPrintQueueStage(value, queueKey = null) {
+  const normalized = normalizeStageKey(value, queueKey);
+  const stages = queueKey == null ? null : getPrintQueueStages(queueKey);
+  return stages
+    ? stages.find((stage) => stage.key === normalized) || null
+    : PRINT_QUEUE_STAGE_LOOKUP.get(normalized) || null;
 }
 
 function parsePositiveInteger(value, fallback = 1) {
@@ -303,6 +335,7 @@ module.exports = {
   DEFAULT_PRINT_QUEUE_STAGE,
   normalizePrintQueueKey,
   getPrintQueueConfig,
+  getPrintQueueStages,
   normalizeStageKey,
   getPrintQueueStage,
   isPrintableSheetType,
