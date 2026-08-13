@@ -380,6 +380,8 @@ let geckoboardDatasetChecked = false;
 const wholesaleAdapterBuiltScanCounts = new Map();
 const webhookRegistrationCheckedShops = new Set();
 const awaitingPartsSyncPromises = new Map();
+const hypArProductionSyncJobs = new Map();
+const HYP_AR_BACKGROUND_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
 const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
 const SHIPPING_ALLOWED_FINANCIAL_STATUSES = new Set(['PAID', 'PARTIALLY_REFUNDED']);
@@ -3561,6 +3563,8 @@ async function syncHypArProductionFromShopify({
   maxOpenOrders = 1000,
   maxHistoricalOrders = 2000,
   maxHistoricalSearchOrders = 1000,
+  includeHistoricalOrders = true,
+  includeTargetedHistoricalOrders = true,
 } = {}) {
   const stats = {
     scannedOpenOrders: 0,
@@ -3582,6 +3586,8 @@ async function syncHypArProductionFromShopify({
     historicalReceiverCount: 0,
     archivedCount: 0,
     refreshedTrackedOrderCount: 0,
+    includeHistoricalOrders: Boolean(includeHistoricalOrders),
+    includeTargetedHistoricalOrders: Boolean(includeTargetedHistoricalOrders),
   };
 
   const openResult = await listHypArOpenOrders({
@@ -3605,47 +3611,51 @@ async function syncHypArProductionFromShopify({
     }
   }
 
-  const historicalResult = await listHypArOpenOrders({
-    client,
-    maxOrders: maxHistoricalOrders,
-    shopifyQuery: 'status:any',
-    sortKey: 'UPDATED_AT',
-    reverse: true,
-  });
-  stats.scannedHistoricalOrders = historicalResult.orders.length;
-  stats.historicalOrderPagesFetched = historicalResult.pagesFetched;
-  stats.historicalOrderHasMore = historicalResult.hasMore;
-  stats.maxHistoricalOrders = historicalResult.maxOrders;
+  if (includeHistoricalOrders) {
+    const historicalResult = await listHypArOpenOrders({
+      client,
+      maxOrders: maxHistoricalOrders,
+      shopifyQuery: 'status:any',
+      sortKey: 'UPDATED_AT',
+      reverse: true,
+    });
+    stats.scannedHistoricalOrders = historicalResult.orders.length;
+    stats.historicalOrderPagesFetched = historicalResult.pagesFetched;
+    stats.historicalOrderHasMore = historicalResult.hasMore;
+    stats.maxHistoricalOrders = historicalResult.maxOrders;
 
-  for (const order of historicalResult.orders) {
-    if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
-    if (!getHypArArchiveReasonForOrder(order)) continue;
+    for (const order of historicalResult.orders) {
+      if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
+      if (!getHypArArchiveReasonForOrder(order)) continue;
 
-    const result = await syncHypArOrderFromShopify({ req, client, shop, order });
-    seenOpenOrderIds.add(order.id);
-    stats.archivedCount += Number(result.archivedCount || 0);
-    if (result.receiverCount > 0) {
-      stats.historicalHypOrderCount += 1;
-      stats.historicalReceiverCount += result.receiverCount;
+      const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+      seenOpenOrderIds.add(order.id);
+      stats.archivedCount += Number(result.archivedCount || 0);
+      if (result.receiverCount > 0) {
+        stats.historicalHypOrderCount += 1;
+        stats.historicalReceiverCount += result.receiverCount;
+      }
     }
   }
 
-  const targetedHistoricalResult = await listHypArHistoricalSearchOrders({
-    client,
-    maxOrdersPerQuery: maxHistoricalSearchOrders,
-  });
-  stats.targetedHistoricalSearches = targetedHistoricalResult.searches;
-  stats.targetedHistoricalOrderCount = targetedHistoricalResult.orders.length;
+  if (includeTargetedHistoricalOrders) {
+    const targetedHistoricalResult = await listHypArHistoricalSearchOrders({
+      client,
+      maxOrdersPerQuery: maxHistoricalSearchOrders,
+    });
+    stats.targetedHistoricalSearches = targetedHistoricalResult.searches;
+    stats.targetedHistoricalOrderCount = targetedHistoricalResult.orders.length;
 
-  for (const order of targetedHistoricalResult.orders) {
-    if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
+    for (const order of targetedHistoricalResult.orders) {
+      if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
 
-    const result = await syncHypArOrderFromShopify({ req, client, shop, order });
-    seenOpenOrderIds.add(order.id);
-    stats.archivedCount += Number(result.archivedCount || 0);
-    if (result.receiverCount > 0) {
-      stats.targetedHistoricalHypOrderCount += 1;
-      stats.targetedHistoricalReceiverCount += result.receiverCount;
+      const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+      seenOpenOrderIds.add(order.id);
+      stats.archivedCount += Number(result.archivedCount || 0);
+      if (result.receiverCount > 0) {
+        stats.targetedHistoricalHypOrderCount += 1;
+        stats.targetedHistoricalReceiverCount += result.receiverCount;
+      }
     }
   }
 
@@ -3676,6 +3686,111 @@ async function syncHypArProductionFromShopify({
   }
 
   return stats;
+}
+
+function parseBooleanOption(value, fallback = false) {
+  if (value === undefined || value === null || value === '') return Boolean(fallback);
+  if (value === true || value === 1) return true;
+  if (value === false || value === 0) return false;
+  const normalized = String(value).trim().toLowerCase();
+  if (['1', 'true', 'yes', 'y', 'on'].includes(normalized)) return true;
+  if (['0', 'false', 'no', 'n', 'off'].includes(normalized)) return false;
+  return Boolean(fallback);
+}
+
+function getHypArProductionSyncOptions(source = {}, defaults = {}) {
+  return {
+    maxOpenOrders: Math.max(50, Math.min(2000, Math.floor(Number(source.maxOpenOrders) || Number(defaults.maxOpenOrders) || 1000))),
+    maxHistoricalOrders: Math.max(50, Math.min(2000, Math.floor(Number(source.maxHistoricalOrders) || Number(defaults.maxHistoricalOrders) || 2000))),
+    maxHistoricalSearchOrders: Math.max(50, Math.min(2000, Math.floor(Number(source.maxHistoricalSearchOrders) || Number(defaults.maxHistoricalSearchOrders) || 1000))),
+    includeHistoricalOrders: parseBooleanOption(source.includeHistoricalOrders, defaults.includeHistoricalOrders !== undefined ? defaults.includeHistoricalOrders : true),
+    includeTargetedHistoricalOrders: parseBooleanOption(source.includeTargetedHistoricalOrders, defaults.includeTargetedHistoricalOrders !== undefined ? defaults.includeTargetedHistoricalOrders : true),
+  };
+}
+
+function buildBackgroundRequestContext(req) {
+  const protocol = req?.protocol || 'https';
+  const host = typeof req?.get === 'function' ? req.get('host') : '';
+  return {
+    protocol,
+    get(headerName) {
+      if (String(headerName || '').toLowerCase() === 'host') return host;
+      return typeof req?.get === 'function' ? req.get(headerName) : '';
+    },
+  };
+}
+
+function serializeHypArSyncJob(job = null) {
+  if (!job) {
+    return {
+      status: 'idle',
+      running: false,
+      startedAt: null,
+      completedAt: null,
+      stats: null,
+      error: null,
+    };
+  }
+
+  return {
+    status: job.status || 'idle',
+    running: job.status === 'running',
+    startedAt: job.startedAt || null,
+    completedAt: job.completedAt || null,
+    stats: job.stats || null,
+    error: job.error || null,
+  };
+}
+
+function startHypArProductionBackgroundSync({ req, session, shop, options = {} } = {}) {
+  const normalizedShop = String(shop || '').trim();
+  if (!normalizedShop || !session) return null;
+
+  const existingJob = hypArProductionSyncJobs.get(normalizedShop);
+  if (existingJob?.status === 'running') {
+    return existingJob;
+  }
+  const force = parseBooleanOption(options.force, false);
+  const existingCompletedAt = existingJob?.completedAt ? Date.parse(existingJob.completedAt) : Number.NaN;
+  if (!force && Number.isFinite(existingCompletedAt) && Date.now() - existingCompletedAt < HYP_AR_BACKGROUND_SYNC_MIN_INTERVAL_MS) {
+    return existingJob;
+  }
+
+  const job = {
+    status: 'running',
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    stats: null,
+    error: null,
+  };
+  hypArProductionSyncJobs.set(normalizedShop, job);
+
+  const requestContext = buildBackgroundRequestContext(req);
+  const client = shopifyClient(session);
+  job.promise = syncHypArProductionFromShopify({
+    req: requestContext,
+    client,
+    shop: normalizedShop,
+    ...getHypArProductionSyncOptions(options, {
+      includeHistoricalOrders: false,
+      includeTargetedHistoricalOrders: false,
+    }),
+  })
+    .then((stats) => {
+      job.status = 'completed';
+      job.stats = stats;
+      job.completedAt = new Date().toISOString();
+      return stats;
+    })
+    .catch((err) => {
+      console.error('Background HYP-AR production sync failed:', err);
+      job.status = 'failed';
+      job.error = err.message || 'Failed to sync HYP-AR orders from Shopify';
+      job.completedAt = new Date().toISOString();
+      return null;
+    });
+
+  return job;
 }
 
 function includesMissingBundleFieldError(err) {
@@ -4810,10 +4925,8 @@ router.get('/api/hyp-ar-production', async (req, res) => {
     if (!auth) return;
 
     const includeArchived = String(req.query.includeArchived || '').trim() === '1';
-    const shouldSync = String(req.query.sync || '1').trim() !== '0';
-    const maxOpenOrders = Math.max(50, Math.min(2000, Math.floor(Number(req.query.maxOpenOrders) || 1000)));
-    const maxHistoricalOrders = Math.max(50, Math.min(2000, Math.floor(Number(req.query.maxHistoricalOrders) || 2000)));
-    const maxHistoricalSearchOrders = Math.max(50, Math.min(2000, Math.floor(Number(req.query.maxHistoricalSearchOrders) || 1000)));
+    const shouldSync = String(req.query.sync || '0').trim() === '1';
+    const syncOptions = getHypArProductionSyncOptions(req.query || {});
     let syncStats = null;
     let syncError = null;
 
@@ -4824,9 +4937,7 @@ router.get('/api/hyp-ar-production', async (req, res) => {
           req,
           client,
           shop: auth.shop,
-          maxOpenOrders,
-          maxHistoricalOrders,
-          maxHistoricalSearchOrders,
+          ...syncOptions,
         });
       } catch (err) {
         console.error('HYP-AR production sync failed:', err);
@@ -4842,6 +4953,49 @@ router.get('/api/hyp-ar-production', async (req, res) => {
     }));
   } catch (err) {
     console.error('Error in /api/hyp-ar-production:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.post('/api/hyp-ar-production/sync', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const job = startHypArProductionBackgroundSync({
+      req,
+      session: auth.session,
+      shop: auth.shop,
+      options: req.body || {},
+    });
+
+    return res.json({
+      success: true,
+      sync: serializeHypArSyncJob(job),
+    });
+  } catch (err) {
+    console.error('Error in POST /api/hyp-ar-production/sync:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
+router.get('/api/hyp-ar-production/sync', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    return res.json({
+      success: true,
+      sync: serializeHypArSyncJob(hypArProductionSyncJobs.get(auth.shop)),
+    });
+  } catch (err) {
+    console.error('Error in GET /api/hyp-ar-production/sync:', err);
     return res.status(500).json({
       success: false,
       error: err.message || 'Server error',

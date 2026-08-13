@@ -5,6 +5,7 @@
     { href: '/order_flow.html', label: 'Monitor' },
     { href: '/putting_away.html', label: 'Part Explorer' },
     { href: '/awaiting_parts.html', label: 'Awaiting Parts' },
+    { href: '/maintenance.html', label: 'Maintenance' },
     { href: '/hyp_ar_production.html', label: 'HYP-AR' },
     { href: '/print_queue.html', label: 'Print Queue' },
     { href: '/fdm_print_queue.html', label: 'FDM Print Queue' },

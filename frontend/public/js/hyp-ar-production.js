@@ -2,7 +2,9 @@ const HYP_PRODUCTION_POLL_MS = 60000;
 
 let hypProductionData = null;
 let hypProductionLoading = false;
+let hypProductionSyncing = false;
 let hypProductionPollId = null;
+let hypProductionSyncPollId = null;
 let hypStageFilter = '';
 
 function escapeHtml(value) {
@@ -237,6 +239,11 @@ function removeReceiverFromProductionData(receiverId) {
   return true;
 }
 
+function formatSyncStats(syncStats = {}) {
+  if (!syncStats) return 'Shopify sync complete.';
+  return `Synced ${syncStats.scannedOpenOrders || 0} open, ${syncStats.scannedHistoricalOrders || 0} recent historical, and ${syncStats.targetedHistoricalOrderCount || 0} targeted HYP Shopify orders; ${(syncStats.receiverCount || 0)} active and ${(syncStats.historicalReceiverCount || 0) + (syncStats.targetedHistoricalReceiverCount || 0)} fulfilled HYP-AR receivers serialised.`;
+}
+
 function renderOverview(summary = {}) {
   const container = document.getElementById('hypProductionOverview');
   if (!container) return;
@@ -445,7 +452,7 @@ function renderReceiverTable(receivers = []) {
   `;
 }
 
-function renderProduction(data) {
+function renderProduction(data, { silent = false } = {}) {
   hypProductionData = data;
   if (!Array.isArray(hypProductionData.receivers)) {
     hypProductionData.receivers = [];
@@ -460,6 +467,8 @@ function renderProduction(data) {
   refreshProductionView();
   updateLastUpdatedLabel();
 
+  if (silent) return;
+
   if (data.syncError) {
     setStatus(`Loaded local records. Sync warning: ${data.syncError}`, 'error');
     return;
@@ -467,20 +476,24 @@ function renderProduction(data) {
 
   const syncStats = data.syncStats;
   if (syncStats) {
-    setStatus(
-      `Synced ${syncStats.scannedOpenOrders || 0} open, ${syncStats.scannedHistoricalOrders || 0} recent historical, and ${syncStats.targetedHistoricalOrderCount || 0} targeted HYP Shopify orders; ${(syncStats.receiverCount || 0)} active and ${(syncStats.historicalReceiverCount || 0) + (syncStats.targetedHistoricalReceiverCount || 0)} fulfilled HYP-AR receivers serialised.`,
-      'success'
-    );
+    setStatus(formatSyncStats(syncStats), 'success');
     return;
   }
 
-  setStatus('Loaded local HYP-AR records.', 'success');
+  setStatus(
+    hypProductionSyncing
+      ? 'Loaded stored HYP-AR records. Shopify sync is running in the background.'
+      : 'Loaded stored HYP-AR records.',
+    hypProductionSyncing ? 'info' : 'success'
+  );
 }
 
-async function fetchProduction({ sync = true } = {}) {
-  if (hypProductionLoading) return;
+async function fetchProduction({ sync = false, silent = false } = {}) {
+  if (hypProductionLoading) return false;
   setLoading(true);
-  setStatus(sync ? 'Syncing Shopify orders...' : 'Loading HYP-AR records...', 'info');
+  if (!silent) {
+    setStatus(sync ? 'Syncing Shopify orders...' : 'Loading stored HYP-AR records...', 'info');
+  }
 
   try {
     const params = new URLSearchParams();
@@ -495,11 +508,97 @@ async function fetchProduction({ sync = true } = {}) {
       throw new Error(data?.error || 'Failed to load HYP-AR production');
     }
 
-    renderProduction(data);
+    renderProduction(data, { silent });
+    return true;
   } catch (err) {
-    setStatus(`Error: ${err.message}`, 'error');
+    if (!silent) setStatus(`Error: ${err.message}`, 'error');
+    return false;
   } finally {
     setLoading(false);
+  }
+}
+
+function clearBackgroundSyncPoll() {
+  if (hypProductionSyncPollId) {
+    clearTimeout(hypProductionSyncPollId);
+    hypProductionSyncPollId = null;
+  }
+}
+
+async function fetchBackgroundSyncStatus() {
+  const response = await fetch('/api/hyp-ar-production/sync', {
+    headers: { Accept: 'application/json' },
+    cache: 'no-store',
+  });
+  const data = await response.json().catch(() => null);
+  if (!response.ok || !data?.success) {
+    throw new Error(data?.error || 'Failed to load HYP-AR sync status');
+  }
+  return data.sync || {};
+}
+
+function scheduleBackgroundSyncPoll() {
+  clearBackgroundSyncPoll();
+  hypProductionSyncPollId = window.setTimeout(pollBackgroundSyncStatus, 5000);
+}
+
+async function pollBackgroundSyncStatus() {
+  try {
+    const sync = await fetchBackgroundSyncStatus();
+    if (sync.running) {
+      scheduleBackgroundSyncPoll();
+      return;
+    }
+
+    hypProductionSyncing = false;
+    await fetchProduction({ sync: false, silent: true });
+    if (sync.error) {
+      setStatus(`Loaded stored HYP-AR records. Background sync failed: ${sync.error}`, 'error');
+      return;
+    }
+
+    setStatus(sync.stats ? `Background sync complete. ${formatSyncStats(sync.stats)}` : 'Background sync complete.', 'success');
+  } catch (err) {
+    hypProductionSyncing = false;
+    setStatus(`Loaded stored HYP-AR records. Background sync status failed: ${err.message}`, 'error');
+  }
+}
+
+async function startBackgroundSync({ silent = false, force = false } = {}) {
+  if (hypProductionSyncing) return;
+  hypProductionSyncing = true;
+  if (!silent) {
+    setStatus('Loaded stored HYP-AR records. Syncing Shopify orders in the background...', 'info');
+  }
+
+  try {
+    const response = await fetch('/api/hyp-ar-production/sync', {
+      method: 'POST',
+      headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ force }),
+      cache: 'no-store',
+    });
+    const data = await response.json().catch(() => null);
+    if (!response.ok || !data?.success) {
+      throw new Error(data?.error || 'Failed to start HYP-AR sync');
+    }
+
+    const sync = data.sync || {};
+    if (sync.running) {
+      scheduleBackgroundSyncPoll();
+      return;
+    }
+
+    hypProductionSyncing = false;
+    await fetchProduction({ sync: false, silent: true });
+    if (sync.error) {
+      setStatus(`Loaded stored HYP-AR records. Background sync failed: ${sync.error}`, 'error');
+      return;
+    }
+    setStatus(sync.stats ? `Background sync complete. ${formatSyncStats(sync.stats)}` : 'Background sync complete.', 'success');
+  } catch (err) {
+    hypProductionSyncing = false;
+    setStatus(`Loaded stored HYP-AR records. Background sync failed to start: ${err.message}`, 'error');
   }
 }
 
@@ -606,9 +705,12 @@ function installEventHandlers() {
   const tableContainer = document.getElementById('hypReceiverTable');
   const filterContainer = document.getElementById('hypStageFilters');
 
-  refreshBtn?.addEventListener('click', () => fetchProduction({ sync: true }));
+  refreshBtn?.addEventListener('click', async () => {
+    const loaded = await fetchProduction({ sync: false });
+    if (loaded) startBackgroundSync({ force: true });
+  });
   printActiveBtn?.addEventListener('click', () => printLabels(getActiveReceivers()));
-  archivedToggle?.addEventListener('change', () => fetchProduction({ sync: archivedToggle.checked }));
+  archivedToggle?.addEventListener('change', () => fetchProduction({ sync: false }));
 
   filterContainer?.addEventListener('click', (event) => {
     const filterButton = event.target.closest('[data-hyp-stage-filter]');
@@ -646,12 +748,14 @@ function installEventHandlers() {
 
 document.addEventListener('DOMContentLoaded', () => {
   installEventHandlers();
-  fetchProduction({ sync: true });
+  fetchProduction({ sync: false }).then((loaded) => {
+    if (loaded) startBackgroundSync();
+  });
 
   if (hypProductionPollId) {
     clearInterval(hypProductionPollId);
   }
   hypProductionPollId = setInterval(() => {
-    fetchProduction({ sync: false });
+    fetchProduction({ sync: false, silent: true });
   }, HYP_PRODUCTION_POLL_MS);
 });

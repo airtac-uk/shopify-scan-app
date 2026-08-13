@@ -452,7 +452,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const listContainer = document.getElementById('awaitingPartsList');
   if (refreshBtn) {
     refreshBtn.addEventListener('click', () => {
-      fetchAwaitingPartsSummary({ sync: true });
+      fetchAwaitingPartsSummary({ sync: false });
     });
   }
 
@@ -479,7 +479,7 @@ document.addEventListener('DOMContentLoaded', () => {
     });
   }
 
-  fetchAwaitingPartsSummary({ sync: true });
+  fetchAwaitingPartsSummary({ sync: false });
 
   if (awaitingPartsPollId) {
     clearInterval(awaitingPartsPollId);

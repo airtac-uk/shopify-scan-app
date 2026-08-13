@@ -990,6 +990,56 @@ function buildHypReceiverCode(number) {
   return `HYP-${String(safeNumber).padStart(4, '0')}`;
 }
 
+function tableExists(tableName) {
+  const normalized = String(tableName || '').trim();
+  if (!normalized) return false;
+  return Boolean(db.prepare(`
+    SELECT 1
+    FROM sqlite_master
+    WHERE type = 'table'
+      AND name = ?
+    LIMIT 1
+  `).get(normalized));
+}
+
+function getExistingTableColumns(tableName) {
+  if (!tableExists(tableName)) return new Set();
+  return new Set(db.prepare(`PRAGMA table_info(${tableName})`).all().map((column) => column.name));
+}
+
+function addKnownUser(users, value) {
+  const normalized = String(value || '').trim();
+  if (!normalized) return;
+  const key = normalized.toLowerCase();
+  if (key === 'unknown' || key === 'system') return;
+  if (!users.has(key)) users.set(key, normalized);
+}
+
+function addKnownSessionUser(users, value) {
+  const parsed = safeJsonParse(value, value);
+  if (typeof parsed === 'string') {
+    addKnownUser(users, parsed);
+    return;
+  }
+  if (!parsed || typeof parsed !== 'object') return;
+  const fullName = [parsed.first_name, parsed.last_name].map((item) => String(item || '').trim()).filter(Boolean).join(' ');
+  addKnownUser(users, fullName || parsed.name || parsed.email);
+}
+
+function addKnownUsersFromColumn(users, { table, column, shop = null } = {}) {
+  const columns = getExistingTableColumns(table);
+  if (!columns.has(column)) return;
+  const shopScoped = shop && columns.has('shop');
+  const rows = db.prepare(`
+    SELECT DISTINCT ${column} AS userName
+    FROM ${table}
+    WHERE ${shopScoped ? 'shop = ? AND' : ''} ${column} IS NOT NULL
+      AND TRIM(${column}) != ''
+    ORDER BY ${column} ASC
+  `).all(...(shopScoped ? [shop] : []));
+  rows.forEach((row) => addKnownUser(users, row.userName));
+}
+
 module.exports = {
   /**
    * Save session for a shop
@@ -1041,6 +1091,43 @@ module.exports = {
       expires: row.expires ? new Date(row.expires) : null,
       associated_user: row.associatedUser ? JSON.parse(row.associatedUser) : null,
     }));
+  },
+
+  listKnownUsers({ shop } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const users = new Map();
+    const sessionRows = normalizedShop
+      ? db.prepare('SELECT associatedUser FROM sessions WHERE shop = ?').all(normalizedShop)
+      : db.prepare('SELECT associatedUser FROM sessions').all();
+    sessionRows.forEach((row) => addKnownSessionUser(users, row.associatedUser));
+
+    [
+      ['waiting_qc_events', 'staff', false],
+      ['wholesale_build_events', 'staff', true],
+      ['order_tracker_events', 'staff', true],
+      ['hyp_receiver_events', 'staff', true],
+      ['awaiting_parts_items', 'reportedBy', true],
+      ['qc_fail_reasons', 'reportedBy', true],
+      ['qc_fail_reasons', 'builtBy', true],
+      ['print_queue_items', 'createdBy', true],
+      ['order_flow_snoozes', 'snoozedBy', true],
+      ['order_flow_snoozes', 'deletedBy', true],
+      ['maintenance_task_templates', 'assignedTo', true],
+      ['maintenance_task_templates', 'createdBy', true],
+      ['maintenance_task_templates', 'updatedBy', true],
+      ['maintenance_scheduled_instances', 'assignedToSnapshot', true],
+      ['maintenance_scheduled_instances', 'skippedBy', true],
+      ['maintenance_completion_records', 'completedBy', true],
+      ['maintenance_faults', 'reportedBy', true],
+      ['maintenance_faults', 'assignedTo', true],
+      ['maintenance_faults', 'resolvedBy', true],
+      ['maintenance_corrective_tasks', 'assignedTo', true],
+      ['maintenance_corrective_tasks', 'completedBy', true],
+    ].forEach(([table, column, scoped]) => {
+      addKnownUsersFromColumn(users, { table, column, shop: scoped ? normalizedShop : null });
+    });
+
+    return Array.from(users.values()).sort((left, right) => left.localeCompare(right));
   },
 
   upsertHypReceiversForOrder({

@@ -12,6 +12,7 @@ const app = express();
 // Initialize Shopify
 initShopify();
 const routes = require('./routes');
+const maintenanceRoutes = require('./maintenanceRoutes');
 
 // Middleware
 app.use(cookieParser());
@@ -30,6 +31,7 @@ const protectedEmployeePages = new Set([
   '/order_flow.html',
   '/putting_away.html',
   '/awaiting_parts.html',
+  '/maintenance.html',
   '/hyp_ar_production.html',
   '/print_queue.html',
   '/fdm_print_queue.html',
@@ -67,6 +69,7 @@ app.use(express.static(path.join(__dirname, '..', 'frontend/public')));
 
 // Use routes
 app.use(routes); // <-- correct
+app.use(maintenanceRoutes);
 
 // Fallback: serve index.html for frontend
 app.get('*', (req, res) => {

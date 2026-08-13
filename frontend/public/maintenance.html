@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Workshop Maintenance</title>
+  <link rel="stylesheet" href="css/style.css" />
+  <script src="/js/theme-secret.js" defer></script>
+</head>
+<body class="pick-list-page maintenance-page">
+  <main class="pick-list-layout maintenance-layout">
+    <header class="pick-list-topbar">
+      <div class="pick-list-link-row">
+        <a href="/pick_list.html" class="pick-list-link">Order Viewer</a>
+        <a href="/order_flow.html" class="pick-list-link">Monitor</a>
+        <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts</a>
+        <a href="/hyp_ar_production.html" class="pick-list-link">HYP-AR</a>
+        <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
+        <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
+      </div>
+      <h1>Workshop Maintenance</h1>
+    </header>
+
+    <section class="maintenance-controls">
+      <div class="maintenance-controls__head">
+        <div>
+          <p class="maintenance-eyebrow">Workshop Maintenance</p>
+          <p id="maintenanceUpdated" class="maintenance-muted">Waiting for first load.</p>
+        </div>
+        <div class="maintenance-actions">
+          <label for="maintenanceDate">Date</label>
+          <input id="maintenanceDate" type="date" />
+          <span id="maintenanceSpinner" class="loader" style="display:none;"></span>
+          <button id="maintenanceRefreshBtn" type="button">Refresh</button>
+        </div>
+      </div>
+      <p id="maintenanceStatus" class="maintenance-status" data-type="info">Ready.</p>
+      <div class="maintenance-tabs" role="tablist" aria-label="Maintenance sections">
+        <button type="button" class="maintenance-tab is-active" data-maintenance-tab="machine">Run Machine</button>
+        <button type="button" class="maintenance-tab" data-maintenance-tab="dashboard">Dashboard</button>
+        <button type="button" class="maintenance-tab" data-maintenance-tab="calendar">Calendar</button>
+        <button type="button" class="maintenance-tab" data-maintenance-tab="assets">Equipment</button>
+        <button type="button" class="maintenance-tab" data-maintenance-tab="templates">Manage Instructions</button>
+        <button type="button" class="maintenance-tab" data-maintenance-tab="faults">Faults</button>
+        <button type="button" class="maintenance-tab" data-maintenance-tab="reports">Reports</button>
+        <button type="button" class="maintenance-tab" data-maintenance-tab="settings">Settings</button>
+      </div>
+    </section>
+
+    <section id="maintenancePanelMachine" class="maintenance-panel is-active" data-maintenance-panel="machine">
+      <div class="maintenance-machine-layout">
+        <section class="maintenance-card maintenance-machine-picker-card">
+          <label class="maintenance-machine-picker" for="maintenanceMachineSelect">
+            <span>Machine</span>
+            <select id="maintenanceMachineSelect"></select>
+          </label>
+        </section>
+        <section class="maintenance-card">
+          <div id="maintenanceMachineTasks"></div>
+        </section>
+      </div>
+    </section>
+
+    <section id="maintenancePanelDashboard" class="maintenance-panel" data-maintenance-panel="dashboard">
+      <div id="maintenanceSummary" class="maintenance-summary-grid"></div>
+      <section class="maintenance-card">
+        <div class="maintenance-card__head maintenance-card__head--task-tabs">
+          <h2 class="pick-list-section-title">Tasks</h2>
+          <div class="maintenance-dashboard-task-actions">
+            <div class="maintenance-dashboard-task-tabs" role="tablist" aria-label="Dashboard task status">
+              <button type="button" class="is-active" data-dashboard-task-view="due_today">
+                Due Today <span id="maintenanceDueTodayCount">0</span>
+              </button>
+              <button type="button" data-dashboard-task-view="overdue">
+                Overdue <span id="maintenanceOverdueCount">0</span>
+              </button>
+            </div>
+            <div class="maintenance-dashboard-task-bulk-actions">
+              <button id="maintenanceClearOverdueDailyBtn" type="button" class="maintenance-small-btn maintenance-small-btn--danger" data-clear-overdue-daily disabled>
+                Clear Overdue Daily
+              </button>
+            </div>
+          </div>
+        </div>
+        <div id="maintenanceDashboardTaskList"></div>
+      </section>
+      <div class="maintenance-two-col">
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Equipment Daily Progress</h2>
+          </div>
+          <div id="maintenanceProgress"></div>
+        </section>
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Upcoming</h2>
+          </div>
+          <div id="maintenanceUpcoming"></div>
+        </section>
+      </div>
+      <section class="maintenance-card">
+        <div class="maintenance-card__head">
+          <h2 class="pick-list-section-title">Recently Completed</h2>
+        </div>
+        <div id="maintenanceRecent"></div>
+      </section>
+    </section>
+
+    <section id="maintenancePanelCalendar" class="maintenance-panel" data-maintenance-panel="calendar">
+      <section class="maintenance-card">
+        <div class="maintenance-card__head">
+          <h2 class="pick-list-section-title">Calendar</h2>
+          <div class="maintenance-view-toggle">
+            <button type="button" class="is-active" data-maintenance-view="month">Month</button>
+            <button type="button" data-maintenance-view="week">Week</button>
+            <button type="button" data-maintenance-view="day">Day</button>
+          </div>
+        </div>
+        <div class="maintenance-filter-row">
+          <select id="maintenanceFilterAsset"></select>
+          <select id="maintenanceFilterType"></select>
+          <select id="maintenanceFilterFrequency"></select>
+          <select id="maintenanceFilterStatus"></select>
+        </div>
+        <div id="maintenanceCalendar"></div>
+      </section>
+    </section>
+
+    <section id="maintenancePanelWork" class="maintenance-panel" data-maintenance-panel="work">
+      <section class="maintenance-card">
+        <div class="maintenance-card__head">
+          <h2 class="pick-list-section-title">Maintenance Task</h2>
+        </div>
+        <div id="maintenanceTaskDetail" class="maintenance-task-detail">
+          <p class="pick-list-empty">Select a scheduled maintenance task from the dashboard or calendar.</p>
+        </div>
+      </section>
+    </section>
+
+    <section id="maintenancePanelAssets" class="maintenance-panel" data-maintenance-panel="assets">
+      <div class="maintenance-two-col maintenance-two-col--wide-left">
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Equipment</h2>
+          </div>
+          <div id="maintenanceAssetList"></div>
+        </section>
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Equipment Editor</h2>
+          </div>
+          <form id="maintenanceAssetForm" class="maintenance-form"></form>
+        </section>
+      </div>
+      <section class="maintenance-card">
+        <div class="maintenance-card__head">
+          <h2 class="pick-list-section-title">Equipment History</h2>
+        </div>
+        <div id="maintenanceAssetHistory"></div>
+      </section>
+    </section>
+
+    <section id="maintenancePanelTemplates" class="maintenance-panel" data-maintenance-panel="templates">
+      <div class="maintenance-two-col maintenance-two-col--wide-left">
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Manage Instructions</h2>
+          </div>
+          <div id="maintenanceTemplateList"></div>
+        </section>
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Instruction Editor</h2>
+          </div>
+          <form id="maintenanceTemplateForm" class="maintenance-form"></form>
+        </section>
+      </div>
+    </section>
+
+    <section id="maintenancePanelFaults" class="maintenance-panel" data-maintenance-panel="faults">
+      <div class="maintenance-two-col maintenance-two-col--wide-left">
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Faults</h2>
+          </div>
+          <div id="maintenanceFaultList"></div>
+        </section>
+        <section class="maintenance-card">
+          <div class="maintenance-card__head">
+            <h2 class="pick-list-section-title">Report Fault</h2>
+          </div>
+          <form id="maintenanceFaultForm" class="maintenance-form"></form>
+        </section>
+      </div>
+      <section class="maintenance-card">
+        <div class="maintenance-card__head">
+          <h2 class="pick-list-section-title">Corrective Maintenance</h2>
+        </div>
+        <div id="maintenanceCorrectiveList"></div>
+      </section>
+    </section>
+
+    <section id="maintenancePanelReports" class="maintenance-panel" data-maintenance-panel="reports">
+      <section class="maintenance-card">
+        <div class="maintenance-card__head">
+          <h2 class="pick-list-section-title">Management Dashboard</h2>
+        </div>
+        <div id="maintenanceReports"></div>
+      </section>
+    </section>
+
+    <section id="maintenancePanelSettings" class="maintenance-panel" data-maintenance-panel="settings">
+      <section class="maintenance-card">
+        <div class="maintenance-card__head">
+          <h2 class="pick-list-section-title">Notifications</h2>
+        </div>
+        <form id="maintenanceNotificationForm" class="maintenance-form"></form>
+      </section>
+    </section>
+  </main>
+
+  <script src="/js/auth-guard.js"></script>
+  <script src="/js/employee-shell.js"></script>
+  <script src="js/maintenance.js"></script>
+</body>
+</html>

@@ -3,4 +3,5 @@ node_modules
 sessions.sqlite
 *.sqlite
 backend/tmp/
+backend/uploads/
 .DS_Store
