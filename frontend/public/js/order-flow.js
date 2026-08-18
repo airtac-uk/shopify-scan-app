@@ -6,6 +6,7 @@ const ORDER_FLOW_EXCEPTION_STACKS = {
   wholesale: { label: 'Wholesale', verb: 'Moving to Wholesale' },
   proto: { label: 'Proto', verb: 'Moving to Proto' },
 };
+const ORDER_FLOW_HIDDEN_FULFILLMENT_STATUSES = new Set(['ON_HOLD']);
 const ORDER_FLOW_OPERATIONAL_STAGE_LABELS = {
   received: 'New Order',
   queued: 'Racked',
@@ -281,15 +282,31 @@ function normalizeOrderFlowStackKey(value) {
   return ORDER_FLOW_EXCEPTION_STACKS[normalized] ? normalized : '';
 }
 
+function normalizeOrderFlowFulfillmentStatus(value) {
+  return String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[-\s]+/g, '_');
+}
+
+function isOrderFlowFulfillmentHidden(value) {
+  return ORDER_FLOW_HIDDEN_FULFILLMENT_STATUSES.has(normalizeOrderFlowFulfillmentStatus(value));
+}
+
+function getVisibleOrderFlowIssues(issues) {
+  return (Array.isArray(issues) ? issues : [])
+    .filter((issue) => !isOrderFlowFulfillmentHidden(issue?.fulfillmentStatus));
+}
+
 function getStackIssues(stackKey) {
   const normalizedStackKey = normalizeOrderFlowStackKey(stackKey);
   if (!normalizedStackKey) return [];
 
   const stack = orderFlowData?.exceptionStacks?.[normalizedStackKey];
-  if (Array.isArray(stack?.issues)) return stack.issues;
+  if (Array.isArray(stack?.issues)) return getVisibleOrderFlowIssues(stack.issues);
 
   if (normalizedStackKey === 'snoozed' && Array.isArray(orderFlowData?.snoozed?.issues)) {
-    return orderFlowData.snoozed.issues;
+    return getVisibleOrderFlowIssues(orderFlowData.snoozed.issues);
   }
 
   return [];
@@ -304,7 +321,7 @@ function getStackCount(stackKey) {
 }
 
 function getAllRenderedIssues() {
-  const issues = Array.isArray(orderFlowData?.issues) ? orderFlowData.issues : [];
+  const issues = getVisibleOrderFlowIssues(orderFlowData?.issues);
   const stackedIssues = getOrderFlowStackKeys().flatMap((stackKey) => getStackIssues(stackKey));
   return [...issues, ...stackedIssues];
 }
@@ -317,7 +334,7 @@ function findIssueByKey(issueKey) {
 }
 
 function getFilteredIssues() {
-  const issues = Array.isArray(orderFlowData?.issues) ? orderFlowData.issues : [];
+  const issues = getVisibleOrderFlowIssues(orderFlowData?.issues);
   const stackFilterKey = normalizeOrderFlowStackKey(orderFlowActiveFilter);
   if (orderFlowActiveFilter === 'all') return issues;
   if (stackFilterKey) return getStackIssues(stackFilterKey);
@@ -381,7 +398,7 @@ function renderScanSummary() {
 function renderFilters() {
   const container = document.getElementById('orderFlowFilters');
   if (!container) return;
-  const issues = Array.isArray(orderFlowData?.issues) ? orderFlowData.issues : [];
+  const issues = getVisibleOrderFlowIssues(orderFlowData?.issues);
   const staleStageCounts = issues
     .filter((issue) => issue.type === 'stale_stage')
     .reduce((acc, issue) => {
@@ -444,7 +461,11 @@ function renderFilters() {
 }
 
 function getOrderGridOrders() {
-  return Array.isArray(orderFlowData?.orders) ? orderFlowData.orders : [];
+  return (Array.isArray(orderFlowData?.orders) ? orderFlowData.orders : [])
+    .filter((order) => (
+      String(order?.issueStack || '').trim() !== 'snoozed'
+      && !isOrderFlowFulfillmentHidden(order?.fulfillmentStatus)
+    ));
 }
 
 function getOrderGridAgeLevel(order) {
@@ -482,6 +503,43 @@ function getOrderGridKey(order) {
   return String(order?.orderId || getOrderGridLookup(order)).trim();
 }
 
+function getOrderGridMarkers(order) {
+  const markers = Array.isArray(order?.markers) ? order.markers : [];
+  if (markers.length) {
+    return markers
+      .map((marker) => ({
+        key: String(marker?.key || '').trim(),
+        code: String(marker?.code || '').trim().slice(0, 1).toUpperCase(),
+        label: String(marker?.label || '').trim(),
+      }))
+      .filter((marker) => marker.key && marker.code);
+  }
+
+  return [
+    order?.isWholesale ? { key: 'wholesale', code: 'W', label: 'Wholesale' } : null,
+    order?.isHypAr ? { key: 'hyp_ar', code: 'H', label: 'HYP-AR' } : null,
+  ].filter(Boolean);
+}
+
+function getOrderGridMarkerCode(order) {
+  return getOrderGridMarkers(order)
+    .map((marker) => marker.code)
+    .join('');
+}
+
+function getOrderGridMarkerLabel(order) {
+  return getOrderGridMarkers(order)
+    .map((marker) => marker.label || marker.code)
+    .filter(Boolean)
+    .join(' / ');
+}
+
+function hasOrderGridMarker(order, markerKey) {
+  const normalizedMarkerKey = String(markerKey || '').trim();
+  return Boolean(normalizedMarkerKey) && getOrderGridMarkers(order)
+    .some((marker) => marker.key === normalizedMarkerKey);
+}
+
 function formatOrderGridTitle(order) {
   const orderLabel = order?.orderNumber || order?.barcode || 'Unknown order';
   const stageLabel = getOperationalStageLabel(order?.currentStage?.key, order?.currentStage?.label);
@@ -489,7 +547,9 @@ function formatOrderGridTitle(order) {
   const idleLabel = order?.idleWorkingDays == null ? '-' : formatWorkingDays(order.idleWorkingDays);
   const stateLabel = getOrderGridAgeLabel(order);
   const issueLabel = order?.issueReason ? ` ${order.issueReason}` : '';
-  return `${orderLabel} - ${stageLabel} - ${stateLabel}. Order age ${ageLabel}. Stage age ${idleLabel}.${issueLabel}`;
+  const markerLabel = getOrderGridMarkerLabel(order);
+  const markerText = markerLabel ? ` (${markerLabel})` : '';
+  return `${orderLabel}${markerText} - ${stageLabel} - ${stateLabel}. Order age ${ageLabel}. Stage age ${idleLabel}.${issueLabel}`;
 }
 
 function renderOrderGridLegend() {
@@ -527,6 +587,7 @@ function renderOrderGridPreview(order = null) {
   const issueSeverity = String(order.issueSeverity || '').trim();
   const issueReason = String(order.issueReason || '').trim();
   const issueStack = String(order.issueStack || '').trim();
+  const markerLabel = getOrderGridMarkerLabel(order);
   const viewerUrl = buildOrderViewerUrl(order);
 
   container.innerHTML = `
@@ -551,6 +612,7 @@ function renderOrderGridPreview(order = null) {
       ${orderValueLabel ? `<span>Value <strong>${escapeHtml(orderValueLabel)}</strong></span>` : ''}
       ${order.itemCount ? `<span>Items <strong>${escapeHtml(order.itemCount)}</strong></span>` : ''}
       ${staffLabel ? `<span>Last staff <strong>${escapeHtml(staffLabel)}</strong></span>` : ''}
+      ${markerLabel ? `<span>Marker <strong>${escapeHtml(markerLabel)}</strong></span>` : ''}
     </div>
     ${itemTitle ? `<p class="order-flow-grid-preview__item">${escapeHtml(itemTitle)}</p>` : ''}
     <a class="order-flow-grid-preview__open" href="${escapeHtmlAttribute(viewerUrl)}" target="_blank" rel="noopener noreferrer">Open order</a>
@@ -586,10 +648,12 @@ function renderOrderGrid() {
     const stageLabel = getOperationalStageLabel(stageKey, order?.currentStage?.label);
     const level = getOrderGridAgeLevel(order);
     const orderKey = getOrderGridKey(order);
+    const markerCode = getOrderGridMarkerCode(order);
+    const isHypAr = hasOrderGridMarker(order, 'hyp_ar');
     const isActive = orderKey === orderFlowActiveGridOrderId;
     return `
       <a
-        class="order-flow-grid-cell order-flow-grid-cell--${escapeHtmlAttribute(level)}${isActive ? ' is-active' : ''}"
+        class="order-flow-grid-cell order-flow-grid-cell--${escapeHtmlAttribute(level)}${isHypAr ? ' order-flow-grid-cell--hyp-ar' : ''}${isActive ? ' is-active' : ''}"
         href="${escapeHtmlAttribute(buildOrderViewerUrl(order))}"
         target="_blank"
         rel="noopener noreferrer"
@@ -598,6 +662,7 @@ function renderOrderGrid() {
         data-order-grid-key="${escapeHtmlAttribute(orderKey)}"
         data-order-stage="${escapeHtmlAttribute(stageKey)}"
       >
+        ${markerCode ? `<span class="order-flow-grid-cell__marker">${escapeHtml(markerCode)}</span>` : ''}
         <span class="order-flow-grid-cell__dot"></span>
         <span class="order-flow-grid-cell__sr">${escapeHtml(order.orderNumber || order.barcode || stageLabel)}</span>
       </a>

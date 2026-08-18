@@ -388,6 +388,7 @@ const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOC
 const SHIPPING_ALLOWED_FINANCIAL_STATUSES = new Set(['PAID', 'PARTIALLY_REFUNDED']);
 const SHIPPING_LABEL_PURCHASE_STAGE_KEYS = new Set(['packaged', 'fulfilled', 'partially_fulfilled']);
 const ORDER_FLOW_TERMINAL_WORKFLOW_STATUSES = new Set(['FULFILLED', 'RESTOCKED', 'CANCELLED']);
+const ORDER_FLOW_HIDDEN_SHOPIFY_FULFILLMENT_STATUSES = new Set(['ON_HOLD']);
 const ORDER_FLOW_DEFAULT_NEW_ORDER_WORKING_DAYS = 1;
 const ORDER_FLOW_DEFAULT_STAGE_THRESHOLD_WORKING_DAYS = 1;
 const ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS = {
@@ -425,6 +426,21 @@ const ORDER_WORKFLOW_STATUS_FIELDS = `
                 shopMoney {
                   amount
                   currencyCode
+                }
+              }
+`;
+const ORDER_FLOW_PURCHASING_ENTITY_FIELD = `
+              purchasingEntity {
+                __typename
+                ... on PurchasingCompany {
+                  company {
+                    id
+                    name
+                  }
+                  location {
+                    id
+                    name
+                  }
                 }
               }
 `;
@@ -1198,17 +1214,24 @@ function summarizeOrderFlowShopifyOrder(order) {
   const itemCount = Number.isFinite(orderLevelItemCount)
     ? Math.max(0, orderLevelItemCount)
     : getOrderFlowLineItemCount(lineItems);
+  const tags = normalizeOrderTags(order.tags);
+  const normalizedTags = tags.map((tag) => tag.toLowerCase());
+  const isWholesale = Boolean(buildWholesaleOrderWarning(order))
+    || normalizedTags.includes('wholesale');
+  const isHypAr = buildHypArReceiverUnits(lineItems).length > 0;
   return {
     id: String(order.id || '').trim(),
     orderNumber: String(order.name || '').trim(),
     barcode: normalizeScanBarcode(order.name || ''),
     createdAt: order.createdAt || '',
     updatedAt: order.updatedAt || '',
-    tags: normalizeOrderTags(order.tags),
+    tags,
     financialStatus: String(order.displayFinancialStatus || '').trim(),
     fulfillmentStatus: String(order.displayFulfillmentStatus || '').trim(),
     cancelledAt: order.cancelledAt || null,
     cancelReason: String(order.cancelReason || '').trim(),
+    isWholesale,
+    isHypAr,
     itemCount,
     orderValue,
     firstItemTitle: getOrderFlowFirstItemTitle(lineItems),
@@ -1216,7 +1239,12 @@ function summarizeOrderFlowShopifyOrder(order) {
   };
 }
 
-async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100 } = {}) {
+async function listOrderFlowOpenOrders({
+  client,
+  maxOrders = 500,
+  pageSize = 100,
+  includePurchasingEntity = true,
+} = {}) {
   const safeMaxOrders = Math.max(1, Math.min(1000, Math.floor(Number(maxOrders) || 500)));
   const safePageSize = Math.max(1, Math.min(250, Math.floor(Number(pageSize) || 100)));
   const query = `
@@ -1231,24 +1259,8 @@ async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100
             updatedAt
             tags
             ${ORDER_WORKFLOW_STATUS_FIELDS}
-            lineItems(first: 10) {
-              edges {
-                node {
-                  id
-                  title
-                  sku
-                  quantity
-                  currentQuantity
-                  variantTitle
-                  product {
-                    id
-                  }
-                  variant {
-                    barcode
-                  }
-                }
-              }
-            }
+            ${includePurchasingEntity ? ORDER_FLOW_PURCHASING_ENTITY_FIELD : ''}
+            ${getHypArOrderLineItemFields()}
           }
         }
         pageInfo {
@@ -1267,12 +1279,25 @@ async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100
 
   while (hasNextPage && orders.length < safeMaxOrders) {
     const first = Math.min(safePageSize, safeMaxOrders - orders.length);
-    const response = await client.graphql(query, {
-      variables: {
-        first,
-        after,
-      },
-    });
+    let response;
+    try {
+      response = await client.graphql(query, {
+        variables: {
+          first,
+          after,
+        },
+      });
+    } catch (err) {
+      if (includePurchasingEntity && includesMissingPurchasingEntityFieldError(err)) {
+        return listOrderFlowOpenOrders({
+          client,
+          maxOrders: safeMaxOrders,
+          pageSize: safePageSize,
+          includePurchasingEntity: false,
+        });
+      }
+      throw err;
+    }
     pagesFetched += 1;
 
     const connection = response.data?.orders || {};
@@ -1297,7 +1322,12 @@ async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100
   };
 }
 
-async function listOrderFlowOrdersByIds({ client, orderIds = [], chunkSize = 50 } = {}) {
+async function listOrderFlowOrdersByIds({
+  client,
+  orderIds = [],
+  chunkSize = 50,
+  includePurchasingEntity = true,
+} = {}) {
   const ids = Array.from(new Set(
     (Array.isArray(orderIds) ? orderIds : [])
       .map((orderId) => String(orderId || '').trim())
@@ -1316,24 +1346,8 @@ async function listOrderFlowOrdersByIds({ client, orderIds = [], chunkSize = 50 
           updatedAt
           tags
           ${ORDER_WORKFLOW_STATUS_FIELDS}
-          lineItems(first: 10) {
-            edges {
-              node {
-                id
-                title
-                sku
-                quantity
-                currentQuantity
-                variantTitle
-                product {
-                  id
-                }
-                variant {
-                  barcode
-                }
-              }
-            }
-          }
+          ${includePurchasingEntity ? ORDER_FLOW_PURCHASING_ENTITY_FIELD : ''}
+          ${getHypArOrderLineItemFields()}
         }
       }
     }
@@ -1342,11 +1356,24 @@ async function listOrderFlowOrdersByIds({ client, orderIds = [], chunkSize = 50 
 
   for (let index = 0; index < ids.length; index += safeChunkSize) {
     const chunk = ids.slice(index, index + safeChunkSize);
-    const response = await client.graphql(query, {
-      variables: {
-        ids: chunk,
-      },
-    });
+    let response;
+    try {
+      response = await client.graphql(query, {
+        variables: {
+          ids: chunk,
+        },
+      });
+    } catch (err) {
+      if (includePurchasingEntity && includesMissingPurchasingEntityFieldError(err)) {
+        return listOrderFlowOrdersByIds({
+          client,
+          orderIds: ids,
+          chunkSize: safeChunkSize,
+          includePurchasingEntity: false,
+        });
+      }
+      throw err;
+    }
     const nodes = Array.isArray(response.data?.nodes) ? response.data.nodes : [];
     nodes.forEach((node) => {
       const order = summarizeOrderFlowShopifyOrder(node);
@@ -1369,6 +1396,20 @@ function isOrderFlowShopifyOrderTerminal(order) {
     .trim()
     .toUpperCase();
   return ORDER_FLOW_TERMINAL_WORKFLOW_STATUSES.has(fulfillmentStatus);
+}
+
+function normalizeOrderFlowShopifyFulfillmentStatus(value) {
+  return String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[-\s]+/g, '_');
+}
+
+function isOrderFlowShopifyOrderHidden(order) {
+  const fulfillmentStatus = normalizeOrderFlowShopifyFulfillmentStatus(
+    order?.fulfillmentStatus || order?.displayFulfillmentStatus
+  );
+  return ORDER_FLOW_HIDDEN_SHOPIFY_FULFILLMENT_STATUSES.has(fulfillmentStatus);
 }
 
 function syncOrderFlowTerminalTracker({ shop, tracker, shopifyOrder }) {
@@ -1505,6 +1546,34 @@ function getOrderFlowGridOrderSortValue(order = {}) {
   return String(order?.orderNumber || order?.barcode || order?.orderId || '').trim();
 }
 
+function buildOrderFlowGridMarkers({ shopifyOrder = null, tracker = null, issue = null } = {}) {
+  const trackerLineItems = Array.isArray(tracker?.lineItems) ? tracker.lineItems : [];
+  const issueStackKey = normalizeOrderFlowExceptionStack(issue?.exceptionStack?.key);
+  const isWholesale = Boolean(shopifyOrder?.isWholesale)
+    || issueStackKey === 'wholesale';
+  const isHypAr = Boolean(shopifyOrder?.isHypAr)
+    || buildHypArReceiverUnits(trackerLineItems).length > 0;
+  const markers = [];
+
+  if (isWholesale) {
+    markers.push({
+      key: 'wholesale',
+      code: 'W',
+      label: 'Wholesale',
+    });
+  }
+
+  if (isHypAr) {
+    markers.push({
+      key: 'hyp_ar',
+      code: 'H',
+      label: 'HYP-AR',
+    });
+  }
+
+  return markers;
+}
+
 function buildOrderFlowGridOrder({
   shopifyOrder = null,
   tracker = null,
@@ -1536,6 +1605,11 @@ function buildOrderFlowGridOrder({
   const tags = Array.from(new Set([
     ...normalizeOrderTags(shopifyOrder?.tags),
   ])).sort((left, right) => left.localeCompare(right));
+  const markers = buildOrderFlowGridMarkers({
+    shopifyOrder,
+    tracker,
+    issue,
+  });
 
   if (!orderId && !barcode) return null;
 
@@ -1556,6 +1630,9 @@ function buildOrderFlowGridOrder({
     issueSeverity: issue?.severity || null,
     issueReason: issue?.reason || '',
     issueStack: issue?.exceptionStack?.key || null,
+    markers,
+    isWholesale: markers.some((marker) => marker.key === 'wholesale'),
+    isHypAr: markers.some((marker) => marker.key === 'hyp_ar'),
     trackerExists: Boolean(tracker),
     shopifyOpen: Boolean(shopifyOrder),
     source,
@@ -1605,7 +1682,15 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
     maxOrders: maxOpenOrders,
     pageSize: query.pageSize,
   });
-  const openOrders = openOrderResult.orders;
+  const allOpenOrders = openOrderResult.orders;
+  const hiddenShopifyOrderIds = new Set(
+    allOpenOrders
+      .filter(isOrderFlowShopifyOrderHidden)
+      .map((order) => String(order.id || '').trim())
+      .filter(Boolean)
+  );
+  const openOrders = allOpenOrders.filter((order) => !hiddenShopifyOrderIds.has(String(order.id || '').trim()));
+  const allOpenOrdersById = new Map(allOpenOrders.map((order) => [order.id, order]));
   const openOrdersById = new Map(openOrders.map((order) => [order.id, order]));
   const trackers = sessionsStore.listOrderTrackers({
     shop,
@@ -1615,7 +1700,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
   const trackersByOrderId = new Map(trackers.map((tracker) => [String(tracker.orderId || '').trim(), tracker]));
   const trackerOrderIdsMissingFromOpenOrders = trackers
     .map((tracker) => String(tracker.orderId || '').trim())
-    .filter((orderId) => orderId && !openOrdersById.has(orderId));
+    .filter((orderId) => orderId && !allOpenOrdersById.has(orderId));
   let trackedShopifyOrders = [];
   if (trackerOrderIdsMissingFromOpenOrders.length) {
     try {
@@ -1627,7 +1712,17 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       console.error('Order Flow tracker status refresh failed:', err);
     }
   }
-  const trackedShopifyOrdersById = new Map(trackedShopifyOrders.map((order) => [order.id, order]));
+  trackedShopifyOrders
+    .filter(isOrderFlowShopifyOrderHidden)
+    .forEach((order) => {
+      const orderId = String(order.id || '').trim();
+      if (orderId) hiddenShopifyOrderIds.add(orderId);
+    });
+  const trackedShopifyOrdersById = new Map(
+    trackedShopifyOrders
+      .filter((order) => !hiddenShopifyOrderIds.has(String(order.id || '').trim()))
+      .map((order) => [order.id, order])
+  );
   const terminalTrackerOrderIds = new Set();
   const issues = [];
   const issueKeys = new Set();
@@ -1707,7 +1802,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
 
   trackers.forEach((tracker) => {
     const orderId = String(tracker?.orderId || '').trim();
-    if (!orderId || openOrdersById.has(orderId) || isOrderFlowTrackerTerminal(tracker)) {
+    if (!orderId || hiddenShopifyOrderIds.has(orderId) || openOrdersById.has(orderId) || isOrderFlowTrackerTerminal(tracker)) {
       return;
     }
 
@@ -1740,14 +1835,14 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
 
   const stageCounts = trackers.reduce((acc, tracker) => {
     const orderId = String(tracker?.orderId || '').trim();
-    if (!tracker?.currentStageKey || terminalTrackerOrderIds.has(orderId) || isOrderFlowTrackerTerminal(tracker)) return acc;
+    if (!tracker?.currentStageKey || hiddenShopifyOrderIds.has(orderId) || terminalTrackerOrderIds.has(orderId) || isOrderFlowTrackerTerminal(tracker)) return acc;
     const key = String(tracker.currentStageKey);
     acc[key] = (acc[key] || 0) + 1;
     return acc;
   }, {});
   const activeTrackerCount = trackers.filter((tracker) => {
     const orderId = String(tracker?.orderId || '').trim();
-    return orderId && !terminalTrackerOrderIds.has(orderId) && !isOrderFlowTrackerTerminal(tracker);
+    return orderId && !hiddenShopifyOrderIds.has(orderId) && !terminalTrackerOrderIds.has(orderId) && !isOrderFlowTrackerTerminal(tracker);
   }).length;
   const snoozesByIssueKey = new Map(
     sessionsStore.listOrderFlowSnoozes({ shop, includeDeleted: true })
@@ -1819,7 +1914,10 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
   const addGridOrder = ({ shopifyOrder = null, tracker = null, source = 'shopify' } = {}) => {
     const orderId = String(shopifyOrder?.id || tracker?.orderId || '').trim();
     if (!orderId || gridOrderIds.has(orderId)) return;
+    if (hiddenShopifyOrderIds.has(orderId) || isOrderFlowShopifyOrderHidden(shopifyOrder)) return;
     const issue = issueByOrderId.get(orderId) || null;
+    const issueStackKey = String(issue?.exceptionStack?.key || '').trim();
+    if (issueStackKey && normalizeOrderFlowExceptionStack(issueStackKey) === 'snoozed') return;
     const gridOrder = buildOrderFlowGridOrder({
       shopifyOrder,
       tracker,
@@ -1848,6 +1946,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
     if (
       !orderId
       || gridOrderIds.has(orderId)
+      || hiddenShopifyOrderIds.has(orderId)
       || terminalTrackerOrderIds.has(orderId)
       || isOrderFlowTrackerTerminal(tracker)
     ) {
