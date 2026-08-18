@@ -47,6 +47,7 @@ let orderFlowLoading = false;
 let orderFlowPollId = null;
 let orderFlowData = null;
 let orderFlowActiveFilter = 'all';
+let orderFlowActiveGridOrderId = '';
 
 function escapeHtml(value) {
   return String(value || '')
@@ -442,6 +443,185 @@ function renderFilters() {
   });
 }
 
+function getOrderGridOrders() {
+  return Array.isArray(orderFlowData?.orders) ? orderFlowData.orders : [];
+}
+
+function getOrderGridAgeLevel(order) {
+  const severity = String(order?.issueSeverity || '').trim();
+  if (severity === 'critical') return 'critical';
+  if (severity === 'warning') return 'warning';
+
+  const ratio = Number(order?.ageRatio || 0);
+  if (ratio >= 1) return 'warning';
+  if (ratio >= 0.66) return 'aging';
+  if (ratio >= 0.33) return 'active';
+  return 'fresh';
+}
+
+function getOrderGridAgeLabel(order) {
+  switch (getOrderGridAgeLevel(order)) {
+    case 'critical':
+      return 'Critical';
+    case 'warning':
+      return 'Over limit';
+    case 'aging':
+      return 'Approaching limit';
+    case 'active':
+      return 'In progress';
+    default:
+      return 'Fresh';
+  }
+}
+
+function getOrderGridLookup(order) {
+  return String(order?.barcode || order?.orderNumber || order?.orderId || '').trim();
+}
+
+function getOrderGridKey(order) {
+  return String(order?.orderId || getOrderGridLookup(order)).trim();
+}
+
+function formatOrderGridTitle(order) {
+  const orderLabel = order?.orderNumber || order?.barcode || 'Unknown order';
+  const stageLabel = getOperationalStageLabel(order?.currentStage?.key, order?.currentStage?.label);
+  const ageLabel = order?.ageWorkingDays == null ? '-' : formatWorkingDays(order.ageWorkingDays);
+  const idleLabel = order?.idleWorkingDays == null ? '-' : formatWorkingDays(order.idleWorkingDays);
+  const stateLabel = getOrderGridAgeLabel(order);
+  const issueLabel = order?.issueReason ? ` ${order.issueReason}` : '';
+  return `${orderLabel} - ${stageLabel} - ${stateLabel}. Order age ${ageLabel}. Stage age ${idleLabel}.${issueLabel}`;
+}
+
+function renderOrderGridLegend() {
+  const container = document.getElementById('orderFlowGridLegend');
+  if (!container) return;
+
+  container.innerHTML = `
+    <div class="order-flow-grid-legend__age">
+      ${['fresh', 'active', 'aging', 'warning', 'critical'].map((level) => `
+        <span class="order-flow-grid-age-swatch order-flow-grid-age-swatch--${escapeHtmlAttribute(level)}"></span>
+      `).join('')}
+      <span>Newer in stage</span>
+      <span>Older in stage / needs attention</span>
+    </div>
+  `;
+}
+
+function renderOrderGridPreview(order = null) {
+  const container = document.getElementById('orderFlowGridPreview');
+  if (!container) return;
+
+  if (!order) {
+    container.innerHTML = '<p class="order-flow-grid-preview__empty">Hover an order square to inspect it. Click to open in a new tab.</p>';
+    return;
+  }
+
+  const orderLabel = order.orderNumber || order.barcode || 'Unknown order';
+  const stageLabel = getOperationalStageLabel(order?.currentStage?.key, order?.currentStage?.label);
+  const ageLabel = order.ageWorkingDays == null ? '-' : formatWorkingDays(order.ageWorkingDays);
+  const idleLabel = order.idleWorkingDays == null ? '-' : formatWorkingDays(order.idleWorkingDays);
+  const thresholdLabel = order.thresholdWorkingDays == null ? '-' : formatWorkingDays(order.thresholdWorkingDays);
+  const orderValueLabel = formatOrderValue(order.orderValue);
+  const itemTitle = String(order.firstItemTitle || '').trim();
+  const staffLabel = String(order.lastStaff || '').trim();
+  const issueSeverity = String(order.issueSeverity || '').trim();
+  const issueReason = String(order.issueReason || '').trim();
+  const issueStack = String(order.issueStack || '').trim();
+  const viewerUrl = buildOrderViewerUrl(order);
+
+  container.innerHTML = `
+    <div class="order-flow-grid-preview__head">
+      <div>
+        <p>${escapeHtml(stageLabel)}</p>
+        <h3><a href="${escapeHtmlAttribute(viewerUrl)}" target="_blank" rel="noopener noreferrer">${escapeHtml(orderLabel)}</a></h3>
+      </div>
+      <span class="order-flow-grid-preview__state order-flow-grid-preview__state--${escapeHtmlAttribute(getOrderGridAgeLevel(order))}">
+        ${escapeHtml(getOrderGridAgeLabel(order))}
+      </span>
+    </div>
+    ${issueReason ? `<p class="order-flow-grid-preview__reason">${escapeHtml(issueReason)}</p>` : ''}
+    <div class="order-flow-grid-preview__meta">
+      <span>Order age <strong>${escapeHtml(ageLabel)}</strong></span>
+      <span>Stage age <strong>${escapeHtml(idleLabel)}</strong></span>
+      <span>Target <strong>${escapeHtml(thresholdLabel)}</strong></span>
+      ${issueSeverity ? `<span>Issue <strong>${escapeHtml(issueSeverity)}</strong></span>` : ''}
+      ${issueStack ? `<span>Stack <strong>${escapeHtml(ORDER_FLOW_EXCEPTION_STACKS[issueStack]?.label || issueStack)}</strong></span>` : ''}
+      ${order.trackerExists ? '<span>Tracker <strong>yes</strong></span>' : '<span>Tracker <strong>no</strong></span>'}
+      ${order.shopifyOpen ? '<span>Shopify <strong>open</strong></span>' : ''}
+      ${orderValueLabel ? `<span>Value <strong>${escapeHtml(orderValueLabel)}</strong></span>` : ''}
+      ${order.itemCount ? `<span>Items <strong>${escapeHtml(order.itemCount)}</strong></span>` : ''}
+      ${staffLabel ? `<span>Last staff <strong>${escapeHtml(staffLabel)}</strong></span>` : ''}
+    </div>
+    ${itemTitle ? `<p class="order-flow-grid-preview__item">${escapeHtml(itemTitle)}</p>` : ''}
+    <a class="order-flow-grid-preview__open" href="${escapeHtmlAttribute(viewerUrl)}" target="_blank" rel="noopener noreferrer">Open order</a>
+  `;
+}
+
+function renderOrderGrid() {
+  const grid = document.getElementById('orderFlowGrid');
+  const summary = document.getElementById('orderFlowGridSummary');
+  if (!grid) return;
+
+  const orders = getOrderGridOrders();
+  renderOrderGridLegend();
+
+  if (summary) {
+    const criticalCount = orders.filter((order) => getOrderGridAgeLevel(order) === 'critical').length;
+    const warningCount = orders.filter((order) => getOrderGridAgeLevel(order) === 'warning').length;
+    summary.textContent = `${orders.length} active orders shown. ${criticalCount} critical, ${warningCount} over current-stage limit.`;
+  }
+
+  if (!orders.length) {
+    grid.innerHTML = '<p class="order-flow-empty">No active orders loaded for the grid.</p>';
+    renderOrderGridPreview(null);
+    return;
+  }
+
+  const activeOrder = orders.find((order) => getOrderGridKey(order) === orderFlowActiveGridOrderId) || orders[0];
+  orderFlowActiveGridOrderId = getOrderGridKey(activeOrder);
+  renderOrderGridPreview(activeOrder);
+
+  grid.innerHTML = orders.map((order) => {
+    const stageKey = String(order?.currentStage?.key || 'unknown').trim();
+    const stageLabel = getOperationalStageLabel(stageKey, order?.currentStage?.label);
+    const level = getOrderGridAgeLevel(order);
+    const orderKey = getOrderGridKey(order);
+    const isActive = orderKey === orderFlowActiveGridOrderId;
+    return `
+      <a
+        class="order-flow-grid-cell order-flow-grid-cell--${escapeHtmlAttribute(level)}${isActive ? ' is-active' : ''}"
+        href="${escapeHtmlAttribute(buildOrderViewerUrl(order))}"
+        target="_blank"
+        rel="noopener noreferrer"
+        title="${escapeHtmlAttribute(formatOrderGridTitle(order))}"
+        aria-label="${escapeHtmlAttribute(formatOrderGridTitle(order))}"
+        data-order-grid-key="${escapeHtmlAttribute(orderKey)}"
+        data-order-stage="${escapeHtmlAttribute(stageKey)}"
+      >
+        <span class="order-flow-grid-cell__dot"></span>
+        <span class="order-flow-grid-cell__sr">${escapeHtml(order.orderNumber || order.barcode || stageLabel)}</span>
+      </a>
+    `;
+  }).join('');
+}
+
+function activateOrderGridCell(gridCell) {
+  if (!gridCell) return;
+
+  const orderKey = String(gridCell.getAttribute('data-order-grid-key') || '').trim();
+  if (!orderKey || orderKey === orderFlowActiveGridOrderId) return;
+
+  const order = getOrderGridOrders().find((item) => getOrderGridKey(item) === orderKey);
+  if (!order) return;
+
+  orderFlowActiveGridOrderId = orderKey;
+  document.querySelectorAll('[data-order-grid-key].is-active').forEach((cell) => {
+    cell.classList.remove('is-active');
+  });
+  gridCell.classList.add('is-active');
+  renderOrderGridPreview(order);
+}
+
 function renderIssueTags(issue) {
   const tags = Array.isArray(issue?.tags) ? issue.tags : [];
   if (!tags.length) return '';
@@ -561,6 +741,7 @@ function renderIssues() {
 
 function renderOrderFlow() {
   renderOverview();
+  renderOrderGrid();
   renderScanSummary();
   renderFilters();
   renderIssues();
@@ -736,6 +917,23 @@ document.addEventListener('DOMContentLoaded', () => {
         issueKey,
         stackButton ? stackButton.getAttribute('data-order-flow-stack-value') : ''
       );
+    });
+
+    layout.addEventListener('mouseover', (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const gridCell = target?.closest('[data-order-grid-key]');
+      if (!gridCell) return;
+
+      if (event.relatedTarget instanceof Node && gridCell.contains(event.relatedTarget)) return;
+      activateOrderGridCell(gridCell);
+    });
+
+    layout.addEventListener('focusin', (event) => {
+      const target = event.target instanceof Element ? event.target : null;
+      const gridCell = target?.closest('[data-order-grid-key]');
+      if (!gridCell) return;
+
+      activateOrderGridCell(gridCell);
     });
   }
 

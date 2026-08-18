@@ -382,6 +382,7 @@ const webhookRegistrationCheckedShops = new Set();
 const awaitingPartsSyncPromises = new Map();
 const hypArProductionSyncJobs = new Map();
 const HYP_AR_BACKGROUND_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const ALLOW_AWAITING_PARTS_NOTE_SYNC = String(process.env.ALLOW_AWAITING_PARTS_NOTE_SYNC || '').trim() === '1';
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
 const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
 const SHIPPING_ALLOWED_FINANCIAL_STATUSES = new Set(['PAID', 'PARTIALLY_REFUNDED']);
@@ -401,6 +402,7 @@ const ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS = {
   on_hold: 3,
   partially_fulfilled: 3,
 };
+const ORDER_FLOW_STAGE_SORT_ORDER = Object.keys(ORDER_FLOW_STAGE_THRESHOLDS_WORKING_DAYS);
 const ORDER_FLOW_EXCEPTION_STACK_LABELS = {
   snoozed: 'Snoozed',
   wholesale: 'Wholesale',
@@ -1210,7 +1212,7 @@ function summarizeOrderFlowShopifyOrder(order) {
     itemCount,
     orderValue,
     firstItemTitle: getOrderFlowFirstItemTitle(lineItems),
-    orderNote: stripAppOrderNoteBlocks(order.note),
+    orderNote: order.note ? stripAppOrderNoteBlocks(order.note) : '',
   };
 }
 
@@ -1227,7 +1229,6 @@ async function listOrderFlowOpenOrders({ client, maxOrders = 500, pageSize = 100
             name
             createdAt
             updatedAt
-            note
             tags
             ${ORDER_WORKFLOW_STATUS_FIELDS}
             lineItems(first: 10) {
@@ -1313,7 +1314,6 @@ async function listOrderFlowOrdersByIds({ client, orderIds = [], chunkSize = 50 
           name
           createdAt
           updatedAt
-          note
           tags
           ${ORDER_WORKFLOW_STATUS_FIELDS}
           lineItems(first: 10) {
@@ -1492,6 +1492,89 @@ function sortOrderFlowIssues(left, right) {
   if (rightAge !== leftAge) return rightAge - leftAge;
 
   return String(left.orderNumber || '').localeCompare(String(right.orderNumber || ''));
+}
+
+function getOrderFlowGridIssueRank(issue) {
+  const severity = String(issue?.severity || issue?.issueSeverity || '').trim();
+  if (severity === 'critical') return 0;
+  if (severity === 'warning') return 1;
+  return 2;
+}
+
+function getOrderFlowGridOrderSortValue(order = {}) {
+  return String(order?.orderNumber || order?.barcode || order?.orderId || '').trim();
+}
+
+function buildOrderFlowGridOrder({
+  shopifyOrder = null,
+  tracker = null,
+  issue = null,
+  nowMs,
+  newOrderWorkingDays,
+  fallbackStaleWorkingDays,
+  stageWorkingDays,
+  source = 'shopify',
+} = {}) {
+  const stage = getOrderFlowTrackerStage(tracker, shopifyOrder);
+  const trackerLineItems = Array.isArray(tracker?.lineItems) ? tracker.lineItems : [];
+  const orderId = String(shopifyOrder?.id || tracker?.orderId || '').trim();
+  const orderNumber = String(shopifyOrder?.orderNumber || tracker?.orderNumber || '').trim();
+  const barcode = normalizeScanBarcode(shopifyOrder?.barcode || tracker?.barcode || orderNumber);
+  const createdAt = shopifyOrder?.createdAt || tracker?.orderCreatedAt || null;
+  const lastEventAt = tracker?.lastEventAt || tracker?.updatedAt || shopifyOrder?.updatedAt || createdAt || null;
+  const ageWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, createdAt);
+  const idleWorkingDays = getOrderFlowElapsedWorkingDays(nowMs, lastEventAt);
+  const thresholdWorkingDays = tracker
+    ? getOrderFlowStageThresholdWorkingDays(stage.key, stageWorkingDays, fallbackStaleWorkingDays)
+    : newOrderWorkingDays;
+  const ageBasisWorkingDays = tracker
+    ? (idleWorkingDays ?? ageWorkingDays ?? 0)
+    : (ageWorkingDays ?? idleWorkingDays ?? 0);
+  const ageRatio = thresholdWorkingDays > 0
+    ? ageBasisWorkingDays / thresholdWorkingDays
+    : 0;
+  const tags = Array.from(new Set([
+    ...normalizeOrderTags(shopifyOrder?.tags),
+  ])).sort((left, right) => left.localeCompare(right));
+
+  if (!orderId && !barcode) return null;
+
+  return {
+    orderId,
+    orderNumber,
+    barcode,
+    createdAt,
+    updatedAt: tracker?.updatedAt || shopifyOrder?.updatedAt || null,
+    lastEventAt,
+    currentStage: stage,
+    ageWorkingDays: ageWorkingDays == null ? null : Number(ageWorkingDays.toFixed(2)),
+    idleWorkingDays: idleWorkingDays == null ? null : Number(idleWorkingDays.toFixed(2)),
+    thresholdWorkingDays,
+    ageRatio: Number(Math.max(0, ageRatio).toFixed(2)),
+    issueKey: issue?.issueKey || null,
+    issueType: issue?.type || null,
+    issueSeverity: issue?.severity || null,
+    issueReason: issue?.reason || '',
+    issueStack: issue?.exceptionStack?.key || null,
+    trackerExists: Boolean(tracker),
+    shopifyOpen: Boolean(shopifyOrder),
+    source,
+    tags,
+    financialStatus: String(shopifyOrder?.financialStatus || '').trim(),
+    fulfillmentStatus: String(shopifyOrder?.fulfillmentStatus || tracker?.workflowStatus || '').trim(),
+    itemCount: Math.max(0, Number(shopifyOrder?.itemCount ?? getOrderFlowLineItemCount(trackerLineItems)) || 0),
+    orderValue: shopifyOrder?.orderValue || null,
+    firstItemTitle: String(shopifyOrder?.firstItemTitle || getOrderFlowFirstItemTitle(trackerLineItems)).trim(),
+    lastStaff: getOrderFlowLatestStaff(tracker),
+  };
+}
+
+function sortOrderFlowGridOrders(left, right) {
+  return getOrderFlowGridOrderSortValue(left).localeCompare(
+    getOrderFlowGridOrderSortValue(right),
+    'en-GB',
+    { numeric: true, sensitivity: 'base' }
+  );
 }
 
 async function buildOrderFlowOverview({ client, shop, query = {} }) {
@@ -1716,6 +1799,71 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
     stack.count = stack.issues.length;
   });
 
+  const issueByOrderId = new Map();
+  const setIssueForGridOrder = (issue) => {
+    const orderId = String(issue?.orderId || '').trim();
+    if (!orderId) return;
+
+    const existing = issueByOrderId.get(orderId);
+    if (!existing || getOrderFlowGridIssueRank(issue) < getOrderFlowGridIssueRank(existing)) {
+      issueByOrderId.set(orderId, issue);
+    }
+  };
+  activeIssues.forEach(setIssueForGridOrder);
+  Object.values(exceptionStacks).forEach((stack) => {
+    (Array.isArray(stack?.issues) ? stack.issues : []).forEach(setIssueForGridOrder);
+  });
+
+  const gridOrders = [];
+  const gridOrderIds = new Set();
+  const addGridOrder = ({ shopifyOrder = null, tracker = null, source = 'shopify' } = {}) => {
+    const orderId = String(shopifyOrder?.id || tracker?.orderId || '').trim();
+    if (!orderId || gridOrderIds.has(orderId)) return;
+    const issue = issueByOrderId.get(orderId) || null;
+    const gridOrder = buildOrderFlowGridOrder({
+      shopifyOrder,
+      tracker,
+      issue,
+      nowMs,
+      newOrderWorkingDays,
+      fallbackStaleWorkingDays,
+      stageWorkingDays,
+      source,
+    });
+    if (!gridOrder) return;
+    gridOrderIds.add(orderId);
+    gridOrders.push(gridOrder);
+  };
+
+  openOrders.forEach((order) => {
+    if (!order?.id || isOrderFlowShopifyOrderTerminal(order)) return;
+    const tracker = trackersByOrderId.get(order.id) || null;
+    const trackerOrderId = String(tracker?.orderId || '').trim();
+    if (trackerOrderId && terminalTrackerOrderIds.has(trackerOrderId)) return;
+    addGridOrder({ shopifyOrder: order, tracker, source: tracker ? 'tracker' : 'shopify' });
+  });
+
+  trackers.forEach((tracker) => {
+    const orderId = String(tracker?.orderId || '').trim();
+    if (
+      !orderId
+      || gridOrderIds.has(orderId)
+      || terminalTrackerOrderIds.has(orderId)
+      || isOrderFlowTrackerTerminal(tracker)
+    ) {
+      return;
+    }
+
+    const refreshedShopifyOrder = trackedShopifyOrdersById.get(orderId) || null;
+    if (isOrderFlowShopifyOrderTerminal(refreshedShopifyOrder)) return;
+    addGridOrder({
+      shopifyOrder: refreshedShopifyOrder,
+      tracker,
+      source: refreshedShopifyOrder ? 'tracker' : 'local_tracker',
+    });
+  });
+  gridOrders.sort(sortOrderFlowGridOrders);
+
   return {
     generatedAt: nowIso,
     shop,
@@ -1748,8 +1896,10 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       protoCount: exceptionStacks.proto.count,
       openOrdersScanned: openOrders.length,
       activeTrackersScanned: activeTrackerCount,
+      gridOrderCount: gridOrders.length,
       stageCounts,
     },
+    orders: gridOrders,
     issues: activeIssues,
     exceptionStacks,
     snoozed: {
@@ -2605,6 +2755,44 @@ function normalizeTrackerOrderId(ref) {
   return '';
 }
 
+function getHypArOrderLineItemFields() {
+  return `
+    lineItems(first: 200) {
+      edges {
+        node {
+          id
+          title
+          sku
+          quantity
+          currentQuantity
+          discountedTotalSet {
+            shopMoney {
+              amount
+              currencyCode
+            }
+          }
+          originalTotalSet {
+            shopMoney {
+              amount
+              currencyCode
+            }
+          }
+          variantTitle
+          product {
+            id
+          }
+          variant {
+            barcode
+            product {
+              id
+            }
+          }
+        }
+      }
+    }
+  `;
+}
+
 async function fetchOrderForTrackerById({ client, orderId }) {
   if (!client || !orderId) {
     return null;
@@ -2620,39 +2808,7 @@ async function fetchOrderForTrackerById({ client, orderId }) {
         tags
         ${ORDER_WORKFLOW_STATUS_FIELDS}
         ${ORDER_TRACKER_METAFIELD_FIELD}
-        lineItems(first: 200) {
-          edges {
-            node {
-              id
-              title
-              sku
-              quantity
-              currentQuantity
-              discountedTotalSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-              originalTotalSet {
-                shopMoney {
-                  amount
-                  currencyCode
-                }
-              }
-              variantTitle
-              product {
-                id
-              }
-              variant {
-                barcode
-                product {
-                  id
-                }
-              }
-            }
-          }
-        }
+        ${getHypArOrderLineItemFields()}
       }
     }
   `;
@@ -2670,6 +2826,31 @@ async function fetchOrderForTrackerById({ client, orderId }) {
   }
 
   return order;
+}
+
+async function fetchHypArOrderById({ client, orderId }) {
+  if (!client || !orderId) {
+    return null;
+  }
+
+  const query = `
+    query getHypArOrderById($id: ID!) {
+      order(id: $id) {
+        id
+        name
+        createdAt
+        tags
+        ${ORDER_WORKFLOW_STATUS_FIELDS}
+        ${getHypArOrderLineItemFields()}
+      }
+    }
+  `;
+
+  const response = await client.graphql(query, {
+    variables: { id: orderId },
+  });
+
+  return response.data?.order || null;
 }
 
 async function findOrCreateTrackerRecordByOrderId({ req, orderId }) {
@@ -3146,7 +3327,6 @@ async function persistOrderTrackerSnapshot({
     orderNote: order.note,
   });
   const legacyEvents = extractTrackerEventsFromOrderNote(order.note || '');
-  const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
   const isAwaitingPartsTagged = hasAwaitingPartsTag(order.tags);
   const shouldExcludeFromAwaitingPartsQueue = shouldExcludeOrderFromAwaitingPartsQueue(order);
 
@@ -3167,9 +3347,7 @@ async function persistOrderTrackerSnapshot({
     staff,
   });
 
-  const hasOpenAwaitingParts = Array.isArray(latestAwaitingPartsSnapshot?.items)
-    && latestAwaitingPartsSnapshot.items.length > 0;
-  if (shouldExcludeFromAwaitingPartsQueue || !isAwaitingPartsTagged || !hasOpenAwaitingParts) {
+  if (shouldExcludeFromAwaitingPartsQueue || !isAwaitingPartsTagged) {
     sessionsStore.resolveAwaitingPartsForOrder({
       shop,
       orderId: order.id,
@@ -3325,43 +3503,9 @@ async function listHypArOpenOrders({
             id
             name
             createdAt
-            note
             tags
             ${ORDER_WORKFLOW_STATUS_FIELDS}
-            ${ORDER_TRACKER_METAFIELD_FIELD}
-            lineItems(first: 200) {
-              edges {
-                node {
-                  id
-                  title
-                  sku
-                  quantity
-                  currentQuantity
-                  discountedTotalSet {
-                    shopMoney {
-                      amount
-                      currencyCode
-                    }
-                  }
-                  originalTotalSet {
-                    shopMoney {
-                      amount
-                      currencyCode
-                    }
-                  }
-                  variantTitle
-                  product {
-                    id
-                  }
-                  variant {
-                    barcode
-                    product {
-                      id
-                    }
-                  }
-                }
-              }
-            }
+            ${getHypArOrderLineItemFields()}
           }
         }
         pageInfo {
@@ -3464,8 +3608,8 @@ async function listHypArHistoricalSearchOrders({ client, maxOrdersPerQuery = 100
   };
 }
 
-async function syncHypArOrderFromShopify({ req, client, shop, order }) {
-  if (!client || !shop || !order?.id) {
+async function syncHypArOrderFromShopify({ shop, order }) {
+  if (!shop || !order?.id) {
     return {
       orderId: '',
       receiverCount: 0,
@@ -3515,17 +3659,6 @@ async function syncHypArOrderFromShopify({ req, client, shop, order }) {
     };
   }
 
-  await persistOrderTrackerSnapshot({
-    req,
-    client,
-    shop,
-    order,
-    barcode: normalizeScanBarcode(order.name || order.id),
-    lineItems,
-    explicitTag: '',
-    appendEventIfStageChanged: false,
-  });
-
   const receivers = sessionsStore.upsertHypReceiversForOrder({
     shop,
     orderId: order.id,
@@ -3557,7 +3690,6 @@ async function syncHypArOrderFromShopify({ req, client, shop, order }) {
 }
 
 async function syncHypArProductionFromShopify({
-  req,
   client,
   shop,
   maxOpenOrders = 1000,
@@ -3603,7 +3735,7 @@ async function syncHypArProductionFromShopify({
   for (const order of openResult.orders) {
     if (!order?.id) continue;
     seenOpenOrderIds.add(order.id);
-    const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+    const result = await syncHypArOrderFromShopify({ shop, order });
     stats.archivedCount += Number(result.archivedCount || 0);
     if (result.receiverCount > 0) {
       stats.hypOrderCount += 1;
@@ -3628,7 +3760,7 @@ async function syncHypArProductionFromShopify({
       if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
       if (!getHypArArchiveReasonForOrder(order)) continue;
 
-      const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+      const result = await syncHypArOrderFromShopify({ shop, order });
       seenOpenOrderIds.add(order.id);
       stats.archivedCount += Number(result.archivedCount || 0);
       if (result.receiverCount > 0) {
@@ -3649,7 +3781,7 @@ async function syncHypArProductionFromShopify({
     for (const order of targetedHistoricalResult.orders) {
       if (!order?.id || seenOpenOrderIds.has(order.id)) continue;
 
-      const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+      const result = await syncHypArOrderFromShopify({ shop, order });
       seenOpenOrderIds.add(order.id);
       stats.archivedCount += Number(result.archivedCount || 0);
       if (result.receiverCount > 0) {
@@ -3674,10 +3806,10 @@ async function syncHypArProductionFromShopify({
     if (seenOpenOrderIds.has(orderId)) continue;
 
     try {
-      const order = await fetchOrderForTrackerById({ client, orderId });
+      const order = await fetchHypArOrderById({ client, orderId });
       if (!order?.id) continue;
 
-      const result = await syncHypArOrderFromShopify({ req, client, shop, order });
+      const result = await syncHypArOrderFromShopify({ shop, order });
       stats.refreshedTrackedOrderCount += 1;
       stats.archivedCount += Number(result.archivedCount || 0);
     } catch (err) {
@@ -3708,18 +3840,6 @@ function getHypArProductionSyncOptions(source = {}, defaults = {}) {
   };
 }
 
-function buildBackgroundRequestContext(req) {
-  const protocol = req?.protocol || 'https';
-  const host = typeof req?.get === 'function' ? req.get('host') : '';
-  return {
-    protocol,
-    get(headerName) {
-      if (String(headerName || '').toLowerCase() === 'host') return host;
-      return typeof req?.get === 'function' ? req.get(headerName) : '';
-    },
-  };
-}
-
 function serializeHypArSyncJob(job = null) {
   if (!job) {
     return {
@@ -3742,7 +3862,7 @@ function serializeHypArSyncJob(job = null) {
   };
 }
 
-function startHypArProductionBackgroundSync({ req, session, shop, options = {} } = {}) {
+function startHypArProductionBackgroundSync({ session, shop, options = {} } = {}) {
   const normalizedShop = String(shop || '').trim();
   if (!normalizedShop || !session) return null;
 
@@ -3765,10 +3885,8 @@ function startHypArProductionBackgroundSync({ req, session, shop, options = {} }
   };
   hypArProductionSyncJobs.set(normalizedShop, job);
 
-  const requestContext = buildBackgroundRequestContext(req);
   const client = shopifyClient(session);
   job.promise = syncHypArProductionFromShopify({
-    req: requestContext,
     client,
     shop: normalizedShop,
     ...getHypArProductionSyncOptions(options, {
@@ -4842,9 +4960,12 @@ router.get('/api/awaiting-parts-summary', async (req, res) => {
 
     const rawTypeFilter = String(req.query.type || '').trim();
     const typeGroupFilter = rawTypeFilter ? getWaitingPartsTypeGroup(rawTypeFilter) : '';
-    const shouldSyncFromNotes = String(req.query.sync || '').trim() === '1';
+    const requestedNoteSync = String(req.query.sync || '').trim() === '1';
+    const shouldSyncFromNotes = requestedNoteSync && ALLOW_AWAITING_PARTS_NOTE_SYNC;
     let syncStats = null;
-    let syncError = null;
+    let syncError = requestedNoteSync && !ALLOW_AWAITING_PARTS_NOTE_SYNC
+      ? 'Legacy awaiting-parts note rebuild is disabled. The summary is loaded from stored structured records.'
+      : null;
 
     if (shouldSyncFromNotes) {
       try {
@@ -4934,7 +5055,6 @@ router.get('/api/hyp-ar-production', async (req, res) => {
       try {
         const client = shopifyClient(auth.session);
         syncStats = await syncHypArProductionFromShopify({
-          req,
           client,
           shop: auth.shop,
           ...syncOptions,
@@ -4966,7 +5086,6 @@ router.post('/api/hyp-ar-production/sync', async (req, res) => {
     if (!auth) return;
 
     const job = startHypArProductionBackgroundSync({
-      req,
       session: auth.session,
       shop: auth.shop,
       options: req.body || {},
@@ -6884,17 +7003,6 @@ router.post('/api/pick-list', async (req, res) => {
       shop,
       orderId: order.id,
     });
-    if (!awaitingPartsItems.length) {
-      if (currentTrackerStage.key === 'awaiting_parts') {
-        const latestAwaitingPartsSnapshot = extractLatestAwaitingPartsSnapshot(order.note || '');
-        awaitingPartsItems = Array.isArray(latestAwaitingPartsSnapshot?.items)
-          ? latestAwaitingPartsSnapshot.items.map((item) => ({
-              partSku: normalizeSku(item?.sku),
-              quantity: Math.max(1, Number(item?.quantity) || 1),
-            })).filter((item) => item.partSku)
-          : [];
-      }
-    }
     const awaitingPartsSkus = awaitingPartsItems.map((item) => item.partSku);
     const wholesaleProgressByItemKey = sessionsStore.getWholesaleBuildProgress({
       shop,

@@ -62,6 +62,22 @@
 
     <section id="orderFlowOverview" class="order-flow-summary-grid"></section>
 
+    <section class="order-flow-grid-panel" aria-labelledby="orderFlowGridTitle">
+      <div class="order-flow-grid-panel__head">
+        <div>
+          <h2 id="orderFlowGridTitle" class="pick-list-section-title">Order Grid</h2>
+          <p id="orderFlowGridSummary">No orders loaded yet.</p>
+        </div>
+        <div id="orderFlowGridLegend" class="order-flow-grid-legend" aria-label="Order age legend"></div>
+      </div>
+      <div class="order-flow-grid-panel__body">
+        <div id="orderFlowGrid" class="order-flow-grid" aria-label="Open order grid"></div>
+        <aside id="orderFlowGridPreview" class="order-flow-grid-preview" aria-live="polite">
+          <p class="order-flow-grid-preview__empty">Hover an order square to inspect it. Click to open in a new tab.</p>
+        </aside>
+      </div>
+    </section>
+
     <section class="order-flow-filter-panel">
       <div>
         <h2 class="pick-list-section-title">Exceptions</h2>
