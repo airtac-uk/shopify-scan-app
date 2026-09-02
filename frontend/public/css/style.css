@@ -1214,10 +1214,12 @@ button:hover { background: #0056b3; }
 }
 
 .pick-verify-item {
+  position: relative;
   display: grid;
   grid-template-columns: 38px minmax(0, 1fr) auto auto;
   gap: 8px;
   align-items: center;
+  overflow: hidden;
   border: 1px solid #314355;
   border-radius: 10px;
   padding: 10px 12px;
@@ -1238,6 +1240,47 @@ button:hover { background: #0056b3; }
 .pick-verify-item--tap-scan {
   grid-template-columns: 38px minmax(0, 1fr) minmax(120px, auto) auto;
   cursor: pointer;
+}
+
+.pick-verify-item--scan-required {
+  border-color: rgba(124, 200, 255, 0.42);
+  box-shadow: inset 3px 0 0 rgba(124, 200, 255, 0.5);
+  cursor: default;
+  touch-action: manipulation;
+  user-select: none;
+  -webkit-touch-callout: none;
+  -webkit-user-select: none;
+}
+
+.pick-verify-item--scan-required::after {
+  content: '';
+  position: absolute;
+  left: 0;
+  right: 100%;
+  bottom: 0;
+  height: 3px;
+  background: #7cc8ff;
+  opacity: 0;
+}
+
+.pick-verify-item--scan-required.is-long-pressing::after {
+  right: 0;
+  opacity: 1;
+  animation: verify-long-press-progress var(--verify-long-press-ms, 5s) linear forwards;
+}
+
+.pick-verify-item--scan-required.pick-list-item--pickable:not(.pick-list-item--picked):not(.pick-list-item--picked-partial):hover {
+  background: #111a24;
+}
+
+@keyframes verify-long-press-progress {
+  from {
+    right: 100%;
+  }
+
+  to {
+    right: 0;
+  }
 }
 
 .pick-verify-item--tap-scan.pick-list-item--picked {
@@ -1386,6 +1429,21 @@ button.pick-verify-item-image:focus-visible:not(:disabled) {
   font-size: 12px;
   font-weight: 900;
   letter-spacing: 0.06em;
+  line-height: 1;
+}
+
+.pick-verify-scan-required-badge {
+  display: inline-flex;
+  width: fit-content;
+  margin-top: 8px;
+  border: 1px solid rgba(124, 200, 255, 0.4);
+  border-radius: 8px;
+  background: rgba(124, 200, 255, 0.12);
+  color: #a9d9ff;
+  padding: 5px 8px;
+  font-size: 11px;
+  font-weight: 900;
+  letter-spacing: 0.04em;
   line-height: 1;
 }
 
@@ -6794,6 +6852,25 @@ html.theme-light .pick-verify-item--hpa-tank-warning {
 html.theme-light .pick-verify-hpa-tank-badge {
   background: #d52d3a;
   color: #ffffff;
+}
+
+html.theme-light .pick-verify-item--scan-required {
+  border-color: #83afd6;
+  box-shadow: inset 3px 0 0 rgba(47, 125, 187, 0.38);
+}
+
+html.theme-light .pick-verify-item--scan-required::after {
+  background: #2f7dbb;
+}
+
+html.theme-light .pick-verify-item--scan-required.pick-list-item--pickable:not(.pick-list-item--picked):not(.pick-list-item--picked-partial):hover {
+  background: #ffffff;
+}
+
+html.theme-light .pick-verify-scan-required-badge {
+  border-color: #9ec4e7;
+  background: #e8f4ff;
+  color: #24517d;
 }
 
 html.theme-light .pick-verify-item--tap-scan.pick-list-item--picked {

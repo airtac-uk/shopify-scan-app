@@ -259,6 +259,27 @@ function formatPartQuantity(count) {
   return `${quantity} ${quantity === 1 ? 'part' : 'parts'}`;
 }
 
+function getAwaitingPartsQuantity(item, matches = []) {
+  const payloadQuantity = Number(item?.awaitingPartsQuantity);
+  if (Number.isFinite(payloadQuantity) && payloadQuantity > 0) {
+    return Math.max(0, payloadQuantity);
+  }
+
+  return (Array.isArray(matches) ? matches : []).reduce((sum, match) => {
+    const matchQuantity = Number(match?.totalQuantity);
+    if (Number.isFinite(matchQuantity) && matchQuantity > 0) {
+      return sum + matchQuantity;
+    }
+
+    const orderQuantity = (Array.isArray(match?.orders) ? match.orders : [])
+      .reduce((orderSum, order) => {
+        const quantity = Number(order?.quantity);
+        return orderSum + (Number.isFinite(quantity) && quantity > 0 ? quantity : 1);
+      }, 0);
+    return sum + orderQuantity;
+  }, 0);
+}
+
 function formatJobQuantity(count) {
   const quantity = Math.max(0, Number(count) || 0);
   return `${quantity} ${quantity === 1 ? 'job' : 'jobs'}`;
@@ -1113,7 +1134,7 @@ function renderQueueCard(item) {
   const isPostDye = item.stageKey === 'post_dye';
   const awaitingPartsMatches = Array.isArray(item.awaitingPartsMatches) ? item.awaitingPartsMatches : [];
   const hasAwaitingPartsOrders = awaitingPartsMatches.length > 0;
-  const awaitingPartsOrderCount = Math.max(0, Number(item.awaitingPartsOrderCount) || 0);
+  const awaitingPartsQuantity = getAwaitingPartsQuantity(item, awaitingPartsMatches);
   const isDeletePending = String(pendingPrintDeleteItemId) === String(item.id);
   const itemId = String(item.id);
   const isChildrenExpanded = expandedPrintChildItemIds.has(itemId);
@@ -1134,7 +1155,7 @@ function renderQueueCard(item) {
     ? `<span>Parent ${escapeHtml(item.parentSku)}</span>`
     : '';
   const awaitingPartsMeta = hasAwaitingPartsOrders
-    ? `<span class="print-queue-card__awaiting-parts">Waiting orders ${escapeHtml(awaitingPartsOrderCount || awaitingPartsMatches.length)}</span>`
+    ? `<span class="print-queue-card__awaiting-parts">Waiting parts ${escapeHtml(awaitingPartsQuantity)}</span>`
     : '';
   const awaitingPartsTitle = hasAwaitingPartsOrders
     ? awaitingPartsMatches

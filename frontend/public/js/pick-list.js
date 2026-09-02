@@ -74,6 +74,8 @@ const WHOLESALE_MODE_COOKIE = 'pick_list_wholesale_mode';
 const QC_MODE_COOKIE = 'pick_list_qc_mode';
 const LAST_RACKED_ORDER_STORAGE_KEY = 'pick_list_last_racked_order';
 const NON_DEDUPE_ACTION_TAGS = new Set(['awaiting_parts', 'qc_fail', 'wholesale_adapter_built', 'on_hold']);
+const VERIFY_RESTRICTED_PICK_TYPES = new Set(['DROP IN', '3RD PARTY']);
+const VERIFY_RESTRICTED_LONG_PRESS_MS = 5000;
 const HPA_TANK_REG_REMOVAL_SKUS = new Set(['T1P_TANK-1', 'T1P_TANK-2']);
 const SHIPPING_PACKAGE_DIMENSION_UNIT = 'centimeter';
 const SHIPPING_PACKAGE_PRESETS = [
@@ -129,6 +131,41 @@ function focusBarcodeInput({ selectAll = false, preventScroll = false } = {}) {
 
 function refocusBarcodeInputForScanner() {
   window.setTimeout(() => focusBarcodeInput({ preventScroll: true }), 0);
+}
+
+function normalizeVerifyPickType(value) {
+  return String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ');
+}
+
+function getNormalizedVerifyPickTypes(value) {
+  return String(value || '')
+    .split(/[,;/|]+/)
+    .map(normalizeVerifyPickType)
+    .filter(Boolean);
+}
+
+function getVerifyRestrictedPickTypes(row) {
+  const types = new Set();
+  (Array.isArray(row?.pickRows) ? row.pickRows : []).forEach((pickRow) => {
+    [
+      ...getNormalizedVerifyPickTypes(pickRow?.type),
+      ...getNormalizedVerifyPickTypes(pickRow?.pickType),
+      ...getNormalizedVerifyPickTypes(pickRow?.typeRaw),
+    ].forEach((type) => {
+      if (VERIFY_RESTRICTED_PICK_TYPES.has(type)) {
+        types.add(type);
+      }
+    });
+  });
+  return Array.from(types);
+}
+
+function isVerifyRowScanRequired(row) {
+  return !wholesaleModeEnabled && getVerifyRestrictedPickTypes(row).length > 0;
 }
 
 function scrollPickListToTop() {
@@ -5695,6 +5732,58 @@ function renderVerifyPickLocations(row) {
   return wrapper;
 }
 
+function attachVerifyRestrictedLongPress(item, key) {
+  let timerId = null;
+  let pointerId = null;
+
+  const clearLongPress = () => {
+    if (timerId) {
+      window.clearTimeout(timerId);
+      timerId = null;
+    }
+    pointerId = null;
+    item.classList.remove('is-long-pressing');
+  };
+
+  item.addEventListener('pointerdown', (event) => {
+    if (loading || timerId) return;
+    if (event.button != null && event.button !== 0) return;
+
+    const target = event.target instanceof Element ? event.target : null;
+    if (target?.closest('button, a, input, select, textarea')) return;
+
+    if (isCurrentOrderWorkflowBlocked()) {
+      showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+      return;
+    }
+
+    event.preventDefault();
+    pointerId = event.pointerId;
+    try {
+      item.setPointerCapture(pointerId);
+    } catch (_err) {
+      // Pointer capture is best-effort; the timeout cancellation handlers still cover normal browsers.
+    }
+
+    item.style.setProperty('--verify-long-press-ms', `${VERIFY_RESTRICTED_LONG_PRESS_MS}ms`);
+    item.classList.add('is-long-pressing');
+    timerId = window.setTimeout(async () => {
+      timerId = null;
+      item.classList.remove('is-long-pressing');
+      await processVerifyLongPress(key);
+      refocusBarcodeInputForScanner();
+    }, VERIFY_RESTRICTED_LONG_PRESS_MS);
+  });
+
+  ['pointerup', 'pointercancel', 'pointerleave', 'lostpointercapture'].forEach((eventName) => {
+    item.addEventListener(eventName, clearLongPress);
+  });
+
+  item.addEventListener('contextmenu', (event) => {
+    event.preventDefault();
+  });
+}
+
 function renderVerifyOrderCards() {
   const container = document.getElementById('pickListLineItems');
   if (!container) return;
@@ -5779,6 +5868,7 @@ function renderVerifyOrderCards() {
 
     const complete = row.scannedQty >= row.requiredQty;
     const usePickStyleVerifyTap = verifyModeEnabled && !wholesaleModeEnabled;
+    const scanRequired = usePickStyleVerifyTap && isVerifyRowScanRequired(row);
     const item = document.createElement('div');
     item.className = `pick-verify-item${complete ? ' is-complete' : ''}`;
     if (row.isWholesaleBundle) {
@@ -5790,28 +5880,37 @@ function renderVerifyOrderCards() {
     item.dataset.verifyKey = row.key;
     if (usePickStyleVerifyTap) {
       item.classList.add('pick-verify-item--tap-scan', 'pick-list-item--pickable');
+      if (scanRequired) {
+        item.classList.add('pick-verify-item--scan-required');
+      }
       item.classList.toggle('pick-list-item--picked', complete);
       item.classList.toggle('pick-list-item--picked-partial', row.scannedQty > 0 && !complete);
       item.tabIndex = 0;
       item.setAttribute('role', 'button');
-      item.setAttribute('aria-label', `${complete ? 'Clear' : 'Scan'} ${getVerifyDisplayLabel(row)}`);
-      item.addEventListener('click', async (event) => {
-        if (loading) return;
-        const target = event.target instanceof Element ? event.target : null;
-        if (target?.closest('button, a, input, select, textarea')) return;
-        await processVerifyTap(row.key);
-        refocusBarcodeInputForScanner();
-      });
-      item.addEventListener('keydown', async (event) => {
-        const target = event.target instanceof Element ? event.target : null;
-        if (target?.closest('button, a, input, select, textarea')) return;
-        if (event.key !== 'Enter' && event.key !== ' ') return;
-        if (event.key === 'Enter' && hidBuffer.trim().length > 0) return;
-        event.preventDefault();
-        if (loading) return;
-        await processVerifyTap(row.key);
-        refocusBarcodeInputForScanner();
-      });
+      item.setAttribute('aria-label', scanRequired
+        ? `${complete ? 'Hold to clear' : 'Scan barcode or hold for 5 seconds to verify'} ${getVerifyDisplayLabel(row)}`
+        : `${complete ? 'Clear' : 'Scan'} ${getVerifyDisplayLabel(row)}`);
+      if (scanRequired) {
+        attachVerifyRestrictedLongPress(item, row.key);
+      } else {
+        item.addEventListener('click', async (event) => {
+          if (loading) return;
+          const target = event.target instanceof Element ? event.target : null;
+          if (target?.closest('button, a, input, select, textarea')) return;
+          await processVerifyTap(row.key);
+          refocusBarcodeInputForScanner();
+        });
+        item.addEventListener('keydown', async (event) => {
+          const target = event.target instanceof Element ? event.target : null;
+          if (target?.closest('button, a, input, select, textarea')) return;
+          if (event.key !== 'Enter' && event.key !== ' ') return;
+          if (event.key === 'Enter' && hidBuffer.trim().length > 0) return;
+          event.preventDefault();
+          if (loading) return;
+          await processVerifyTap(row.key);
+          refocusBarcodeInputForScanner();
+        });
+      }
     }
 
     const info = document.createElement('div');
@@ -5847,6 +5946,13 @@ function renderVerifyOrderCards() {
       warningBadge.className = 'pick-verify-hpa-tank-badge';
       warningBadge.textContent = 'REG REMOVAL REQUIRED';
       info.appendChild(warningBadge);
+    }
+    if (scanRequired) {
+      const scanBadge = document.createElement('span');
+      scanBadge.className = 'pick-verify-scan-required-badge';
+      scanBadge.textContent = 'SCAN REQUIRED';
+      scanBadge.title = 'Scan the barcode or hold this row for 5 seconds.';
+      info.appendChild(scanBadge);
     }
     if (row.isWholesaleBundle && Array.isArray(row.bundleParts) && row.bundleParts.length > 0) {
       const partsList = document.createElement('ul');
@@ -6072,6 +6178,12 @@ async function processVerifyTap(key) {
     return;
   }
 
+  if (isVerifyRowScanRequired(row)) {
+    playVerifyErrorSound();
+    setStatus(`${getVerifyDisplayLabel(row)} must be barcode scanned or held for 5 seconds.`, 'info');
+    return;
+  }
+
   const requiredQty = Math.max(1, Number(row.requiredQty) || 1);
   const wasComplete = row.scannedQty >= requiredQty;
   row.scannedQty = wasComplete ? 0 : Math.min(requiredQty, Math.max(0, Number(row.scannedQty) || 0) + 1);
@@ -6091,6 +6203,46 @@ async function processVerifyTap(key) {
   } else {
     playVerifyScanSound();
     setStatus(`${getManualVerificationVerb()}: ${getVerifyDisplayLabel(row)} (${row.scannedQty}/${row.requiredQty}).`, 'success');
+  }
+}
+
+async function processVerifyLongPress(key) {
+  if (!verifyModeEnabled || wholesaleModeEnabled) return;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
+  const row = verifyItems.find((item) => item.key === key);
+  if (!row) {
+    setStatus('Error: Verification item not found.', 'error');
+    return;
+  }
+
+  if (!isVerifyRowScanRequired(row)) {
+    await processVerifyTap(key);
+    return;
+  }
+
+  const requiredQty = Math.max(1, Number(row.requiredQty) || 1);
+  const wasComplete = row.scannedQty >= requiredQty;
+  row.scannedQty = wasComplete ? 0 : requiredQty;
+
+  renderVerifyOrderCards();
+  scheduleVerifyProgressSave();
+
+  const totals = getVerifyTotals();
+  if (wasComplete) {
+    setStatus(`Cleared: ${getVerifyDisplayLabel(row)} (0/${requiredQty}).`, totals.isComplete ? 'success' : 'info');
+    return;
+  }
+
+  if (totals.isComplete) {
+    playVerifyCompleteSound();
+    setStatus(`Order ${currentOrderNumber} fully verified (${totals.scanned}/${totals.required}).`, 'success');
+  } else {
+    playVerifyScanSound();
+    setStatus(`Verified: ${getVerifyDisplayLabel(row)} (${row.scannedQty}/${row.requiredQty}).`, 'success');
   }
 }
 
