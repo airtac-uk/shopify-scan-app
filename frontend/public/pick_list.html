@@ -47,7 +47,7 @@
             <div class="pick-list-toggle-row">
               <label class="pick-list-toggle-label" for="wholesaleModeToggle">
                 <input id="wholesaleModeToggle" type="checkbox" />
-                Wholesale
+                Builder mode
               </label>
             </div>
             <div class="pick-list-toggle-row">
@@ -86,8 +86,8 @@
           <div class="pick-list-action-grid">
             <button type="button" class="pick-list-action-btn" data-order-action="racked_up" data-picker-visible="true" data-verify-visible="false" data-qc-visible="false">Racked</button>
             <button type="button" class="pick-list-action-btn pick-list-action-btn--warn" data-order-action="awaiting_parts" data-picker-visible="true" data-verify-visible="true" data-qc-visible="false">Awaiting Parts</button>
-            <button type="button" class="pick-list-action-btn" data-order-action="waiting_qc" data-picker-visible="false" data-verify-visible="false" data-qc-visible="false">Waiting QC</button>
-            <button type="button" class="pick-list-action-btn" data-order-action="wholesale_adapter_built" data-picker-visible="false" data-verify-visible="false" data-qc-visible="false">Wholesale Adapter</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="waiting_qc" data-picker-visible="false" data-verify-visible="false" data-builder-visible="true" data-qc-visible="false">Waiting QC</button>
+            <button type="button" class="pick-list-action-btn" data-order-action="wholesale_adapter_built" data-picker-visible="false" data-verify-visible="false" data-qc-visible="false">Builder Adapter</button>
             <button type="button" class="pick-list-action-btn pick-list-action-btn--qc-pass" data-order-action="qc_passed" data-picker-visible="false" data-verify-visible="false" data-qc-visible="true">QC PASS</button>
             <button type="button" class="pick-list-action-btn pick-list-action-btn--warn pick-list-action-btn--qc-fail" data-order-action="qc_fail" data-picker-visible="false" data-verify-visible="false" data-qc-visible="true">QC FAIL</button>
             <button type="button" class="pick-list-action-btn" data-order-action="packaged" data-picker-visible="true" data-verify-visible="true" data-qc-visible="false">Packaged</button>
@@ -135,7 +135,7 @@
   <div id="qcFailModal" class="pick-modal" aria-hidden="true">
     <div class="pick-modal__panel">
       <h3>QC Fail</h3>
-      <p>Select failed SKU:</p>
+      <p>Select failed item:</p>
       <select id="qcFailSku" class="pick-modal-select"></select>
 
       <p>Reason for fail:</p>

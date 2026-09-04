@@ -10,6 +10,7 @@ let lastRenderedLineItems = [];
 let lastOrderItems = [];
 let lastWholesaleProgressByItemKey = {};
 let lastVerifyProgressByItemKey = {};
+let lastQcProgressByItemKey = {};
 let hasRenderedPickList = false;
 let currentOrderBarcode = '';
 let currentOrderNumber = '';
@@ -46,6 +47,9 @@ let wholesaleSaveQueued = false;
 let verifySaveTimeoutId = null;
 let verifySaveInFlight = false;
 let verifySaveQueued = false;
+let qcSaveTimeoutId = null;
+let qcSaveInFlight = false;
+let qcSaveQueued = false;
 let pickedRowsSaveTimeoutId = null;
 let pickedRowsSaveInFlight = false;
 let pickedRowsSaveQueued = false;
@@ -85,6 +89,18 @@ const SHIPPING_PACKAGE_PRESETS = [
   { key: 'tank_box', label: 'Tank Box', length: 50, width: 75, height: 75 },
   { key: 'custom', label: 'Custom', custom: true },
 ];
+const QC_WHOLESALE_TYPE_SORT_ORDER = [
+  'bundle',
+  'adapter',
+  'sls',
+  'cnc_part',
+  'moulded_part',
+  'fdm',
+  'fixing',
+];
+const QC_WHOLESALE_TYPE_SORT_RANK = new Map(
+  QC_WHOLESALE_TYPE_SORT_ORDER.map((typeKey, index) => [typeKey, index])
+);
 const SHIPSTATION_ROYAL_MAIL_SMALL_PARCEL_CODE = 'royal_mail_small_parcel';
 const SHIPSTATION_ROYAL_MAIL_MEDIUM_PARCEL_CODE = 'royal_mail_medium_parcel';
 
@@ -1741,6 +1757,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentAwaitingPartsSkuMap = new Map();
   currentAwaitingPartsCatalog = new Map();
   currentPickedRowCounts = new Map();
+  lastQcProgressByItemKey = {};
   if (pickedRowsSaveTimeoutId) {
     clearTimeout(pickedRowsSaveTimeoutId);
     pickedRowsSaveTimeoutId = null;
@@ -1757,6 +1774,12 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   }
   verifySaveInFlight = false;
   verifySaveQueued = false;
+  if (qcSaveTimeoutId) {
+    clearTimeout(qcSaveTimeoutId);
+    qcSaveTimeoutId = null;
+  }
+  qcSaveInFlight = false;
+  qcSaveQueued = false;
   resetShippingPanelState('');
 
   const lineItems = document.getElementById('pickListLineItems');
@@ -1776,7 +1799,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
 }
 
 function isVerificationStyleModeEnabled() {
-  return verifyModeEnabled || wholesaleModeEnabled;
+  return verifyModeEnabled || wholesaleModeEnabled || qcModeEnabled;
 }
 
 function isPackagedActionLocked() {
@@ -1808,7 +1831,7 @@ function syncVerifyButtonDisabledState() {
     }
 
     const role = button.dataset.role || 'increment';
-    if (role === 'undo') {
+    if (role === 'undo' || role === 'undo-pass' || role === 'undo-fail') {
       const canUndo = button.dataset.canUndo === '1';
       button.disabled = loading || !canUndo;
       return;
@@ -1824,6 +1847,9 @@ function syncActionVisibilityForModes() {
     const tag = button.dataset.orderAction || '';
     const isPickerVisible = button.dataset.pickerVisible === 'true';
     const isVerifyVisible = button.dataset.verifyVisible === 'true';
+    const isBuilderVisible = Object.prototype.hasOwnProperty.call(button.dataset, 'builderVisible')
+      ? button.dataset.builderVisible === 'true'
+      : isVerifyVisible;
     const isQcVisible = button.dataset.qcVisible === 'true';
 
     if (qcModeEnabled) {
@@ -1832,7 +1858,7 @@ function syncActionVisibilityForModes() {
     }
 
     if (wholesaleModeEnabled) {
-      button.hidden = !isVerifyVisible;
+      button.hidden = !isBuilderVisible;
       return;
     }
 
@@ -2302,7 +2328,7 @@ function formatActionLabel(tag) {
     case 'waiting_qc':
       return 'Waiting QC';
     case 'wholesale_adapter_built':
-      return 'Wholesale Adapter';
+      return 'Builder Adapter';
     case 'qc_passed':
       return 'QC Passed';
     case 'qc_fail':
@@ -2362,13 +2388,14 @@ function normalizeQcFailReasons(items) {
   if (!Array.isArray(items)) return [];
 
   return items
-    .map((item) => ({
+    .map((item, sourceIndex) => ({
       id: Number(item?.id || 0),
       sku: normalizeDisplaySku(item?.sku),
       reason: String(item?.reason || '').trim(),
       reportedBy: String(item?.reportedBy || '').trim(),
       builtBy: String(item?.builtBy || '').trim(),
       createdAt: String(item?.createdAt || '').trim(),
+      sourceIndex: Number.isFinite(Number(item?.sourceIndex)) ? Number(item.sourceIndex) : sourceIndex,
     }))
     .filter((item) => item.sku || item.reason);
 }
@@ -2405,6 +2432,95 @@ function buildQcFailReasonsNoteText(reasons = currentQcFailReasons) {
   });
 
   return lines.join('\n');
+}
+
+function addQcFailMatchKeys(keys, value) {
+  const raw = normalizeDisplaySku(value);
+  if (!raw) return;
+
+  const values = new Set([raw]);
+  const withoutLabel = raw.replace(/^(?:SKU|ITEM|BUNDLE)\s*[:#-]\s*/, '').trim();
+  if (withoutLabel && withoutLabel !== raw) {
+    values.add(withoutLabel);
+  }
+
+  values.forEach((candidate) => {
+    const normalized = normalizeDisplaySku(candidate);
+    const words = normalized.replace(/[^A-Z0-9]+/g, ' ').replace(/\s+/g, ' ').trim();
+    const compact = words.replace(/\s+/g, '');
+
+    [normalized, words, compact].forEach((key) => {
+      if (!key || key === 'SKU' || key === 'ITEM' || key === 'BUNDLE') return;
+      keys.add(key);
+    });
+  });
+}
+
+function getQcFailReasonMatchKeys(value) {
+  const keys = new Set();
+  addQcFailMatchKeys(keys, value);
+  return keys;
+}
+
+function getVerifyRowQcFailMatchKeys(row) {
+  const keys = new Set();
+  if (!row) return keys;
+
+  if (row.sku && row.sku !== '(No SKU)' && row.sku !== 'Bundle') {
+    addQcFailMatchKeys(keys, row.sku);
+  }
+  addQcFailMatchKeys(keys, getQcFailSkuForRow(row));
+  addQcFailMatchKeys(keys, row.productName);
+  addQcFailMatchKeys(keys, row.bundleGroupTitle);
+  if (row.bundleGroupTitle) {
+    addQcFailMatchKeys(keys, `BUNDLE: ${row.bundleGroupTitle}`);
+  }
+
+  (Array.isArray(row.bundleParts) ? row.bundleParts : []).forEach((part) => {
+    addQcFailMatchKeys(keys, part?.sku);
+    addQcFailMatchKeys(keys, part?.productName);
+  });
+
+  (Array.isArray(row.pickRows) ? row.pickRows : []).forEach((pickRow) => {
+    addQcFailMatchKeys(keys, pickRow?.sku);
+  });
+
+  return keys;
+}
+
+function getQcFailReasonsForVerifyRow(row, reasons = currentQcFailReasons) {
+  const rowKeys = getVerifyRowQcFailMatchKeys(row);
+  if (!rowKeys.size) return [];
+
+  return normalizeQcFailReasons(reasons).filter((reason) => {
+    const reasonKeys = getQcFailReasonMatchKeys(reason.sku);
+    return Array.from(reasonKeys).some((key) => rowKeys.has(key));
+  });
+}
+
+function getQcFailReasonSortIndex(reason) {
+  const index = Number(reason?.sourceIndex);
+  return Number.isFinite(index) ? index : Number.MAX_SAFE_INTEGER;
+}
+
+function annotateBuilderQcFailReasons(row) {
+  if (!row) return;
+
+  const reasons = wholesaleModeEnabled
+    ? getQcFailReasonsForVerifyRow(row)
+    : [];
+  row.qcFailReasons = reasons;
+  row.qcFailSortIndex = reasons.length
+    ? Math.min(...reasons.map(getQcFailReasonSortIndex))
+    : Number.MAX_SAFE_INTEGER;
+}
+
+function getVerifyRowQcFailReasons(row) {
+  return Array.isArray(row?.qcFailReasons) ? row.qcFailReasons : [];
+}
+
+function hasVerifyRowQcFailReasons(row) {
+  return getVerifyRowQcFailReasons(row).length > 0;
 }
 
 function updateOrderNoteBanner(element, text, key) {
@@ -2499,11 +2615,18 @@ function hasVerifyPickProgress() {
   return verifyItems.some((row) => Number(row?.scannedQty) > 0);
 }
 
+function hasQcProgress() {
+  if (!qcModeEnabled) return false;
+  return verifyItems.some((row) => (
+    Number(row?.passedQty) > 0 || Number(row?.failedQty) > 0
+  ));
+}
+
 function shouldShowOrderActionReminder({ nextLookup = '' } = {}) {
   if (!hasRenderedPickList || !currentOrderBarcode || isCurrentOrderWorkflowBlocked()) {
     return false;
   }
-  if (!pickerModeEnabled && !verifyModeEnabled) {
+  if (!pickerModeEnabled && !verifyModeEnabled && !qcModeEnabled) {
     return false;
   }
   if (nextLookup && isCurrentOrderLookup(nextLookup)) {
@@ -2513,7 +2636,7 @@ function shouldShowOrderActionReminder({ nextLookup = '' } = {}) {
     return false;
   }
 
-  return hasPickerPickProgress() || hasVerifyPickProgress();
+  return hasPickerPickProgress() || hasVerifyPickProgress() || hasQcProgress();
 }
 
 function getOrderActionReminderSummary() {
@@ -2529,6 +2652,11 @@ function getOrderActionReminderSummary() {
   if (verifyModeEnabled) {
     const totals = getVerifyTotals();
     return `${totals.scanned}/${totals.required} verified`;
+  }
+
+  if (qcModeEnabled) {
+    const totals = getQcTotals();
+    return `${totals.passed} passed, ${totals.failed} failed, ${totals.checked}/${totals.required} checked`;
   }
 
   return 'pick progress recorded';
@@ -3266,6 +3394,7 @@ function getPickRowsFromLineSummary(line) {
         location: String(row?.location || '').trim(),
         note: String(row?.note || '').trim(),
         type: String(row?.type || row?.typeRaw || '').trim(),
+        typeRaw: String(row?.typeRaw || '').trim(),
         sectionTitle,
       });
     });
@@ -3309,6 +3438,7 @@ function findPickRowsForOrderItem(orderItem = {}) {
         row.location,
         row.note,
         row.type,
+        row.typeRaw,
         row.sectionTitle,
       ].join('|');
       if (!rowMap.has(key)) {
@@ -3326,12 +3456,12 @@ function mergeVerifyPickRows(targetRow, pickRows = []) {
   if (!targetRow || !Array.isArray(pickRows) || !pickRows.length) return;
   const existingRows = Array.isArray(targetRow.pickRows) ? targetRow.pickRows : [];
   const rowMap = new Map(existingRows.map((row) => ([
-    [row.sku, row.location, row.note, row.type, row.sectionTitle].join('|'),
+    [row.sku, row.location, row.note, row.type, row.typeRaw, row.sectionTitle].join('|'),
     { ...row },
   ])));
 
   pickRows.forEach((row) => {
-    const key = [row.sku, row.location, row.note, row.type, row.sectionTitle].join('|');
+    const key = [row.sku, row.location, row.note, row.type, row.typeRaw, row.sectionTitle].join('|');
     if (!rowMap.has(key)) {
       rowMap.set(key, { ...row });
       return;
@@ -3341,6 +3471,165 @@ function mergeVerifyPickRows(targetRow, pickRows = []) {
   });
 
   targetRow.pickRows = Array.from(rowMap.values()).sort(comparePickLocation);
+}
+
+function getQcWholesaleTypeKeyFromText(value) {
+  const normalized = String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[^A-Z0-9]+/g, ' ');
+  if (!normalized) return '';
+
+  if (/\bADAPTER\b/.test(normalized) || /\bGROUP ADAPTER\b/.test(normalized)) return 'adapter';
+  if (/\bSLS\b/.test(normalized)) return 'sls';
+  if (/\bCNC\b/.test(normalized)) return 'cnc_part';
+  if (/\bMOULD(?:ED|ING)?\b/.test(normalized) || /\bMOLD(?:ED|ING)?\b/.test(normalized)) return 'moulded_part';
+  if (/\bFDM\b/.test(normalized)) return 'fdm';
+  if (/\bFIXINGS?\b/.test(normalized) || /\bFASTENERS?\b/.test(normalized)) return 'fixing';
+
+  return '';
+}
+
+function getQcWholesaleTypeRankFromText(value) {
+  const typeKey = getQcWholesaleTypeKeyFromText(value);
+  return QC_WHOLESALE_TYPE_SORT_RANK.has(typeKey)
+    ? QC_WHOLESALE_TYPE_SORT_RANK.get(typeKey)
+    : Number.MAX_SAFE_INTEGER;
+}
+
+function getQcWholesaleRowTypeCandidates(row) {
+  const candidates = [];
+
+  (Array.isArray(row?.pickRows) ? row.pickRows : []).forEach((pickRow) => {
+    candidates.push(pickRow?.typeRaw, pickRow?.type, pickRow?.sku, pickRow?.note);
+  });
+
+  (Array.isArray(row?.bundleParts) ? row.bundleParts : []).forEach((part) => {
+    candidates.push(part?.sku, part?.productName);
+  });
+
+  candidates.push(row?.sku, row?.productName, row?.bundleGroupTitle);
+  return candidates.filter((candidate) => String(candidate || '').trim());
+}
+
+function getQcWholesaleBestSubTypeRank(row) {
+  const ranks = getQcWholesaleRowTypeCandidates(row)
+    .map(getQcWholesaleTypeRankFromText)
+    .filter((rank) => Number.isFinite(rank));
+
+  return ranks.length ? Math.min(...ranks) : Number.MAX_SAFE_INTEGER;
+}
+
+function getQcWholesalePrimaryTypeRank(row) {
+  if (row?.isWholesaleBundle) {
+    return QC_WHOLESALE_TYPE_SORT_RANK.get('bundle');
+  }
+
+  return getQcWholesaleBestSubTypeRank(row);
+}
+
+function getQcWholesaleSortLabel(row) {
+  return [
+    row?.sku && row.sku !== '(No SKU)' && row.sku !== 'Bundle' ? row.sku : '',
+    row?.productName,
+    row?.bundleGroupTitle,
+  ].filter(Boolean).join(' ');
+}
+
+function compareQcWholesaleRows(a, b) {
+  if (wholesaleModeEnabled) {
+    const aHasQcFail = hasVerifyRowQcFailReasons(a);
+    const bHasQcFail = hasVerifyRowQcFailReasons(b);
+    if (aHasQcFail !== bHasQcFail) {
+      return aHasQcFail ? -1 : 1;
+    }
+
+    if (aHasQcFail && bHasQcFail) {
+      const failSortDiff = (Number(a?.qcFailSortIndex) || 0) - (Number(b?.qcFailSortIndex) || 0);
+      if (failSortDiff !== 0) return failSortDiff;
+    }
+  }
+
+  const primaryRankDiff = getQcWholesalePrimaryTypeRank(a) - getQcWholesalePrimaryTypeRank(b);
+  if (primaryRankDiff !== 0) return primaryRankDiff;
+
+  if (a?.isWholesaleBundle && b?.isWholesaleBundle) {
+    const subTypeRankDiff = getQcWholesaleBestSubTypeRank(a) - getQcWholesaleBestSubTypeRank(b);
+    if (subTypeRankDiff !== 0) return subTypeRankDiff;
+  }
+
+  const labelDiff = getQcWholesaleSortLabel(a).localeCompare(getQcWholesaleSortLabel(b), undefined, {
+    numeric: true,
+    sensitivity: 'base',
+  });
+  if (labelDiff !== 0) return labelDiff;
+
+  return (Number(a?.sortIndex) || 0) - (Number(b?.sortIndex) || 0);
+}
+
+function getVerifyPendingTypeClassForPickerClass(className) {
+  switch (className) {
+    case 'pick-list-card--drop-in':
+      return 'pick-verify-item--type-drop-in';
+    case 'pick-list-card--desk-item':
+      return 'pick-verify-item--type-desk-item';
+    case 'pick-list-card--third-party':
+      return 'pick-verify-item--type-third-party';
+    case 'pick-list-card--no-type':
+      return 'pick-verify-item--type-no-type';
+    default:
+      return '';
+  }
+}
+
+function getVerifyPendingTypeClassForProductType(typeKey) {
+  switch (typeKey) {
+    case 'adapter':
+    case 'sls':
+      return 'pick-verify-item--type-drop-in';
+    case 'cnc_part':
+    case 'moulded_part':
+    case 'fdm':
+      return 'pick-verify-item--type-desk-item';
+    case 'fixing':
+      return 'pick-verify-item--type-no-type';
+    default:
+      return '';
+  }
+}
+
+function getVerifyPendingLineTypeClass(row) {
+  if (!row) return '';
+  if (row.isWholesaleBundle) return 'pick-verify-item--type-bundle';
+
+  const pickTypeCandidates = [];
+  (Array.isArray(row.pickRows) ? row.pickRows : []).forEach((pickRow) => {
+    pickTypeCandidates.push(pickRow?.type, pickRow?.pickType);
+  });
+
+  const pickerClasses = pickTypeCandidates
+    .map(getLineTypeClass)
+    .filter(Boolean);
+  const pickerClass = pickerClasses.find((className) => className !== 'pick-list-card--no-type')
+    || pickerClasses[0]
+    || '';
+  const mappedPickerClass = getVerifyPendingTypeClassForPickerClass(pickerClass);
+  if (mappedPickerClass) return mappedPickerClass;
+
+  const productTypeCandidates = getQcWholesaleRowTypeCandidates(row)
+    .map((candidate) => {
+      const typeKey = getQcWholesaleTypeKeyFromText(candidate);
+      return {
+        typeKey,
+        rank: QC_WHOLESALE_TYPE_SORT_RANK.has(typeKey)
+          ? QC_WHOLESALE_TYPE_SORT_RANK.get(typeKey)
+          : Number.MAX_SAFE_INTEGER,
+      };
+    })
+    .filter((candidate) => candidate.typeKey);
+  productTypeCandidates.sort((a, b) => a.rank - b.rank);
+
+  return getVerifyPendingTypeClassForProductType(productTypeCandidates[0]?.typeKey);
 }
 
 function getNoteQuantityMultiplier(noteText) {
@@ -3553,6 +3842,93 @@ function sendVerifyProgressBeacon() {
   });
   const blob = new Blob([payload], { type: 'application/json' });
   navigator.sendBeacon('/api/pick-list-verify-progress', blob);
+}
+
+function getQcProgressSnapshot() {
+  const progressByItemKey = {};
+  verifyItems.forEach((row) => {
+    const passedQty = Math.max(0, Math.floor(Number(row.passedQty) || 0));
+    const failedQty = Math.max(0, Math.floor(Number(row.failedQty) || 0));
+    if (passedQty <= 0 && failedQty <= 0) return;
+    progressByItemKey[row.key] = { passedQty, failedQty };
+  });
+  return progressByItemKey;
+}
+
+function updateQcProgressCacheFromState() {
+  lastQcProgressByItemKey = getQcProgressSnapshot();
+}
+
+async function flushQcProgressSave(force = false) {
+  if (!hasRenderedPickList || !currentOrderBarcode) return;
+  if (!force && !qcModeEnabled) return;
+
+  if (qcSaveInFlight) {
+    qcSaveQueued = true;
+    return;
+  }
+
+  qcSaveInFlight = true;
+  qcSaveQueued = false;
+
+  try {
+    const response = await fetch('/api/pick-list-qc-progress', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        barcode: currentOrderBarcode,
+        progressByItemKey: getQcProgressSnapshot(),
+      }),
+    });
+
+    const data = await response.json();
+    if (!response.ok || !data.success) {
+      throw new Error(data.error || 'Failed to save QC progress');
+    }
+  } catch (err) {
+    console.error('Error saving QC progress:', err);
+  } finally {
+    qcSaveInFlight = false;
+    if (qcSaveQueued) {
+      qcSaveQueued = false;
+      flushQcProgressSave(force);
+    }
+  }
+}
+
+function scheduleQcProgressSave() {
+  if (!qcModeEnabled) return;
+
+  updateQcProgressCacheFromState();
+
+  if (qcSaveTimeoutId) {
+    clearTimeout(qcSaveTimeoutId);
+  }
+
+  qcSaveTimeoutId = setTimeout(() => {
+    qcSaveTimeoutId = null;
+    flushQcProgressSave(false);
+  }, 150);
+}
+
+async function flushPendingQcProgressSave() {
+  if (!qcSaveTimeoutId) return;
+
+  clearTimeout(qcSaveTimeoutId);
+  qcSaveTimeoutId = null;
+  await flushQcProgressSave(true);
+}
+
+function sendQcProgressBeacon() {
+  if (!hasRenderedPickList || !currentOrderBarcode || !qcModeEnabled) return;
+  if (!navigator.sendBeacon) return;
+
+  const payload = JSON.stringify({
+    barcode: currentOrderBarcode,
+    progressByItemKey: getQcProgressSnapshot(),
+  });
+  const blob = new Blob([payload], { type: 'application/json' });
+  navigator.sendBeacon('/api/pick-list-qc-progress', blob);
 }
 
 function getPickedRowCount(rowKey) {
@@ -4074,7 +4450,7 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const normalizedSku = normalizeVerifyCode(sku);
     const normalizedUpc = normalizeVerifyCode(upc);
     const lineStableId = String(item?.id || '').trim() || `ORDER_ITEM_${index + 1}`;
-    const isWholesaleBundle = wholesaleModeEnabled && Boolean(bundleGroupId);
+    const isWholesaleBundle = (wholesaleModeEnabled || qcModeEnabled) && Boolean(bundleGroupId);
     // Keep no-SKU rows separate even if UPC matches, so duplicate UPC items
     // are verified one item at a time.
     const rowBaseKey = normalizedSku ? `SKU:${normalizedSku}` : `LINE:${lineStableId}`;
@@ -4100,11 +4476,13 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
         isWholesaleBundle,
         bundleItemCount: 0,
         bundleParts: [],
-        imageUrl: isWholesaleBundle ? '' : imageUrl,
-        imageAltText: isWholesaleBundle ? '' : imageAltText,
+        imageUrl,
+        imageAltText,
         sortIndex: index,
         requiredQty: 0,
         scannedQty: 0,
+        passedQty: 0,
+        failedQty: 0,
         codes: new Set(),
         totalValueAmount: 0,
         unitValueAmount: 0,
@@ -4117,9 +4495,9 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const row = grouped.get(key);
     row.requiresRegRemoval = row.requiresRegRemoval || requiresRegRemoval;
     mergeVerifyPickRows(row, pickRows);
-    if (!isWholesaleBundle && !row.imageUrl && imageUrl) {
+    if (!row.imageUrl && imageUrl) {
       row.imageUrl = imageUrl;
-      row.imageAltText = imageAltText;
+      row.imageAltText = imageAltText || productName || sku || '';
     }
     row.sortIndex = Math.min(row.sortIndex, index);
     if (Number.isFinite(lineValueAmount) && lineValueAmount > 0) {
@@ -4149,7 +4527,14 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     expandVerifyCodeVariants(normalizedUpc).forEach((code) => row.codes.add(code));
   });
 
-  verifyItems = Array.from(grouped.values()).sort((a, b) => {
+  const builtVerifyRows = Array.from(grouped.values());
+  builtVerifyRows.forEach(annotateBuilderQcFailReasons);
+
+  verifyItems = builtVerifyRows.sort((a, b) => {
+    if (wholesaleModeEnabled || qcModeEnabled) {
+      return compareQcWholesaleRows(a, b);
+    }
+
     const aGroupSort = a.bundleGroupId ? (bundleOrder.get(a.bundleGroupId) ?? a.sortIndex) : a.sortIndex;
     const bGroupSort = b.bundleGroupId ? (bundleOrder.get(b.bundleGroupId) ?? b.sortIndex) : b.sortIndex;
 
@@ -4191,11 +4576,33 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
 
   if (initialProgressByItemKey && typeof initialProgressByItemKey === 'object') {
     verifyItems.forEach((row) => {
+      if (qcModeEnabled) {
+        const persisted = normalizeQcProgressCounts(initialProgressByItemKey[row.key], row.requiredQty);
+        row.passedQty = persisted.passedQty;
+        row.failedQty = persisted.failedQty;
+        row.scannedQty = persisted.passedQty + persisted.failedQty;
+        return;
+      }
+
       const persisted = Number(initialProgressByItemKey[row.key]);
       if (!Number.isFinite(persisted)) return;
       row.scannedQty = Math.max(0, Math.min(row.requiredQty, Math.floor(persisted)));
     });
   }
+}
+
+function normalizeQcProgressCounts(value, requiredQty) {
+  const maxQty = Math.max(1, Math.floor(Number(requiredQty) || 1));
+  const source = value && typeof value === 'object' ? value : {};
+  const passedQty = Math.max(0, Math.floor(Number(source.passedQty) || 0));
+  const failedQty = Math.max(0, Math.floor(Number(source.failedQty) || 0));
+  const clampedPassedQty = Math.min(maxQty, passedQty);
+  const remainingAfterPasses = Math.max(0, maxQty - clampedPassedQty);
+
+  return {
+    passedQty: clampedPassedQty,
+    failedQty: Math.min(remainingAfterPasses, failedQty),
+  };
 }
 
 function getVerifyTotals() {
@@ -4209,21 +4616,66 @@ function getVerifyTotals() {
   return totals;
 }
 
+function getQcRowPassedQty(row) {
+  return Math.max(0, Math.floor(Number(row?.passedQty) || 0));
+}
+
+function getQcRowFailedQty(row) {
+  return Math.max(0, Math.floor(Number(row?.failedQty) || 0));
+}
+
+function getQcRowCheckedQty(row) {
+  return getQcRowPassedQty(row) + getQcRowFailedQty(row);
+}
+
+function isQcRowComplete(row) {
+  return getQcRowCheckedQty(row) >= Math.max(1, Number(row?.requiredQty) || 1);
+}
+
+function getQcTotals() {
+  const totals = verifyItems.reduce((acc, row) => {
+    const requiredQty = Math.max(1, Math.floor(Number(row.requiredQty) || 1));
+    const passedQty = getQcRowPassedQty(row);
+    const failedQty = getQcRowFailedQty(row);
+    acc.required += requiredQty;
+    acc.passed += passedQty;
+    acc.failed += failedQty;
+    acc.checked += Math.min(requiredQty, passedQty + failedQty);
+    return acc;
+  }, {
+    required: 0,
+    passed: 0,
+    failed: 0,
+    checked: 0,
+  });
+
+  totals.remaining = Math.max(0, totals.required - totals.checked);
+  totals.isComplete = totals.required > 0 && totals.checked >= totals.required;
+  return totals;
+}
+
 function getVerificationModeTitle() {
-  return wholesaleModeEnabled ? 'Wholesale Build' : 'Verify Order';
+  if (qcModeEnabled) return 'QC Check';
+  return wholesaleModeEnabled ? 'Builder Mode' : 'Verify Order';
 }
 
 function getVerificationVerb() {
+  if (qcModeEnabled) return 'QC Passed';
   return wholesaleModeEnabled ? 'Built' : 'Scanned';
 }
 
 function getManualVerificationVerb() {
+  if (qcModeEnabled) return 'QC pass';
   return wholesaleModeEnabled ? 'Manual build' : 'Manual scan';
 }
 
 function getVerificationIncrementLabel(row, complete) {
   if (complete) {
+    if (qcModeEnabled) return 'Checked';
     return wholesaleModeEnabled ? 'Built' : 'Complete';
+  }
+  if (qcModeEnabled) {
+    return 'Pass +1';
   }
   if (wholesaleModeEnabled) {
     return 'Build +1';
@@ -5732,6 +6184,45 @@ function renderVerifyPickLocations(row) {
   return wrapper;
 }
 
+function createBuilderQcFailReasonsBlock(reasons = []) {
+  const items = normalizeQcFailReasons(reasons);
+  if (!items.length) return null;
+
+  const wrapper = document.createElement('div');
+  wrapper.className = 'pick-builder-qc-fails';
+
+  const title = document.createElement('strong');
+  title.className = 'pick-builder-qc-fails__title';
+  title.textContent = items.length > 1 ? 'QC fail reasons' : 'QC fail reason';
+  wrapper.appendChild(title);
+
+  const list = document.createElement('ul');
+  items.forEach((item) => {
+    const li = document.createElement('li');
+
+    const reasonText = document.createElement('span');
+    reasonText.className = 'pick-builder-qc-fails__reason';
+    reasonText.textContent = [item.sku, item.reason].filter(Boolean).join(': ');
+    li.appendChild(reasonText);
+
+    const meta = [
+      item.reportedBy ? `Reported by ${item.reportedBy}` : '',
+      item.builtBy ? `Built by ${item.builtBy}` : '',
+      formatQcFailTimestamp(item.createdAt),
+    ].filter(Boolean).join(' / ');
+    if (meta) {
+      const metaText = document.createElement('small');
+      metaText.textContent = meta;
+      li.appendChild(metaText);
+    }
+
+    list.appendChild(li);
+  });
+  wrapper.appendChild(list);
+
+  return wrapper;
+}
+
 function attachVerifyRestrictedLongPress(item, key) {
   let timerId = null;
   let pointerId = null;
@@ -5790,12 +6281,12 @@ function renderVerifyOrderCards() {
   container.innerHTML = '';
 
   if (!verifyItems.length) {
-    container.innerHTML = '<p class="pick-list-empty">No order line items found for verification.</p>';
+    container.innerHTML = `<p class="pick-list-empty">No order line items found for ${qcModeEnabled ? 'QC' : 'verification'}.</p>`;
     return;
   }
 
-  const totals = getVerifyTotals();
-  const canOpenShippingPanel = shouldShowVerifyShippingPanel(totals);
+  const totals = qcModeEnabled ? getQcTotals() : getVerifyTotals();
+  const canOpenShippingPanel = !qcModeEnabled && shouldShowVerifyShippingPanel(totals);
   if (!canOpenShippingPanel && isVerifyShippingModalOpen()) {
     closeVerifyShippingModal();
   }
@@ -5803,24 +6294,16 @@ function renderVerifyOrderCards() {
     resetShippingPanelState(currentOrderBarcode);
   }
 
-  const hpaTankWarningCard = createHpaTankVerifyWarningCard();
-  if (hpaTankWarningCard) {
-    container.appendChild(hpaTankWarningCard);
-  }
-
-  const wholesaleWarningCard = createWholesaleVerifyWarningCard();
-  if (wholesaleWarningCard) {
-    container.appendChild(wholesaleWarningCard);
-  }
-
   const summaryCard = document.createElement('article');
   const summaryTitle = canOpenShippingPanel
     ? (totals.isComplete ? 'ORDER VERIFIED - TAP TO SHIP' : 'ORDER FULFILLED - TAP TO SHIP')
     : getVerificationModeTitle();
-  const summarySubtitle = canOpenShippingPanel
+  const summarySubtitle = qcModeEnabled
+    ? `${totals.passed} passed / ${totals.failed} failed / ${totals.remaining} remaining`
+    : (canOpenShippingPanel
     ? getVerifyShippingLaunchStatusText()
-    : `${getVerificationVerb()} ${totals.scanned} of ${totals.required}${totals.isComplete ? ' - complete' : ''}`;
-  summaryCard.className = `pick-list-card pick-verify-summary${totals.isComplete ? ' is-complete' : ''}${canOpenShippingPanel ? ' is-shipping-launch' : ''}`;
+    : `${getVerificationVerb()} ${totals.scanned} of ${totals.required}${totals.isComplete ? ' - complete' : ''}`);
+  summaryCard.className = `pick-list-card pick-verify-summary${qcModeEnabled || wholesaleModeEnabled ? ' pick-mode-summary' : ''}${qcModeEnabled ? ' pick-qc-summary' : ''}${wholesaleModeEnabled ? ' pick-wholesale-summary' : ''}${totals.isComplete ? ' is-complete' : ''}${canOpenShippingPanel ? ' is-shipping-launch' : ''}${qcModeEnabled && totals.failed > 1 ? ' has-failures' : ''}`;
   summaryCard.innerHTML = `
     <header class="pick-list-card-header">
       <h3>${summaryTitle}</h3>
@@ -5840,17 +6323,40 @@ function renderVerifyOrderCards() {
   }
   container.appendChild(summaryCard);
 
+  const hpaTankWarningCard = createHpaTankVerifyWarningCard();
+  if (hpaTankWarningCard) {
+    container.appendChild(hpaTankWarningCard);
+  }
+
+  if (qcModeEnabled) {
+    container.appendChild(createQcModePanel());
+  }
+
+  const wholesaleWarningCard = createWholesaleVerifyWarningCard();
+  if (wholesaleWarningCard) {
+    container.appendChild(wholesaleWarningCard);
+  }
+
   if (canOpenShippingPanel) {
     queueVerifyShippingLookupPreload();
   }
 
   const listCard = document.createElement('article');
   listCard.className = 'pick-list-card';
+  if (qcModeEnabled || wholesaleModeEnabled) {
+    listCard.classList.add('pick-mode-list-card');
+  }
+  if (qcModeEnabled) {
+    listCard.classList.add('pick-qc-list-card');
+  }
+  if (wholesaleModeEnabled) {
+    listCard.classList.add('pick-wholesale-list-card');
+  }
 
   const list = document.createElement('div');
   list.className = 'pick-verify-list';
 
-  const shouldRenderBundleMarkers = !wholesaleModeEnabled;
+  const shouldRenderBundleMarkers = !wholesaleModeEnabled && !qcModeEnabled;
   let previousBundleGroupId = '';
   verifyItems.forEach((row, index) => {
     const bundleGroupId = String(row.bundleGroupId || '').trim();
@@ -5866,11 +6372,29 @@ function renderVerifyOrderCards() {
       list.appendChild(bundleMarker);
     }
 
-    const complete = row.scannedQty >= row.requiredQty;
-    const usePickStyleVerifyTap = verifyModeEnabled && !wholesaleModeEnabled;
+    const complete = qcModeEnabled ? isQcRowComplete(row) : row.scannedQty >= row.requiredQty;
+    const usePickStyleVerifyTap = verifyModeEnabled && !wholesaleModeEnabled && !qcModeEnabled;
     const scanRequired = usePickStyleVerifyTap && isVerifyRowScanRequired(row);
+    const builderQcFailReasons = wholesaleModeEnabled ? getVerifyRowQcFailReasons(row) : [];
     const item = document.createElement('div');
     item.className = `pick-verify-item${complete ? ' is-complete' : ''}`;
+    if (builderQcFailReasons.length) {
+      item.classList.add('has-builder-qc-fail');
+    }
+    if (qcModeEnabled) {
+      item.classList.add('pick-qc-item');
+      if (getQcRowPassedQty(row) > 0) item.classList.add('has-qc-passes');
+      if (getQcRowFailedQty(row) > 1) item.classList.add('has-qc-failures');
+    }
+    const pendingTypeClass = (
+      (qcModeEnabled && getQcRowCheckedQty(row) <= 0)
+      || (wholesaleModeEnabled && !complete)
+    )
+      ? getVerifyPendingLineTypeClass(row)
+      : '';
+    if (pendingTypeClass) {
+      item.classList.add(pendingTypeClass);
+    }
     if (row.isWholesaleBundle) {
       item.classList.add('pick-verify-item--bundle-build');
     }
@@ -5933,14 +6457,20 @@ function renderVerifyOrderCards() {
       if (row.upc) labels.push(`UPC: ${row.upc}`);
       meta.textContent = labels.join(' | ');
     } else {
-      meta.textContent = wholesaleModeEnabled
+      meta.textContent = qcModeEnabled
+        ? 'Manual QC only (no SKU/UPC barcode)'
+        : (wholesaleModeEnabled
         ? 'Manual build only (no SKU/UPC barcode)'
-        : 'Manual verify only (no SKU/UPC barcode)';
+        : 'Manual verify only (no SKU/UPC barcode)');
     }
     meta.title = meta.textContent;
 
     info.appendChild(title);
     info.appendChild(meta);
+    const builderQcFailBlock = createBuilderQcFailReasonsBlock(builderQcFailReasons);
+    if (builderQcFailBlock) {
+      info.appendChild(builderQcFailBlock);
+    }
     if (row.requiresRegRemoval) {
       const warningBadge = document.createElement('span');
       warningBadge.className = 'pick-verify-hpa-tank-badge';
@@ -5973,19 +6503,104 @@ function renderVerifyOrderCards() {
       info.appendChild(partsList);
     }
 
-    const progress = document.createElement('p');
-    progress.className = 'pick-verify-item-progress';
-    progress.textContent = `${row.scannedQty} / ${row.requiredQty}`;
+    const progress = document.createElement(qcModeEnabled ? 'div' : 'p');
+    progress.className = qcModeEnabled
+      ? 'pick-verify-item-progress pick-qc-item-progress'
+      : 'pick-verify-item-progress';
+    if (qcModeEnabled) {
+      const passed = document.createElement('span');
+      passed.className = 'pick-qc-item-progress__pass';
+      passed.textContent = `Pass ${getQcRowPassedQty(row)}`;
 
-    item.appendChild(createVerifyProductImageThumb(row));
+      const failed = document.createElement('span');
+      failed.className = 'pick-qc-item-progress__fail';
+      failed.textContent = `Fail ${getQcRowFailedQty(row)}`;
+
+      const total = document.createElement('span');
+      total.className = 'pick-qc-item-progress__total';
+      total.textContent = `${getQcRowCheckedQty(row)} / ${row.requiredQty}`;
+
+      progress.appendChild(passed);
+      progress.appendChild(failed);
+      progress.appendChild(total);
+    } else {
+      progress.textContent = `${row.scannedQty} / ${row.requiredQty}`;
+    }
+
+    const shouldShowProductImageThumb = !qcModeEnabled || Boolean(normalizeImageUrl(row?.imageUrl));
+    if (shouldShowProductImageThumb) {
+      item.appendChild(createVerifyProductImageThumb(row));
+    } else {
+      item.classList.add('pick-qc-item--no-thumb');
+    }
     item.appendChild(info);
-    if (verifyModeEnabled && !wholesaleModeEnabled) {
+    if (verifyModeEnabled && !wholesaleModeEnabled && !qcModeEnabled) {
       item.appendChild(renderVerifyPickLocations(row));
     }
     item.appendChild(progress);
     if (!usePickStyleVerifyTap) {
       const actions = document.createElement('div');
-      actions.className = 'pick-verify-item-actions';
+      actions.className = qcModeEnabled
+        ? 'pick-verify-item-actions pick-qc-item-actions'
+        : 'pick-verify-item-actions';
+
+      if (qcModeEnabled) {
+        const passButton = document.createElement('button');
+        passButton.type = 'button';
+        passButton.className = 'pick-verify-item-btn pick-qc-item-btn--pass';
+        passButton.textContent = 'Pass +1';
+        passButton.dataset.role = 'qc-pass';
+        passButton.dataset.complete = complete ? '1' : '0';
+        passButton.disabled = loading || complete;
+        passButton.addEventListener('click', () => {
+          processQcPassManual(row.key);
+        });
+
+        const failButton = document.createElement('button');
+        failButton.type = 'button';
+        failButton.className = 'pick-verify-item-btn pick-qc-item-btn--fail';
+        failButton.textContent = 'Fail +1';
+        failButton.dataset.role = 'qc-fail';
+        failButton.dataset.complete = complete ? '1' : '0';
+        failButton.disabled = loading || complete;
+        failButton.addEventListener('click', () => {
+          processQcFailManual(row.key);
+        });
+
+        const undoPassButton = document.createElement('button');
+        undoPassButton.type = 'button';
+        undoPassButton.className = 'pick-verify-item-btn pick-qc-item-btn--undo';
+        undoPassButton.textContent = '-1 Pass';
+        undoPassButton.dataset.role = 'undo-pass';
+        undoPassButton.dataset.canUndo = getQcRowPassedQty(row) > 0 ? '1' : '0';
+        undoPassButton.disabled = loading || getQcRowPassedQty(row) <= 0;
+        undoPassButton.addEventListener('click', () => {
+          processQcUndo(row.key, 'pass');
+        });
+
+        const undoFailButton = document.createElement('button');
+        undoFailButton.type = 'button';
+        undoFailButton.className = 'pick-verify-item-btn pick-qc-item-btn--undo';
+        undoFailButton.textContent = '-1 Fail';
+        undoFailButton.dataset.role = 'undo-fail';
+        undoFailButton.dataset.canUndo = getQcRowFailedQty(row) > 0 ? '1' : '0';
+        undoFailButton.disabled = loading || getQcRowFailedQty(row) <= 0;
+        undoFailButton.addEventListener('click', () => {
+          processQcUndo(row.key, 'fail');
+        });
+
+        actions.appendChild(passButton);
+        actions.appendChild(failButton);
+        actions.appendChild(undoPassButton);
+        actions.appendChild(undoFailButton);
+        item.appendChild(actions);
+        list.appendChild(item);
+        previousBundleGroupId = bundleGroupId;
+        if (!bundleGroupId) {
+          previousBundleGroupId = '';
+        }
+        return;
+      }
 
       const button = document.createElement('button');
       button.type = 'button';
@@ -6049,7 +6664,7 @@ function createQcModePanel() {
   const detail = document.createElement('p');
   detail.className = 'pick-qc-mode-card__detail';
   detail.textContent = currentQcBuilderStaff
-    ? 'Use QC PASS or QC FAIL after checking the adapter.'
+    ? 'Mark each adapter or bundle as QC passed or QC failed.'
     : 'Mark the order as Waiting QC when the builder hands it over, then reload this order.';
   card.appendChild(detail);
 
@@ -6165,6 +6780,222 @@ function getVerifyDisplayLabel(row) {
   return row.productName || 'Item';
 }
 
+function getQcFailSkuForRow(row) {
+  if (!row) return '';
+  const sku = normalizeDisplaySku(row.sku);
+  if (sku && sku !== 'BUNDLE' && sku !== '(NO SKU)') return sku;
+
+  const fallbackTitle = String(row.bundleGroupTitle || row.productName || '').trim();
+  if (row.bundleGroupId) {
+    return fallbackTitle ? `BUNDLE: ${fallbackTitle}` : 'BUNDLE';
+  }
+
+  return fallbackTitle ? `ITEM: ${fallbackTitle}` : 'ITEM';
+}
+
+function findQcRowForSku(sku) {
+  const normalizedSku = normalizeDisplaySku(sku);
+  if (!normalizedSku) return null;
+
+  return verifyItems.find((row) => normalizeDisplaySku(getQcFailSkuForRow(row)) === normalizedSku)
+    || verifyItems.find((row) => normalizeDisplaySku(row?.sku) === normalizedSku)
+    || null;
+}
+
+function incrementQcRow(row, resultKey) {
+  if (!row) return { success: false, reason: 'missing_row' };
+  if (isQcRowComplete(row)) return { success: false, reason: 'already_complete' };
+
+  if (resultKey === 'fail') {
+    row.failedQty = getQcRowFailedQty(row) + 1;
+  } else {
+    row.passedQty = getQcRowPassedQty(row) + 1;
+  }
+  row.scannedQty = getQcRowCheckedQty(row);
+
+  return { success: true, row };
+}
+
+function decrementQcRow(row, resultKey) {
+  if (!row) return { success: false, reason: 'missing_row' };
+
+  if (resultKey === 'fail') {
+    if (getQcRowFailedQty(row) <= 0) return { success: false, reason: 'already_zero' };
+    row.failedQty = getQcRowFailedQty(row) - 1;
+  } else {
+    if (getQcRowPassedQty(row) <= 0) return { success: false, reason: 'already_zero' };
+    row.passedQty = getQcRowPassedQty(row) - 1;
+  }
+  row.scannedQty = getQcRowCheckedQty(row);
+
+  return { success: true, row };
+}
+
+function markAllRemainingQcPassed() {
+  let changed = false;
+  verifyItems.forEach((row) => {
+    const requiredQty = Math.max(1, Math.floor(Number(row.requiredQty) || 1));
+    const failedQty = getQcRowFailedQty(row);
+    const nextPassedQty = Math.max(0, requiredQty - failedQty);
+    if (getQcRowPassedQty(row) === nextPassedQty) return;
+    row.passedQty = nextPassedQty;
+    row.scannedQty = getQcRowCheckedQty(row);
+    changed = true;
+  });
+  return changed;
+}
+
+function renderAndSaveQcProgress() {
+  renderVerifyOrderCards();
+  scheduleQcProgressSave();
+}
+
+async function maybeApplyQcPassedForCompleteOrder() {
+  const totals = getQcTotals();
+  if (!totals.isComplete || totals.failed > 0) return;
+  await runOrderAction('qc_passed');
+}
+
+async function processQcPassManual(key) {
+  if (!qcModeEnabled) return;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
+  const row = verifyItems.find((item) => item.key === key);
+  if (!row) {
+    setStatus('Error: QC item not found.', 'error');
+    return;
+  }
+
+  const result = incrementQcRow(row, 'pass');
+  if (!result.success) {
+    setStatus(`${getVerifyDisplayLabel(row)} is already fully checked.`, 'info');
+    return;
+  }
+
+  renderAndSaveQcProgress();
+  const totals = getQcTotals();
+  playVerifyScanSound();
+  if (totals.isComplete && totals.failed <= 0) {
+    await maybeApplyQcPassedForCompleteOrder();
+    return;
+  }
+
+  if (totals.isComplete) {
+    setStatus(
+      `QC complete for ${currentOrderNumber}: ${totals.passed} passed, ${totals.failed} failed.`,
+      'error'
+    );
+  } else {
+    setStatus(`QC pass: ${getVerifyDisplayLabel(row)} (${getQcRowPassedQty(row)} passed, ${getQcRowFailedQty(row)} failed).`, 'success');
+  }
+}
+
+async function processQcFailManual(key) {
+  if (!qcModeEnabled) return;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
+  const row = verifyItems.find((item) => item.key === key);
+  if (!row) {
+    setStatus('Error: QC item not found.', 'error');
+    return;
+  }
+
+  if (isQcRowComplete(row)) {
+    setStatus(`${getVerifyDisplayLabel(row)} is already fully checked.`, 'info');
+    return;
+  }
+
+  await runOrderAction('qc_fail', {
+    qcFailDefaults: {
+      itemKey: row.key,
+      sku: getQcFailSkuForRow(row),
+    },
+  });
+}
+
+function processQcUndo(key, resultKey) {
+  if (!qcModeEnabled) return;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return;
+  }
+
+  const row = verifyItems.find((item) => item.key === key);
+  if (!row) {
+    setStatus('Error: QC item not found.', 'error');
+    return;
+  }
+
+  const result = decrementQcRow(row, resultKey);
+  if (!result.success) {
+    setStatus(`${getVerifyDisplayLabel(row)} has no ${resultKey === 'fail' ? 'failed' : 'passed'} QC count to undo.`, 'info');
+    return;
+  }
+
+  renderAndSaveQcProgress();
+  const totals = getQcTotals();
+  const label = resultKey === 'fail' ? 'fail' : 'pass';
+  setStatus(
+    `Undo QC ${label}: ${getVerifyDisplayLabel(row)} (${getQcRowPassedQty(row)} passed, ${getQcRowFailedQty(row)} failed).`,
+    totals.isComplete && totals.failed <= 0 ? 'success' : 'info'
+  );
+}
+
+async function processQcScan(scannedCode) {
+  if (!qcModeEnabled) return false;
+  if (isCurrentOrderWorkflowBlocked()) {
+    showWorkflowBlockedWarning(currentWorkflowBlock?.message);
+    return true;
+  }
+
+  const codeVariants = expandVerifyCodeVariants(scannedCode);
+  const normalizedCode = codeVariants[0] || '';
+  if (!normalizedCode) {
+    setStatus('Error: Empty scan received.', 'error');
+    return true;
+  }
+
+  const rowKeySeen = new Set();
+  const candidates = [];
+  codeVariants.forEach((variant) => {
+    const variantCandidates = verifyCodeIndex.get(variant) || [];
+    variantCandidates.forEach((row) => {
+      if (rowKeySeen.has(row.key)) return;
+      rowKeySeen.add(row.key);
+      candidates.push(row);
+    });
+  });
+
+  if (!candidates.length) {
+    setStatus(`Error: ${normalizedCode} is not on this order.`, 'error');
+    return true;
+  }
+
+  const target = candidates.find((row) => !isQcRowComplete(row)) || candidates[0];
+  const result = incrementQcRow(target, 'pass');
+  if (!result.success) {
+    setStatus(`${getVerifyDisplayLabel(target)} is already fully checked.`, 'info');
+    return true;
+  }
+
+  renderAndSaveQcProgress();
+  const totals = getQcTotals();
+  playVerifyScanSound();
+  if (totals.isComplete && totals.failed <= 0) {
+    await maybeApplyQcPassedForCompleteOrder();
+  } else {
+    setStatus(`QC pass: ${getVerifyDisplayLabel(target)} (${getQcRowPassedQty(target)} passed, ${getQcRowFailedQty(target)} failed).`, 'success');
+  }
+
+  return true;
+}
+
 async function processVerifyTap(key) {
   if (!verifyModeEnabled || wholesaleModeEnabled) return;
   if (isCurrentOrderWorkflowBlocked()) {
@@ -6248,6 +7079,10 @@ async function processVerifyLongPress(key) {
 
 async function processVerifyManual(key) {
   if (!isVerificationStyleModeEnabled()) return;
+  if (qcModeEnabled) {
+    await processQcPassManual(key);
+    return;
+  }
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
     return;
@@ -6260,7 +7095,7 @@ async function processVerifyManual(key) {
   }
 
   if (row.scannedQty >= row.requiredQty) {
-    setStatus(`${getVerifyDisplayLabel(row)} is already fully scanned.`, 'info');
+    setStatus(`${getVerifyDisplayLabel(row)} is already fully ${wholesaleModeEnabled ? 'built' : 'scanned'}.`, 'info');
     return;
   }
 
@@ -6273,7 +7108,7 @@ async function processVerifyManual(key) {
 
   const result = incrementVerifyRow(row);
   if (!result.success) {
-    setStatus(`${getVerifyDisplayLabel(row)} is already fully scanned.`, 'info');
+    setStatus(`${getVerifyDisplayLabel(row)} is already fully ${wholesaleModeEnabled ? 'built' : 'scanned'}.`, 'info');
     return;
   }
 
@@ -6287,7 +7122,7 @@ async function processVerifyManual(key) {
   if (totals.isComplete) {
     playVerifyCompleteSound();
     if (wholesaleModeEnabled) {
-      setStatus(`Wholesale build complete for ${currentOrderNumber} (${totals.scanned}/${totals.required}).`, 'success');
+      setStatus(`Builder mode complete for ${currentOrderNumber} (${totals.scanned}/${totals.required}).`, 'success');
     } else {
       setStatus(`Order ${currentOrderNumber} fully verified (${totals.scanned}/${totals.required}).`, 'success');
     }
@@ -6299,6 +7134,10 @@ async function processVerifyManual(key) {
 
 function processVerifyUndo(key) {
   if (!isVerificationStyleModeEnabled()) return;
+  if (qcModeEnabled) {
+    processQcUndo(key, 'pass');
+    return;
+  }
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
     return;
@@ -6328,6 +7167,9 @@ function processVerifyUndo(key) {
 
 async function processVerifyScan(scannedCode) {
   if (!isVerificationStyleModeEnabled()) return false;
+  if (qcModeEnabled) {
+    return processQcScan(scannedCode);
+  }
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
     return true;
@@ -6358,7 +7200,7 @@ async function processVerifyScan(scannedCode) {
 
   const target = candidates.find((row) => row.scannedQty < row.requiredQty) || candidates[0];
   if (target.scannedQty >= target.requiredQty) {
-    setStatus(`${getVerifyDisplayLabel(target)} is already fully scanned.`, 'info');
+    setStatus(`${getVerifyDisplayLabel(target)} is already fully ${wholesaleModeEnabled ? 'built' : 'scanned'}.`, 'info');
     return true;
   }
 
@@ -6372,7 +7214,7 @@ async function processVerifyScan(scannedCode) {
   const result = incrementVerifyRow(target);
 
   if (!result.success) {
-    setStatus(`${getVerifyDisplayLabel(target)} is already fully scanned.`, 'info');
+    setStatus(`${getVerifyDisplayLabel(target)} is already fully ${wholesaleModeEnabled ? 'built' : 'scanned'}.`, 'info');
     return true;
   }
 
@@ -6387,7 +7229,7 @@ async function processVerifyScan(scannedCode) {
   if (totals.isComplete) {
     playVerifyCompleteSound();
     if (wholesaleModeEnabled) {
-      setStatus(`Wholesale build complete for ${currentOrderNumber} (${totals.scanned}/${totals.required}).`, 'success');
+      setStatus(`Builder mode complete for ${currentOrderNumber} (${totals.scanned}/${totals.required}).`, 'success');
     } else {
       setStatus(`Order ${currentOrderNumber} fully verified (${totals.scanned}/${totals.required}).`, 'success');
     }
@@ -6551,7 +7393,7 @@ async function submitAwaitingParts() {
   }
 }
 
-function openQcFailDialog(orderId, lineItems) {
+function openQcFailDialog(orderId, lineItems, defaults = {}) {
   const modal = document.getElementById('qcFailModal');
   const skuSelect = document.getElementById('qcFailSku');
   const reasonInput = document.getElementById('qcFailReason');
@@ -6559,29 +7401,70 @@ function openQcFailDialog(orderId, lineItems) {
 
   skuSelect.innerHTML = '';
 
-  const uniqueSkuItems = [];
-  const seenSkus = new Set();
+  if (qcModeEnabled && verifyItems.length) {
+    const defaultItemKey = String(defaults?.itemKey || '').trim();
+    const defaultSku = normalizeDisplaySku(defaults?.sku);
+    let firstAvailableOption = null;
+    let selectedOption = null;
 
-  (lineItems || []).forEach((item) => {
-    if (!item || !item.sku) return;
-    if (seenSkus.has(item.sku)) return;
-    seenSkus.add(item.sku);
-    uniqueSkuItems.push(item);
-  });
+    verifyItems.forEach((row) => {
+      const sku = getQcFailSkuForRow(row);
+      if (!sku) return;
 
-  uniqueSkuItems.forEach((item) => {
-    const option = document.createElement('option');
-    option.value = item.sku;
-    option.textContent = `${item.sku} — ${item.title || ''}`;
-    skuSelect.appendChild(option);
-  });
+      const checkedQty = getQcRowCheckedQty(row);
+      const requiredQty = Math.max(1, Math.floor(Number(row.requiredQty) || 1));
+      const option = document.createElement('option');
+      option.value = row.key;
+      option.dataset.qcItemKey = row.key;
+      option.dataset.sku = sku;
+      option.textContent = `${sku} - ${row.productName || sku} (${checkedQty}/${requiredQty} checked)`;
+      option.disabled = checkedQty >= requiredQty && row.key !== defaultItemKey;
+      skuSelect.appendChild(option);
 
-  if (!uniqueSkuItems.length) {
-    setStatus('Error: No SKU found on this order to mark as QC fail.', 'error');
-    return;
+      if (!option.disabled && !firstAvailableOption) {
+        firstAvailableOption = option;
+      }
+      if (
+        (defaultItemKey && row.key === defaultItemKey)
+        || (defaultSku && normalizeDisplaySku(sku) === defaultSku)
+      ) {
+        selectedOption = option;
+      }
+    });
+
+    if (!skuSelect.options.length) {
+      setStatus('Error: No item found on this order to mark as QC fail.', 'error');
+      return;
+    }
+
+    (selectedOption || firstAvailableOption || skuSelect.options[0]).selected = true;
+  } else {
+    const uniqueSkuItems = [];
+    const seenSkus = new Set();
+
+    (lineItems || []).forEach((item) => {
+      if (!item || !item.sku) return;
+      if (seenSkus.has(item.sku)) return;
+      seenSkus.add(item.sku);
+      uniqueSkuItems.push(item);
+    });
+
+    uniqueSkuItems.forEach((item) => {
+      const option = document.createElement('option');
+      option.value = item.sku;
+      option.dataset.sku = item.sku;
+      option.textContent = `${item.sku} - ${item.title || ''}`;
+      skuSelect.appendChild(option);
+    });
+
+    if (!uniqueSkuItems.length) {
+      setStatus('Error: No SKU found on this order to mark as QC fail.', 'error');
+      return;
+    }
   }
 
   skuSelect.dataset.orderId = orderId;
+  skuSelect.dataset.qcItemKey = String(defaults?.itemKey || '').trim();
   reasonInput.value = '';
   modal.classList.add('is-open');
 }
@@ -6595,6 +7478,7 @@ function closeQcFailDialog() {
   if (skuSelect) {
     skuSelect.innerHTML = '';
     skuSelect.dataset.orderId = '';
+    skuSelect.dataset.qcItemKey = '';
   }
   if (reasonInput) reasonInput.value = '';
 }
@@ -6675,8 +7559,10 @@ async function submitQcFail() {
   const reasonInput = document.getElementById('qcFailReason');
   if (!skuSelect || !reasonInput) return;
 
+  const selectedOption = skuSelect.selectedOptions?.[0] || null;
   const orderId = skuSelect.dataset.orderId;
-  const sku = skuSelect.value;
+  const sku = selectedOption?.dataset?.sku || skuSelect.value;
+  const qcItemKey = selectedOption?.dataset?.qcItemKey || skuSelect.dataset.qcItemKey || '';
   const reason = reasonInput.value.trim();
 
   if (!orderId) {
@@ -6720,11 +7606,29 @@ async function submitQcFail() {
       }
     }
 
-    setStatus(
-      `QC fail saved for ${sku}: ${reason}. Last waiting_qc by: ${data.latestWaitingQcStaff || 'No waiting_qc record found'}`,
-      'success'
-    );
     closeQcFailDialog();
+    if (qcModeEnabled) {
+      const row = verifyItems.find((item) => item.key === qcItemKey) || findQcRowForSku(sku);
+      const result = incrementQcRow(row, 'fail');
+      if (result.success) {
+        renderAndSaveQcProgress();
+        const totals = getQcTotals();
+        setStatus(
+          `QC fail saved for ${sku}: ${reason}. ${totals.passed} passed, ${totals.failed} failed.`,
+          'error'
+        );
+      } else {
+        setStatus(
+          `QC fail reason saved for ${sku}: ${reason}. Count was not changed because the item is already fully checked.`,
+          'info'
+        );
+      }
+    } else {
+      setStatus(
+        `QC fail saved for ${sku}: ${reason}. Last waiting_qc by: ${data.latestWaitingQcStaff || 'No waiting_qc record found'}`,
+        'success'
+      );
+    }
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
   } finally {
@@ -6732,7 +7636,7 @@ async function submitQcFail() {
   }
 }
 
-async function runOrderAction(tag) {
+async function runOrderAction(tag, options = {}) {
   const normalizedBarcode = String(currentOrderBarcode || '').trim().toUpperCase();
   if (!normalizedBarcode) {
     setStatus('Scan an order first to enable actions.', 'error');
@@ -6750,6 +7654,14 @@ async function runOrderAction(tag) {
     return false;
   }
 
+  if (qcModeEnabled && tag === 'qc_passed' && verifyItems.length) {
+    const totals = getQcTotals();
+    if (totals.failed > 0) {
+      setStatus('QC has failed items. Clear failed counts before marking the order QC passed.', 'error');
+      return false;
+    }
+  }
+
   if (loading || isAnyDialogOpen()) return false;
 
   const isDuplicate =
@@ -6758,6 +7670,14 @@ async function runOrderAction(tag) {
     !NON_DEDUPE_ACTION_TAGS.has(tag);
 
   if (isDuplicate) {
+    if (qcModeEnabled && tag === 'qc_passed' && verifyItems.length) {
+      if (markAllRemainingQcPassed()) {
+        renderAndSaveQcProgress();
+        const totals = getQcTotals();
+        setStatus(`QC counts marked passed for ${currentOrderNumber} (${totals.passed}/${totals.required}).`, 'success');
+        return true;
+      }
+    }
     setStatus(`Skipped duplicate action: ${formatActionLabel(tag)}.`, 'info');
     return true;
   }
@@ -6790,6 +7710,10 @@ async function runOrderAction(tag) {
     lastActionTag = tag;
     lastActionBarcode = normalizedBarcode;
     applyOrderHeaderData(data, { fallbackTag: tag });
+    if (qcModeEnabled && tag === 'qc_passed' && verifyItems.length) {
+      markAllRemainingQcPassed();
+      scheduleQcProgressSave();
+    }
     if (tag === 'racked_up') {
       recordLastRackedOrder({
         orderNumber: data.orderNumber || currentOrderNumber,
@@ -6800,7 +7724,24 @@ async function runOrderAction(tag) {
     if (tag === 'wholesale_adapter_built') {
       setStatus(
         appendActionWarnings(
-          `Order ${data.orderNumber} adapter built by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`,
+          `Order ${data.orderNumber} builder scan recorded by ${data.staff}. Total scans: ${data.wholesaleAdapterBuiltCount ?? 1}`,
+          data
+        ),
+        'success'
+      );
+    } else if (tag === 'waiting_qc') {
+      setStatus(
+        appendActionWarnings(
+          `Order ${data.orderNumber} marked Waiting QC by ${data.staff}.`,
+          data
+        ),
+        'success'
+      );
+    } else if (qcModeEnabled && tag === 'qc_passed' && verifyItems.length) {
+      const totals = getQcTotals();
+      setStatus(
+        appendActionWarnings(
+          `Order ${data.orderNumber} QC passed by ${data.staff}. ${totals.passed}/${totals.required} passed.`,
           data
         ),
         'success'
@@ -6816,7 +7757,7 @@ async function runOrderAction(tag) {
     if (tag === 'awaiting_parts') {
       openAwaitingPartsDialog(normalizedBarcode, lastRenderedLineItems);
     } else if (tag === 'qc_fail') {
-      openQcFailDialog(normalizedBarcode, data.lineItems || []);
+      openQcFailDialog(normalizedBarcode, data.lineItems || [], options?.qcFailDefaults || {});
     } else if (hasRenderedPickList) {
       setCurrentAwaitingPartsItems([]);
       renderCurrentOrderSection();
@@ -6856,6 +7797,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
 
   await flushPendingPickedRowCountsSave();
   await flushPendingVerifyProgressSave();
+  await flushPendingQcProgressSave();
   scrollPickListToTop();
 
   setLoading(true);
@@ -6925,12 +7867,16 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
       data.verifyProgressByItemKey && typeof data.verifyProgressByItemKey === 'object'
         ? data.verifyProgressByItemKey
         : {};
+    lastQcProgressByItemKey =
+      data.qcProgressByItemKey && typeof data.qcProgressByItemKey === 'object'
+        ? data.qcProgressByItemKey
+        : {};
     setPickedRowCountsFromPayload(data.pickedRowCounts);
     buildVerifyState(
       lastOrderItems,
       wholesaleModeEnabled
         ? lastWholesaleProgressByItemKey
-        : (verifyModeEnabled ? lastVerifyProgressByItemKey : null)
+        : (qcModeEnabled ? lastQcProgressByItemKey : (verifyModeEnabled ? lastVerifyProgressByItemKey : null))
     );
     hasRenderedPickList = true;
     prunePickedRowCountsToRenderedRows();
@@ -7042,6 +7988,7 @@ function registerOrderActionReminderNavigationGuards() {
   window.addEventListener('beforeunload', (event) => {
     sendPickedRowCountsBeacon();
     sendVerifyProgressBeacon();
+    sendQcProgressBeacon();
     if (suppressNextActionReminderUnload) return;
     if (!shouldShowOrderActionReminder()) return;
 
@@ -7309,7 +8256,7 @@ document.addEventListener('DOMContentLoaded', () => {
       lastOrderItems,
       wholesaleModeEnabled
         ? lastWholesaleProgressByItemKey
-        : (verifyModeEnabled ? lastVerifyProgressByItemKey : null)
+        : (qcModeEnabled ? lastQcProgressByItemKey : (verifyModeEnabled ? lastVerifyProgressByItemKey : null))
     );
   };
 
@@ -7326,11 +8273,18 @@ document.addEventListener('DOMContentLoaded', () => {
       flushWholesaleProgressSave(true);
     }
 
+    if (!qcModeEnabled && qcSaveTimeoutId) {
+      clearTimeout(qcSaveTimeoutId);
+      qcSaveTimeoutId = null;
+      flushQcProgressSave(true);
+    }
+
     if (pickerModeToggle) pickerModeToggle.checked = pickerModeEnabled;
     if (verifyModeToggle) verifyModeToggle.checked = verifyModeEnabled;
     if (wholesaleModeToggle) wholesaleModeToggle.checked = wholesaleModeEnabled;
     if (qcModeToggle) qcModeToggle.checked = qcModeEnabled;
     document.body?.classList.toggle('pick-list-page--qc-mode', qcModeEnabled);
+    document.body?.classList.toggle('pick-list-page--wholesale-mode', wholesaleModeEnabled);
 
     setCookieValue(PICKER_MODE_COOKIE, pickerModeEnabled ? '1' : '0');
     setCookieValue(VERIFY_MODE_COOKIE, verifyModeEnabled ? '1' : '0');

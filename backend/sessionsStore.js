@@ -135,6 +135,23 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE TABLE IF NOT EXISTS qc_order_progress (
+    shop TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    itemKey TEXT NOT NULL,
+    passedQty INTEGER NOT NULL,
+    failedQty INTEGER NOT NULL,
+    updatedAt TEXT NOT NULL,
+    PRIMARY KEY (shop, barcode, itemKey)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_qc_order_progress_shop_barcode
+  ON qc_order_progress (shop, barcode)
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS wholesale_build_events (
     shop TEXT NOT NULL,
     barcode TEXT NOT NULL,
@@ -1830,6 +1847,71 @@ module.exports = {
       deleteStmt.run(String(shop), normalizedBarcode);
       entries.forEach((entry) => {
         insertStmt.run(String(shop), normalizedBarcode, entry.itemKey, entry.scannedQty, nowIso);
+      });
+    });
+
+    tx();
+  },
+
+  getQcOrderProgress({ shop, barcode }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return {};
+
+    const rows = db.prepare(`
+      SELECT itemKey, passedQty, failedQty
+      FROM qc_order_progress
+      WHERE shop = ? AND barcode = ?
+    `).all(String(shop), normalizedBarcode);
+
+    const progressByItemKey = {};
+    rows.forEach((row) => {
+      if (!row?.itemKey) return;
+      const passedQty = Math.max(0, Number(row.passedQty) || 0);
+      const failedQty = Math.max(0, Number(row.failedQty) || 0);
+      if (passedQty <= 0 && failedQty <= 0) return;
+      progressByItemKey[String(row.itemKey)] = { passedQty, failedQty };
+    });
+
+    return progressByItemKey;
+  },
+
+  setQcOrderProgress({ shop, barcode, progressByItemKey }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return;
+
+    const entries = Object.entries(progressByItemKey || {})
+      .map(([itemKey, value]) => {
+        const source = value && typeof value === 'object' ? value : {};
+        return {
+          itemKey: String(itemKey || '').trim(),
+          passedQty: Math.max(0, Math.floor(Number(source.passedQty) || 0)),
+          failedQty: Math.max(0, Math.floor(Number(source.failedQty) || 0)),
+        };
+      })
+      .filter((entry) => entry.itemKey && (entry.passedQty > 0 || entry.failedQty > 0));
+
+    const nowIso = new Date().toISOString();
+    const deleteStmt = db.prepare(`
+      DELETE FROM qc_order_progress
+      WHERE shop = ? AND barcode = ?
+    `);
+    const insertStmt = db.prepare(`
+      INSERT OR REPLACE INTO qc_order_progress
+      (shop, barcode, itemKey, passedQty, failedQty, updatedAt)
+      VALUES (?, ?, ?, ?, ?, ?)
+    `);
+
+    const tx = db.transaction(() => {
+      deleteStmt.run(String(shop), normalizedBarcode);
+      entries.forEach((entry) => {
+        insertStmt.run(
+          String(shop),
+          normalizedBarcode,
+          entry.itemKey,
+          entry.passedQty,
+          entry.failedQty,
+          nowIso
+        );
       });
     });
 

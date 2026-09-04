@@ -7111,6 +7111,10 @@ router.post('/api/pick-list', async (req, res) => {
       shop,
       barcode: normalizedBarcode,
     });
+    const qcProgressByItemKey = sessionsStore.getQcOrderProgress({
+      shop,
+      barcode: normalizedBarcode,
+    });
     const pickedRowCounts = sessionsStore.getPickListPickedProgress({
       shop,
       barcode: normalizedBarcode,
@@ -7177,6 +7181,7 @@ router.post('/api/pick-list', async (req, res) => {
       trackerUrl: trackerInfo.trackerUrl,
       wholesaleProgressByItemKey,
       verifyProgressByItemKey,
+      qcProgressByItemKey,
       pickedRowCounts,
       hpaTankShippingWarning,
       wholesaleOrderWarning,
@@ -7651,6 +7656,42 @@ router.post('/api/pick-list-verify-progress', async (req, res) => {
     return res.json({ success: true });
   } catch (err) {
     console.error('Error in /api/pick-list-verify-progress:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/pick-list-qc-progress', async (req, res) => {
+  try {
+    const { barcode, progressByItemKey } = req.body || {};
+    const normalizedBarcode = normalizeScanBarcode(barcode);
+
+    if (!normalizedBarcode) {
+      return res.status(400).json({ success: false, error: 'Missing barcode' });
+    }
+
+    if (!progressByItemKey || typeof progressByItemKey !== 'object' || Array.isArray(progressByItemKey)) {
+      return res.status(400).json({ success: false, error: 'Missing progressByItemKey object' });
+    }
+
+    const shop = req.cookies.shop;
+    if (!shop) {
+      return res.status(401).json({ success: false, error: 'Not logged in' });
+    }
+
+    const session = sessionsStore.get(shop);
+    if (!session) {
+      return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    sessionsStore.setQcOrderProgress({
+      shop,
+      barcode: normalizedBarcode,
+      progressByItemKey,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /api/pick-list-qc-progress:', err);
     return res.status(500).json({ success: false, error: err.message || 'Server error' });
   }
 });
