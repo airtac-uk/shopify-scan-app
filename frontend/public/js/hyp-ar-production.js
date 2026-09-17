@@ -43,12 +43,73 @@ function formatDatePlaced(value) {
   }).format(date);
 }
 
+function formatAuditTimestamp(value) {
+  if (!value) return '-';
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return '-';
+  return new Intl.DateTimeFormat('en-GB', {
+    day: '2-digit',
+    month: 'short',
+    year: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  }).format(date);
+}
+
 function formatStatusLabel(value) {
   return String(value || '')
     .trim()
     .toLowerCase()
     .replace(/_/g, ' ')
     .replace(/\b\w/g, (match) => match.toUpperCase());
+}
+
+function normalizeHypActionType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return normalized || 'stage_changed';
+}
+
+function getHypActionText(event = {}) {
+  const actionType = normalizeHypActionType(event.actionType);
+  const receiverCode = String(event.receiverCode || '').trim() || 'HYP receiver';
+  const stageLabel = String(event.stageLabel || '').trim() || formatStatusLabel(event.stageKey);
+  const previousStageLabel = String(event.previousStageLabel || '').trim();
+
+  if (actionType === 'created') {
+    return `${receiverCode} added at ${stageLabel}`;
+  }
+
+  if (actionType === 'deleted') {
+    return `${receiverCode} deleted from tracker`;
+  }
+
+  if (actionType === 'stage_changed') {
+    return previousStageLabel
+      ? `${receiverCode} moved from ${previousStageLabel} to ${stageLabel}`
+      : `${receiverCode} moved to ${stageLabel}`;
+  }
+
+  return `${receiverCode} updated`;
+}
+
+function getHypActionTone(event = {}) {
+  const actionType = normalizeHypActionType(event.actionType);
+  if (actionType === 'deleted') return 'danger';
+  if (actionType === 'created') return 'neutral';
+  return 'stage';
+}
+
+function getSortedHypEvents(events = []) {
+  return (Array.isArray(events) ? events : [])
+    .slice()
+    .sort((left, right) => {
+      const leftTime = new Date(left?.createdAt || 0).getTime();
+      const rightTime = new Date(right?.createdAt || 0).getTime();
+      const timeDiff = (Number.isNaN(rightTime) ? 0 : rightTime) - (Number.isNaN(leftTime) ? 0 : leftTime);
+      if (timeDiff !== 0) return timeDiff;
+      return (Number(right?.id) || 0) - (Number(left?.id) || 0);
+    });
 }
 
 function getReceiverOrderStatus(receiver = {}) {
@@ -207,6 +268,7 @@ function refreshProductionView({ updateTimestamp = false } = {}) {
   renderOp1Summary(summary.op1BySku);
   renderStageFilters(visibleReceivers);
   renderReceiverTable(getFilteredReceivers());
+  renderActionTimeline(hypProductionData.events || []);
   if (updateTimestamp) updateLastUpdatedLabel();
 }
 
@@ -452,6 +514,43 @@ function renderReceiverTable(receivers = []) {
   `;
 }
 
+function renderActionTimeline(events = []) {
+  const container = document.getElementById('hypActionTimeline');
+  if (!container) return;
+
+  const safeEvents = getSortedHypEvents(events).slice(0, 100);
+  if (!safeEvents.length) {
+    container.innerHTML = '<p class="pick-list-empty">No HYP actions recorded yet.</p>';
+    return;
+  }
+
+  container.innerHTML = `
+    <ol class="hyp-action-timeline__list">
+      ${safeEvents.map((event) => {
+        const actionTone = getHypActionTone(event);
+        const staff = String(event.staff || '').trim();
+        const orderNumber = String(event.orderNumber || '').trim();
+        const note = String(event.note || '').trim();
+        return `
+          <li class="hyp-action-timeline__item hyp-action-timeline__item--${escapeHtmlAttribute(actionTone)}">
+            <time datetime="${escapeHtmlAttribute(event.createdAt || '')}">
+              ${escapeHtml(formatAuditTimestamp(event.createdAt))}
+            </time>
+            <div>
+              <strong>${escapeHtml(getHypActionText(event))}</strong>
+              <span>
+                ${staff ? `By ${escapeHtml(staff)}` : 'System'}
+                ${orderNumber ? ` | <a href="${escapeHtmlAttribute(buildOrderViewerUrl(orderNumber))}">${escapeHtml(orderNumber)}</a>` : ''}
+                ${note ? ` | ${escapeHtml(note)}` : ''}
+              </span>
+            </div>
+          </li>
+        `;
+      }).join('')}
+    </ol>
+  `;
+}
+
 function renderProduction(data, { silent = false } = {}) {
   hypProductionData = data;
   if (!Array.isArray(hypProductionData.receivers)) {
@@ -459,6 +558,9 @@ function renderProduction(data, { silent = false } = {}) {
   }
   if (!Array.isArray(hypProductionData.stages)) {
     hypProductionData.stages = [];
+  }
+  if (!Array.isArray(hypProductionData.events)) {
+    hypProductionData.events = [];
   }
   if (!hypProductionData.summary) {
     hypProductionData.summary = buildLocalProductionSummary(hypProductionData.receivers);
@@ -623,6 +725,9 @@ async function updateReceiverStage(receiverId, stageKey) {
     }
 
     mergeReceiverIntoProductionData(data.receiver);
+    if (Array.isArray(data.events)) {
+      hypProductionData.events = data.events;
+    }
     refreshProductionView({ updateTimestamp: true });
     setStatus(`${data.receiver.receiverCode} moved to ${data.receiver.currentStageLabel}.`, 'success');
   } catch (err) {
@@ -655,6 +760,9 @@ async function deleteReceiver(receiverId) {
     }
 
     removeReceiverFromProductionData(receiverId);
+    if (Array.isArray(data.events)) {
+      hypProductionData.events = data.events;
+    }
     refreshProductionView({ updateTimestamp: true });
     setStatus(`${receiver.receiverCode} deleted from the HYP-AR tracker.`, 'success');
   } catch (err) {

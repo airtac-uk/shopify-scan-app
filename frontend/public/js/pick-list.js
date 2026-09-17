@@ -132,6 +132,37 @@ function setCookieValue(name, value, maxAgeDays = 365) {
   document.cookie = `${name}=${encodeURIComponent(value)}; path=/; max-age=${maxAgeSeconds}; samesite=lax`;
 }
 
+function normalizeStaffIdentity(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function getCurrentStaffName() {
+  return String(getCookieValue('userId') || '').trim();
+}
+
+function isCurrentUserQcBuilder() {
+  const currentStaff = normalizeStaffIdentity(getCurrentStaffName());
+  const builderStaff = normalizeStaffIdentity(currentQcBuilderStaff);
+  return Boolean(qcModeEnabled && currentStaff && builderStaff && currentStaff === builderStaff);
+}
+
+function getQcSelfReviewBlockedMessage() {
+  return 'You built this order. Ask another team member to complete QC.';
+}
+
+function isQcSelfReviewActionTag(tag) {
+  return tag === 'qc_passed' || tag === 'qc_fail';
+}
+
+function isQcSelfReviewActionBlocked(tag = '') {
+  return qcModeEnabled && isQcSelfReviewActionTag(tag) && isCurrentUserQcBuilder();
+}
+
+function showQcSelfReviewBlockedWarning() {
+  playVerifyErrorSound();
+  setStatus(getQcSelfReviewBlockedMessage(), 'error');
+}
+
 function focusBarcodeInput({ selectAll = false, preventScroll = false } = {}) {
   const input = document.getElementById('pickListBarcode');
   if (!input) return;
@@ -1818,7 +1849,8 @@ function setActionButtonsEnabled(enabled) {
 
     const tag = button.dataset.orderAction || '';
     const packagedLocked = tag === 'packaged' && isPackagedActionLocked();
-    button.disabled = loading || !actionButtonsUnlocked || packagedLocked || isCurrentOrderWorkflowBlocked();
+    const qcSelfReviewLocked = isQcSelfReviewActionBlocked(tag);
+    button.disabled = loading || !actionButtonsUnlocked || packagedLocked || qcSelfReviewLocked || isCurrentOrderWorkflowBlocked();
   });
 }
 
@@ -1831,6 +1863,15 @@ function syncVerifyButtonDisabledState() {
     }
 
     const role = button.dataset.role || 'increment';
+    if (
+      qcModeEnabled
+      && isCurrentUserQcBuilder()
+      && ['qc-pass', 'qc-fail', 'undo-pass', 'undo-fail'].includes(role)
+    ) {
+      button.disabled = true;
+      return;
+    }
+
     if (role === 'undo' || role === 'undo-pass' || role === 'undo-fail') {
       const canUndo = button.dataset.canUndo === '1';
       button.disabled = loading || !canUndo;
@@ -6376,6 +6417,7 @@ function renderVerifyOrderCards() {
     const usePickStyleVerifyTap = verifyModeEnabled && !wholesaleModeEnabled && !qcModeEnabled;
     const scanRequired = usePickStyleVerifyTap && isVerifyRowScanRequired(row);
     const builderQcFailReasons = wholesaleModeEnabled ? getVerifyRowQcFailReasons(row) : [];
+    const qcSelfReviewBlocked = qcModeEnabled && isCurrentUserQcBuilder();
     const item = document.createElement('div');
     item.className = `pick-verify-item${complete ? ' is-complete' : ''}`;
     if (builderQcFailReasons.length) {
@@ -6551,7 +6593,7 @@ function renderVerifyOrderCards() {
         passButton.textContent = 'Pass +1';
         passButton.dataset.role = 'qc-pass';
         passButton.dataset.complete = complete ? '1' : '0';
-        passButton.disabled = loading || complete;
+        passButton.disabled = loading || complete || qcSelfReviewBlocked;
         passButton.addEventListener('click', () => {
           processQcPassManual(row.key);
         });
@@ -6562,7 +6604,7 @@ function renderVerifyOrderCards() {
         failButton.textContent = 'Fail +1';
         failButton.dataset.role = 'qc-fail';
         failButton.dataset.complete = complete ? '1' : '0';
-        failButton.disabled = loading || complete;
+        failButton.disabled = loading || complete || qcSelfReviewBlocked;
         failButton.addEventListener('click', () => {
           processQcFailManual(row.key);
         });
@@ -6573,7 +6615,7 @@ function renderVerifyOrderCards() {
         undoPassButton.textContent = '-1 Pass';
         undoPassButton.dataset.role = 'undo-pass';
         undoPassButton.dataset.canUndo = getQcRowPassedQty(row) > 0 ? '1' : '0';
-        undoPassButton.disabled = loading || getQcRowPassedQty(row) <= 0;
+        undoPassButton.disabled = loading || qcSelfReviewBlocked || getQcRowPassedQty(row) <= 0;
         undoPassButton.addEventListener('click', () => {
           processQcUndo(row.key, 'pass');
         });
@@ -6584,7 +6626,7 @@ function renderVerifyOrderCards() {
         undoFailButton.textContent = '-1 Fail';
         undoFailButton.dataset.role = 'undo-fail';
         undoFailButton.dataset.canUndo = getQcRowFailedQty(row) > 0 ? '1' : '0';
-        undoFailButton.disabled = loading || getQcRowFailedQty(row) <= 0;
+        undoFailButton.disabled = loading || qcSelfReviewBlocked || getQcRowFailedQty(row) <= 0;
         undoFailButton.addEventListener('click', () => {
           processQcUndo(row.key, 'fail');
         });
@@ -6651,6 +6693,10 @@ function renderVerifyOrderCards() {
 function createQcModePanel() {
   const card = document.createElement('article');
   card.className = 'pick-list-card pick-qc-mode-card';
+  const selfQcBlocked = isCurrentUserQcBuilder();
+  if (selfQcBlocked) {
+    card.classList.add('is-self-qc-blocked');
+  }
 
   const eyebrow = document.createElement('p');
   eyebrow.className = 'pick-qc-mode-card__eyebrow';
@@ -6663,9 +6709,11 @@ function createQcModePanel() {
 
   const detail = document.createElement('p');
   detail.className = 'pick-qc-mode-card__detail';
-  detail.textContent = currentQcBuilderStaff
+  detail.textContent = selfQcBlocked
+    ? getQcSelfReviewBlockedMessage()
+    : (currentQcBuilderStaff
     ? 'Mark each adapter or bundle as QC passed or QC failed.'
-    : 'Mark the order as Waiting QC when the builder hands it over, then reload this order.';
+    : 'Mark the order as Waiting QC when the builder hands it over, then reload this order.');
   card.appendChild(detail);
 
   return card;
@@ -6851,6 +6899,10 @@ function renderAndSaveQcProgress() {
 }
 
 async function maybeApplyQcPassedForCompleteOrder() {
+  if (isCurrentUserQcBuilder()) {
+    showQcSelfReviewBlockedWarning();
+    return;
+  }
   const totals = getQcTotals();
   if (!totals.isComplete || totals.failed > 0) return;
   await runOrderAction('qc_passed');
@@ -6858,6 +6910,10 @@ async function maybeApplyQcPassedForCompleteOrder() {
 
 async function processQcPassManual(key) {
   if (!qcModeEnabled) return;
+  if (isCurrentUserQcBuilder()) {
+    showQcSelfReviewBlockedWarning();
+    return;
+  }
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
     return;
@@ -6895,6 +6951,10 @@ async function processQcPassManual(key) {
 
 async function processQcFailManual(key) {
   if (!qcModeEnabled) return;
+  if (isCurrentUserQcBuilder()) {
+    showQcSelfReviewBlockedWarning();
+    return;
+  }
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
     return;
@@ -6921,6 +6981,10 @@ async function processQcFailManual(key) {
 
 function processQcUndo(key, resultKey) {
   if (!qcModeEnabled) return;
+  if (isCurrentUserQcBuilder()) {
+    showQcSelfReviewBlockedWarning();
+    return;
+  }
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
     return;
@@ -6949,6 +7013,10 @@ function processQcUndo(key, resultKey) {
 
 async function processQcScan(scannedCode) {
   if (!qcModeEnabled) return false;
+  if (isCurrentUserQcBuilder()) {
+    showQcSelfReviewBlockedWarning();
+    return true;
+  }
   if (isCurrentOrderWorkflowBlocked()) {
     showWorkflowBlockedWarning(currentWorkflowBlock?.message);
     return true;
@@ -7559,6 +7627,11 @@ async function submitQcFail() {
   const reasonInput = document.getElementById('qcFailReason');
   if (!skuSelect || !reasonInput) return;
 
+  if (isCurrentUserQcBuilder()) {
+    showQcSelfReviewBlockedWarning();
+    return;
+  }
+
   const selectedOption = skuSelect.selectedOptions?.[0] || null;
   const orderId = skuSelect.dataset.orderId;
   const sku = selectedOption?.dataset?.sku || skuSelect.value;
@@ -7651,6 +7724,11 @@ async function runOrderAction(tag, options = {}) {
 
   if (tag === 'packaged' && isPackagedActionLocked()) {
     setStatus('Complete Verify Order before marking this order as Packaged.', 'error');
+    return false;
+  }
+
+  if (isQcSelfReviewActionBlocked(tag)) {
+    showQcSelfReviewBlockedWarning();
     return false;
   }
 

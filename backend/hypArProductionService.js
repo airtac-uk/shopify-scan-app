@@ -309,6 +309,10 @@ function buildHypArPublicProduction({ receivers = [], events = [] } = {}) {
   );
 
   const timeline = (Array.isArray(events) ? events : [])
+    .filter((event) => {
+      const actionType = normalizeText(event.actionType).toLowerCase();
+      return !actionType || actionType === 'created' || actionType === 'stage_changed';
+    })
     .map((event) => {
       const stage = getHypArStage(event.stageKey);
       const code = normalizeText(event.receiverCode);

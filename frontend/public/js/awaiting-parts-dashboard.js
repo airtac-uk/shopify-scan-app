@@ -100,40 +100,42 @@ function escapeHtmlAttribute(value) {
   return escapeHtml(value);
 }
 
-async function markAwaitingPartsOrderFulfilled(orderId, orderNumber) {
+async function clearAwaitingPartItem(orderId, orderNumber, partSku) {
   const normalizedOrderId = String(orderId || '').trim();
   const normalizedOrderNumber = String(orderNumber || '').trim();
-  if (!normalizedOrderId || !normalizedOrderNumber || awaitingPartsLoading) {
+  const normalizedPartSku = String(partSku || '').trim().toUpperCase();
+  if (!normalizedOrderId || !normalizedOrderNumber || !normalizedPartSku || awaitingPartsLoading) {
     return;
   }
 
-  const confirmed = window.confirm(`Mark ${normalizedOrderNumber} as fulfilled and remove it from the awaiting-parts queue?`);
+  const confirmed = window.confirm(`Clear ${normalizedPartSku} from ${normalizedOrderNumber}?`);
   if (!confirmed) return;
 
   setLoading(true);
-  setStatus(`Marking ${normalizedOrderNumber} fulfilled locally...`, 'info');
+  setStatus(`Clearing ${normalizedPartSku} from ${normalizedOrderNumber}...`, 'info');
 
   try {
-    const response = await fetch('/api/awaiting-parts/mark-fulfilled', {
+    const response = await fetch('/api/awaiting-parts/clear', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({
         orderId: normalizedOrderId,
         orderNumber: normalizedOrderNumber,
+        partSku: normalizedPartSku,
       }),
     });
 
     const data = await response.json();
     if (!response.ok || !data.success) {
-      throw new Error(data.error || 'Failed to mark order fulfilled');
+      throw new Error(data.error || 'Failed to clear awaiting part');
     }
 
     setLoading(false);
     await fetchAwaitingPartsSummary({ silent: true, sync: false });
     setStatus(
-      data.remoteTagUpdated
-        ? `Marked ${normalizedOrderNumber} fulfilled locally and retagged it as Packaged in Shopify.`
-        : `Marked ${normalizedOrderNumber} fulfilled locally.`,
+      data.remainingItemCount > 0
+        ? `Cleared ${normalizedPartSku} from ${normalizedOrderNumber}. ${data.remainingItemCount} awaiting part SKU${data.remainingItemCount === 1 ? '' : 's'} remain on this order.`
+        : `Cleared ${normalizedPartSku} from ${normalizedOrderNumber}. No awaiting parts remain on this order.`,
       'success'
     );
     return;
@@ -283,11 +285,12 @@ function renderAwaitingPartsList(items) {
                       ${orders.map((order) => `
                         <button
                           type="button"
-                          class="awaiting-parts-fulfill-btn awaiting-parts-fulfill-btn--minimal"
+                          class="awaiting-parts-clear-btn awaiting-parts-clear-btn--minimal"
                           data-awaiting-order-id="${escapeHtmlAttribute(order.orderId)}"
                           data-awaiting-order-number="${escapeHtmlAttribute(order.orderNumber || order.orderId)}"
+                          data-awaiting-part-sku="${escapeHtmlAttribute(item.partSku)}"
                         >
-                          Mark Fulfilled
+                          Clear
                         </button>
                       `).join('')}
                     </div>
@@ -371,11 +374,12 @@ function renderAwaitingPartsList(items) {
               <div class="awaiting-parts-order__actions">
                 <button
                   type="button"
-                  class="awaiting-parts-fulfill-btn"
+                  class="awaiting-parts-clear-btn"
                   data-awaiting-order-id="${escapeHtmlAttribute(order.orderId)}"
                   data-awaiting-order-number="${escapeHtmlAttribute(order.orderNumber || order.orderId)}"
+                  data-awaiting-part-sku="${escapeHtmlAttribute(item.partSku)}"
                 >
-                  Mark Fulfilled
+                  Clear
                 </button>
               </div>
             </div>
@@ -468,14 +472,15 @@ document.addEventListener('DOMContentLoaded', () => {
   if (listContainer) {
     listContainer.addEventListener('click', (event) => {
       const button = event.target instanceof Element
-        ? event.target.closest('.awaiting-parts-fulfill-btn')
+        ? event.target.closest('.awaiting-parts-clear-btn')
         : null;
       if (!button) return;
 
       event.preventDefault();
       const orderId = String(button.getAttribute('data-awaiting-order-id') || '').trim();
       const orderNumber = String(button.getAttribute('data-awaiting-order-number') || '').trim();
-      markAwaitingPartsOrderFulfilled(orderId, orderNumber);
+      const partSku = String(button.getAttribute('data-awaiting-part-sku') || '').trim();
+      clearAwaitingPartItem(orderId, orderNumber, partSku);
     });
   }
 

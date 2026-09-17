@@ -622,6 +622,38 @@ db.prepare(`
   )
 `).run();
 
+const hypReceiverEventColumns = db.prepare(`
+  PRAGMA table_info(hyp_receiver_events)
+`).all();
+
+if (!hypReceiverEventColumns.some((column) => column?.name === 'actionType')) {
+  db.prepare(`
+    ALTER TABLE hyp_receiver_events
+    ADD COLUMN actionType TEXT
+  `).run();
+}
+
+if (!hypReceiverEventColumns.some((column) => column?.name === 'previousStageKey')) {
+  db.prepare(`
+    ALTER TABLE hyp_receiver_events
+    ADD COLUMN previousStageKey TEXT
+  `).run();
+}
+
+if (!hypReceiverEventColumns.some((column) => column?.name === 'previousStageLabel')) {
+  db.prepare(`
+    ALTER TABLE hyp_receiver_events
+    ADD COLUMN previousStageLabel TEXT
+  `).run();
+}
+
+if (!hypReceiverEventColumns.some((column) => column?.name === 'note')) {
+  db.prepare(`
+    ALTER TABLE hyp_receiver_events
+    ADD COLUMN note TEXT
+  `).run();
+}
+
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_hyp_receiver_events_shop_order_created
   ON hyp_receiver_events (shop, orderId, createdAt ASC, id ASC)
@@ -630,6 +662,11 @@ db.prepare(`
 db.prepare(`
   CREATE INDEX IF NOT EXISTS idx_hyp_receiver_events_shop_receiver_created
   ON hyp_receiver_events (shop, receiverId, createdAt ASC, id ASC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_hyp_receiver_events_shop_created
+  ON hyp_receiver_events (shop, createdAt DESC, id DESC)
 `).run();
 
 function normalizeBarcode(barcode) {
@@ -983,6 +1020,10 @@ function normalizeHypReceiverRecord(row) {
 function normalizeHypReceiverEventRecord(row) {
   if (!row) return null;
 
+  const staff = String(row.staff || '').trim();
+  const actionType = String(row.actionType || '').trim()
+    || (staff ? 'stage_changed' : 'created');
+
   return {
     id: Number(row.id),
     shop: String(row.shop || '').trim(),
@@ -992,7 +1033,11 @@ function normalizeHypReceiverEventRecord(row) {
     orderNumber: String(row.orderNumber || '').trim(),
     stageKey: String(row.stageKey || '').trim(),
     stageLabel: String(row.stageLabel || '').trim(),
-    staff: String(row.staff || '').trim(),
+    staff,
+    actionType,
+    previousStageKey: String(row.previousStageKey || '').trim(),
+    previousStageLabel: String(row.previousStageLabel || '').trim(),
+    note: String(row.note || '').trim(),
     createdAt: row.createdAt || null,
   };
 }
@@ -1235,8 +1280,9 @@ module.exports = {
     `);
     const insertEventStmt = db.prepare(`
       INSERT INTO hyp_receiver_events (
-        shop, receiverId, receiverCode, orderId, orderNumber, stageKey, stageLabel, staff, createdAt
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        shop, receiverId, receiverCode, orderId, orderNumber, stageKey, stageLabel,
+        staff, actionType, previousStageKey, previousStageLabel, note, createdAt
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, 'created', NULL, NULL, ?, ?)
     `);
 
     const tx = db.transaction(() => {
@@ -1310,6 +1356,7 @@ module.exports = {
           normalizedOrderNumber,
           initialStageKey,
           initialStageLabel,
+          'Receiver added from Shopify sync.',
           nowIso
         );
       });
@@ -1471,6 +1518,7 @@ module.exports = {
     id,
     reason = 'manual_deleted',
     archivedAt = null,
+    staff = null,
   } = {}) {
     const normalizedShop = String(shop || '').trim();
     const normalizedId = Number(id);
@@ -1478,17 +1526,46 @@ module.exports = {
 
     const nowIso = archivedAt || new Date().toISOString();
     const safeReason = String(reason || 'manual_deleted').trim() || 'manual_deleted';
+    const safeStaff = staff ? String(staff).trim() : null;
+    const existing = this.getHypReceiverById({ shop: normalizedShop, id: normalizedId });
+    if (!existing) return null;
 
-    const result = db.prepare(`
-      UPDATE hyp_receivers
-      SET archivedAt = COALESCE(archivedAt, ?),
-          archiveReason = ?,
-          updatedAt = ?
-      WHERE shop = ?
-        AND id = ?
-    `).run(nowIso, safeReason, nowIso, normalizedShop, normalizedId);
+    const tx = db.transaction(() => {
+      const result = db.prepare(`
+        UPDATE hyp_receivers
+        SET archivedAt = COALESCE(archivedAt, ?),
+            archiveReason = ?,
+            updatedAt = ?
+        WHERE shop = ?
+          AND id = ?
+      `).run(nowIso, safeReason, nowIso, normalizedShop, normalizedId);
 
-    if (!result?.changes) return null;
+      if (!result?.changes) return false;
+
+      db.prepare(`
+        INSERT INTO hyp_receiver_events (
+          shop, receiverId, receiverCode, orderId, orderNumber, stageKey, stageLabel,
+          staff, actionType, previousStageKey, previousStageLabel, note, createdAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'deleted', ?, ?, ?, ?)
+      `).run(
+        normalizedShop,
+        normalizedId,
+        existing.receiverCode,
+        existing.orderId,
+        existing.orderNumber,
+        existing.currentStageKey,
+        existing.currentStageLabel,
+        safeStaff,
+        existing.currentStageKey,
+        existing.currentStageLabel,
+        safeReason,
+        nowIso
+      );
+
+      return true;
+    });
+
+    if (!tx()) return null;
     return this.getHypReceiverById({ shop: normalizedShop, id: normalizedId });
   },
 
@@ -1522,6 +1599,22 @@ module.exports = {
         AND orderId = ?
       ORDER BY createdAt ASC, id ASC
     `).all(normalizedShop, normalizedOrderId)
+      .map(normalizeHypReceiverEventRecord)
+      .filter(Boolean);
+  },
+
+  listHypReceiverEvents({ shop, limit = 100 } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 100)));
+    if (!normalizedShop) return [];
+
+    return db.prepare(`
+      SELECT *
+      FROM hyp_receiver_events
+      WHERE shop = ?
+      ORDER BY createdAt DESC, id DESC
+      LIMIT ?
+    `).all(normalizedShop, safeLimit)
       .map(normalizeHypReceiverEventRecord)
       .filter(Boolean);
   },
@@ -1571,8 +1664,9 @@ module.exports = {
 
       db.prepare(`
         INSERT INTO hyp_receiver_events (
-          shop, receiverId, receiverCode, orderId, orderNumber, stageKey, stageLabel, staff, createdAt
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          shop, receiverId, receiverCode, orderId, orderNumber, stageKey, stageLabel,
+          staff, actionType, previousStageKey, previousStageLabel, note, createdAt
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'stage_changed', ?, ?, NULL, ?)
       `).run(
         normalizedShop,
         normalizedId,
@@ -1582,6 +1676,8 @@ module.exports = {
         normalizedStageKey,
         normalizedStageLabel,
         safeStaff,
+        existing.currentStageKey,
+        existing.currentStageLabel,
         nowIso
       );
     });
@@ -2248,6 +2344,26 @@ module.exports = {
       SET resolvedAt = ?, updatedAt = ?
       WHERE shop = ? AND orderId = ? AND resolvedAt IS NULL
     `).run(nowIso, nowIso, String(shop), normalizedOrderId);
+
+    return Number(result?.changes || 0);
+  },
+
+  resolveAwaitingPartItem({ shop, orderId, partSku, resolvedAt }) {
+    const normalizedOrderId = String(orderId || '').trim();
+    const normalizedPartSku = normalizeBarcode(partSku);
+    if (!shop || !normalizedOrderId || !normalizedPartSku) {
+      return 0;
+    }
+
+    const nowIso = resolvedAt || new Date().toISOString();
+    const result = db.prepare(`
+      UPDATE awaiting_parts_items
+      SET resolvedAt = ?, updatedAt = ?
+      WHERE shop = ?
+        AND orderId = ?
+        AND partSku = ?
+        AND resolvedAt IS NULL
+    `).run(nowIso, nowIso, String(shop), normalizedOrderId, normalizedPartSku);
 
     return Number(result?.changes || 0);
   },

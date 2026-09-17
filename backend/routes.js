@@ -382,6 +382,7 @@ const webhookRegistrationCheckedShops = new Set();
 const awaitingPartsSyncPromises = new Map();
 const hypArProductionSyncJobs = new Map();
 const HYP_AR_BACKGROUND_SYNC_MIN_INTERVAL_MS = 5 * 60 * 1000;
+const HYP_AR_AUDIT_TIMELINE_LIMIT = 100;
 const ALLOW_AWAITING_PARTS_NOTE_SYNC = String(process.env.ALLOW_AWAITING_PARTS_NOTE_SYNC || '').trim() === '1';
 const BLOCKED_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'PARTIALLY_FULFILLED', 'RESTOCKED']);
 const CLOSED_AWAITING_PARTS_FULFILLMENT_STATUSES = new Set(['FULFILLED', 'RESTOCKED']);
@@ -627,6 +628,20 @@ function resolveLatestWaitingQcStaff({ shop, normalizedBarcode, orderId, orderNo
     orderId,
     stageKey: 'quality_check',
   });
+}
+
+function normalizeStaffIdentity(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').toLowerCase();
+}
+
+function isSameStaffMember(left, right) {
+  const normalizedLeft = normalizeStaffIdentity(left);
+  const normalizedRight = normalizeStaffIdentity(right);
+  return Boolean(normalizedLeft && normalizedRight && normalizedLeft === normalizedRight);
+}
+
+function getQcSelfReviewBlockedMessage() {
+  return 'You cannot QC an order you built. Ask another team member to complete QC.';
 }
 
 function verifyShopifyWebhook(rawBody, hmacHeader) {
@@ -4324,7 +4339,8 @@ router.post('/api/tag-order', async (req, res) => {
     }
 
     const order = orderEdge.node;
-    const latestWaitingQcStaff = tag == "qc_fail"
+    const isQcAction = tag == "qc_fail" || tag == "qc_passed";
+    const latestWaitingQcStaff = isQcAction
       ? resolveLatestWaitingQcStaff({
           shop,
           normalizedBarcode,
@@ -4332,6 +4348,13 @@ router.post('/api/tag-order', async (req, res) => {
           orderNote: order.note || '',
         })
       : null;
+    if (isQcAction && isSameStaffMember(staff, latestWaitingQcStaff)) {
+      return res.status(403).json({
+        success: false,
+        error: getQcSelfReviewBlockedMessage(),
+        qcBuilderStaff: latestWaitingQcStaff,
+      });
+    }
     const attributedStaff = tag == "qc_fail"
       ? (latestWaitingQcStaff || staff)
       : staff;
@@ -5045,6 +5068,97 @@ router.post('/api/awaiting-parts/mark-fulfilled', async (req, res) => {
   }
 });
 
+router.post('/api/awaiting-parts/clear', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const normalizedOrderId = String(req.body?.orderId || '').trim();
+    const normalizedOrderNumber = String(req.body?.orderNumber || '').trim();
+    const normalizedPartSku = normalizeSku(req.body?.partSku);
+
+    if (!normalizedOrderId || !normalizedOrderNumber || !normalizedPartSku) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing orderId, orderNumber, or partSku',
+      });
+    }
+
+    const openItems = sessionsStore.getOpenAwaitingPartsItemsForOrder({
+      shop: auth.shop,
+      orderId: normalizedOrderId,
+    });
+    const targetItem = openItems.find((item) => normalizeSku(item.partSku) === normalizedPartSku);
+    if (!targetItem) {
+      return res.status(404).json({
+        success: false,
+        error: `${normalizedPartSku} is not open for ${normalizedOrderNumber}`,
+      });
+    }
+
+    const resolvedItemCount = sessionsStore.resolveAwaitingPartItem({
+      shop: auth.shop,
+      orderId: normalizedOrderId,
+      partSku: normalizedPartSku,
+      resolvedAt: new Date().toISOString(),
+    });
+
+    if (resolvedItemCount <= 0) {
+      return res.status(404).json({
+        success: false,
+        error: `${normalizedPartSku} was already clear for ${normalizedOrderNumber}`,
+      });
+    }
+
+    const remainingItems = sessionsStore.getOpenAwaitingPartsItemsForOrder({
+      shop: auth.shop,
+      orderId: normalizedOrderId,
+    });
+    const trackerRecord = sessionsStore.getOrderTrackerByOrderId(normalizedOrderId);
+
+    if (remainingItems.length === 0) {
+      const priorStageKey = Array.isArray(trackerRecord?.events)
+        ? [...trackerRecord.events]
+            .reverse()
+            .find((event) => String(event?.stageKey || '').trim() && String(event.stageKey).trim() !== 'awaiting_parts')
+            ?.stageKey
+        : '';
+      const nextStage = TRACKER_STAGES[priorStageKey] || TRACKER_STAGES.received;
+
+      sessionsStore.saveOrderTrackerSnapshot({
+        shop: auth.shop,
+        orderId: normalizedOrderId,
+        barcode: normalizeScanBarcode(trackerRecord?.barcode || normalizedOrderNumber || normalizedOrderId),
+        orderNumber: trackerRecord?.orderNumber || normalizedOrderNumber,
+        orderCreatedAt: trackerRecord?.orderCreatedAt || null,
+        currentStage: nextStage,
+        workflowStatus: trackerRecord?.workflowStatus || null,
+        lineItems: Array.isArray(trackerRecord?.lineItems) ? trackerRecord.lineItems : [],
+        legacyEvents: [],
+        appendEventIfStageChanged: true,
+        sourceTag: 'awaiting_parts_cleared',
+        staff: auth.userId,
+      });
+    }
+
+    return res.json({
+      success: true,
+      orderId: normalizedOrderId,
+      orderNumber: trackerRecord?.orderNumber || normalizedOrderNumber,
+      partSku: normalizedPartSku,
+      resolvedItemCount,
+      remainingItemCount: remainingItems.length,
+      remainingItems,
+    });
+  } catch (err) {
+    console.error('Error in /api/awaiting-parts/clear:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
 router.get('/api/awaiting-parts-summary', async (req, res) => {
   try {
     const shop = req.cookies.shop;
@@ -5126,6 +5240,10 @@ function buildHypArProductionPayload({ shop, includeArchived = false, syncStats 
     includeArchived,
     stages: HYP_AR_STAGES,
     receivers: visibleReceivers,
+    events: sessionsStore.listHypReceiverEvents({
+      shop,
+      limit: HYP_AR_AUDIT_TIMELINE_LIMIT,
+    }),
     summary: {
       activeReceiverCount: activeReceivers.length,
       archivedReceiverCount: archivedCount,
@@ -5221,6 +5339,30 @@ router.get('/api/hyp-ar-production/sync', async (req, res) => {
   }
 });
 
+router.get('/api/hyp-ar-production/events', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const requestedLimit = Math.floor(Number(req.query.limit) || HYP_AR_AUDIT_TIMELINE_LIMIT);
+    const limit = Math.max(1, Math.min(500, requestedLimit));
+
+    return res.json({
+      success: true,
+      events: sessionsStore.listHypReceiverEvents({
+        shop: auth.shop,
+        limit,
+      }),
+    });
+  } catch (err) {
+    console.error('Error in GET /api/hyp-ar-production/events:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
 router.post('/api/hyp-ar-production/:id/stage', async (req, res) => {
   try {
     const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
@@ -5255,6 +5397,10 @@ router.post('/api/hyp-ar-production/:id/stage', async (req, res) => {
       success: true,
       receiver,
       stages: HYP_AR_STAGES,
+      events: sessionsStore.listHypReceiverEvents({
+        shop: auth.shop,
+        limit: HYP_AR_AUDIT_TIMELINE_LIMIT,
+      }),
     });
   } catch (err) {
     console.error('Error in /api/hyp-ar-production/:id/stage:', err);
@@ -5282,6 +5428,7 @@ router.delete('/api/hyp-ar-production/:id', async (req, res) => {
       shop: auth.shop,
       id: receiverId,
       reason: 'manual_deleted',
+      staff: auth.userId,
     });
 
     if (!receiver) {
@@ -5294,6 +5441,10 @@ router.delete('/api/hyp-ar-production/:id', async (req, res) => {
     return res.json({
       success: true,
       receiver,
+      events: sessionsStore.listHypReceiverEvents({
+        shop: auth.shop,
+        limit: HYP_AR_AUDIT_TIMELINE_LIMIT,
+      }),
     });
   } catch (err) {
     console.error('Error in DELETE /api/hyp-ar-production/:id:', err);
@@ -6212,6 +6363,13 @@ router.post('/api/qc-fail', async (req, res) => {
       orderId: order.id,
       orderNote: order.note || '',
     });
+    if (isSameStaffMember(staff, latestWaitingQcStaff)) {
+      return res.status(403).json({
+        success: false,
+        error: getQcSelfReviewBlockedMessage(),
+        qcBuilderStaff: latestWaitingQcStaff,
+      });
+    }
 
     const qcFailCreatedAt = new Date();
     const timestamp = qcFailCreatedAt
@@ -7681,6 +7839,25 @@ router.post('/api/pick-list-qc-progress', async (req, res) => {
     const session = sessionsStore.get(shop);
     if (!session) {
       return res.status(401).json({ success: false, error: 'No session found' });
+    }
+
+    const staff = String(req.cookies.userId || '').trim();
+    if (!staff) {
+      return res.status(401).json({ success: false, error: 'Username needs to be set' });
+    }
+
+    const latestWaitingQcStaff = resolveLatestWaitingQcStaff({
+      shop,
+      normalizedBarcode,
+      orderId: '',
+      orderNote: '',
+    });
+    if (isSameStaffMember(staff, latestWaitingQcStaff)) {
+      return res.status(403).json({
+        success: false,
+        error: getQcSelfReviewBlockedMessage(),
+        qcBuilderStaff: latestWaitingQcStaff,
+      });
     }
 
     sessionsStore.setQcOrderProgress({
