@@ -9,7 +9,6 @@
     { href: '/hyp_ar_production.html', label: 'HYP-AR' },
     { href: '/print_queue.html', label: 'Print Queue' },
     { href: '/fdm_print_queue.html', label: 'FDM Print Queue' },
-    { href: '/scan.html', label: 'Scanner' },
   ];
 
   function getCurrentPath() {
@@ -18,11 +17,6 @@
 
   function isActiveLink(href, currentPath) {
     const normalizedHref = String(href || '').toLowerCase();
-    if (normalizedHref === '/scan.html') {
-      return currentPath === '/scan.html' ||
-        currentPath === '/scan_usb.html' ||
-        currentPath === '/scan_photo.html';
-    }
     return currentPath === normalizedHref;
   }
 

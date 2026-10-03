@@ -164,6 +164,41 @@ db.prepare(`
 `).run();
 
 db.prepare(`
+  CREATE TABLE IF NOT EXISTS builder_time_sessions (
+    shop TEXT NOT NULL,
+    sessionId TEXT NOT NULL,
+    barcode TEXT NOT NULL,
+    orderId TEXT,
+    orderNumber TEXT,
+    itemKey TEXT NOT NULL,
+    itemLabel TEXT,
+    sku TEXT,
+    staff TEXT,
+    startedAt TEXT NOT NULL,
+    lastSeenAt TEXT NOT NULL,
+    endedAt TEXT,
+    elapsedMs INTEGER NOT NULL DEFAULT 0,
+    stopReason TEXT,
+    PRIMARY KEY (shop, sessionId)
+  )
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_builder_time_sessions_shop_barcode
+  ON builder_time_sessions (shop, barcode, startedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_builder_time_sessions_shop_started
+  ON builder_time_sessions (shop, startedAt DESC)
+`).run();
+
+db.prepare(`
+  CREATE INDEX IF NOT EXISTS idx_builder_time_sessions_shop_active
+  ON builder_time_sessions (shop, endedAt, lastSeenAt DESC)
+`).run();
+
+db.prepare(`
   CREATE TABLE IF NOT EXISTS order_trackers (
     shop TEXT NOT NULL,
     orderId TEXT NOT NULL,
@@ -687,52 +722,41 @@ function generatePublicToken() {
 
 const DAILY_OPERATION_METRICS = [
   {
-    key: 'scanned',
-    label: 'Scanned',
-    stageKeys: ['queued', 'building', 'awaiting_parts', 'quality_check', 'rebuild', 'passed_qc', 'packaged', 'on_hold', 'fulfilled', 'partially_fulfilled'],
-    countMode: 'events',
-  },
-  {
-    key: 'racked',
-    label: 'Racked',
-    stageKeys: ['queued'],
-    countMode: 'orders',
-  },
-  {
-    key: 'built',
-    label: 'Built',
-    stageKeys: ['quality_check'],
-    countMode: 'orders',
-  },
-  {
     key: 'adapter_built',
-    label: 'Adapter Built',
+    label: 'Adapters Built',
     stageKeys: ['building'],
     countMode: 'orders',
   },
   {
+    key: 'packages_racked',
+    label: 'Packages Racked',
+    stageKeys: ['queued'],
+    countMode: 'orders',
+  },
+  {
+    key: 'packages_shipped',
+    label: 'Packages Shipped',
+    stageKeys: ['fulfilled', 'partially_fulfilled'],
+    countMode: 'orders',
+  },
+  {
     key: 'qc_passed',
-    label: 'QC Passed',
+    label: 'QC Passes',
     stageKeys: ['passed_qc'],
     countMode: 'orders',
   },
   {
     key: 'qc_failed',
-    label: 'QC Failed',
+    label: 'QC Fails',
     stageKeys: ['rebuild'],
     countMode: 'orders',
   },
   {
-    key: 'packed',
-    label: 'Packed',
-    stageKeys: ['packaged'],
-    countMode: 'orders',
-  },
-  {
-    key: 'awaiting_parts',
-    label: 'Awaiting Parts',
-    stageKeys: ['awaiting_parts'],
-    countMode: 'orders',
+    key: 'avg_adapter_build_time',
+    label: 'Avg Adapter Build',
+    source: 'builder_time_average',
+    valueType: 'duration_ms',
+    lowerIsBetter: true,
   },
 ];
 
@@ -801,6 +825,92 @@ function getDailyOperationPeriodBounds({ date = null, now = new Date() } = {}) {
     yesterdayStartIso: yesterdayStart.toISOString(),
     yesterdayEndIso: selectedStart.toISOString(),
     weekStartIso: weekStart.toISOString(),
+  };
+}
+
+function parseTimeMs(value) {
+  const parsed = Date.parse(value || '');
+  return Number.isFinite(parsed) ? parsed : null;
+}
+
+function normalizeBuilderTimeSessionRecord(row, { now = new Date(), activeStaleMs = 90000 } = {}) {
+  if (!row) return null;
+  const nowMs = now instanceof Date && !Number.isNaN(now.getTime()) ? now.getTime() : Date.now();
+  const startedMs = parseTimeMs(row.startedAt) ?? nowMs;
+  const lastSeenMs = parseTimeMs(row.lastSeenAt) ?? startedMs;
+  const endedMs = parseTimeMs(row.endedAt);
+  const storedElapsedMs = Math.max(0, Math.floor(Number(row.elapsedMs) || 0));
+  const isEnded = Number.isFinite(endedMs);
+  const isFreshActive = !isEnded && nowMs - lastSeenMs <= activeStaleMs;
+  const elapsedMs = isEnded
+    ? (storedElapsedMs || Math.max(0, endedMs - startedMs))
+    : Math.max(0, (isFreshActive ? nowMs : lastSeenMs) - startedMs);
+
+  return {
+    sessionId: String(row.sessionId || '').trim(),
+    barcode: normalizeBarcode(row.barcode),
+    orderId: String(row.orderId || '').trim(),
+    orderNumber: String(row.orderNumber || '').trim(),
+    itemKey: String(row.itemKey || '').trim(),
+    itemLabel: String(row.itemLabel || '').trim(),
+    sku: normalizeBarcode(row.sku),
+    staff: String(row.staff || '').trim() || 'Unknown',
+    startedAt: row.startedAt || null,
+    lastSeenAt: row.lastSeenAt || null,
+    endedAt: row.endedAt || null,
+    elapsedMs,
+    stopReason: String(row.stopReason || '').trim(),
+    status: isEnded ? 'stopped' : (isFreshActive ? 'active' : 'stale'),
+  };
+}
+
+function summarizeBuilderTimeSessions(rows, { now = new Date() } = {}) {
+  const sessions = (Array.isArray(rows) ? rows : [])
+    .map((row) => normalizeBuilderTimeSessionRecord(row, { now }))
+    .filter(Boolean);
+  const activeSessions = sessions.filter((session) => session.status === 'active');
+  const completedSessions = sessions.filter((session) => session.status === 'stopped');
+  const totalElapsedMs = sessions.reduce((sum, session) => sum + Math.max(0, Number(session.elapsedMs) || 0), 0);
+
+  const aggregateBy = (keyFn) => {
+    const map = new Map();
+    sessions.forEach((session) => {
+      const key = keyFn(session);
+      if (!key) return;
+      const current = map.get(key) || {
+        key,
+        label: key,
+        elapsedMs: 0,
+        sessionCount: 0,
+        activeCount: 0,
+      };
+      current.elapsedMs += Math.max(0, Number(session.elapsedMs) || 0);
+      current.sessionCount += 1;
+      if (session.status === 'active') current.activeCount += 1;
+      map.set(key, current);
+    });
+    return Array.from(map.values())
+      .sort((left, right) => {
+        const elapsedDiff = right.elapsedMs - left.elapsedMs;
+        return elapsedDiff || left.label.localeCompare(right.label);
+      });
+  };
+
+  return {
+    generatedAt: (now instanceof Date && !Number.isNaN(now.getTime()) ? now : new Date()).toISOString(),
+    summary: {
+      sessionCount: sessions.length,
+      completedSessionCount: completedSessions.length,
+      activeCount: activeSessions.length,
+      totalElapsedMs,
+      averageElapsedMs: completedSessions.length
+        ? Math.round(completedSessions.reduce((sum, session) => sum + session.elapsedMs, 0) / completedSessions.length)
+        : 0,
+    },
+    activeSessions,
+    recentSessions: sessions.slice(0, 50),
+    staffTotals: aggregateBy((session) => session.staff),
+    itemTotals: aggregateBy((session) => session.itemLabel || session.sku || session.itemKey).slice(0, 20),
   };
 }
 
@@ -1841,6 +1951,139 @@ module.exports = {
     );
 
     return Number(result?.changes || 0) > 0;
+  },
+
+  startBuilderTimeSession({
+    shop,
+    sessionId,
+    barcode,
+    orderId = null,
+    orderNumber = null,
+    itemKey,
+    itemLabel = '',
+    sku = '',
+    staff = null,
+    startedAt = null,
+    lastSeenAt = null,
+  }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    const normalizedSessionId = String(sessionId || '').trim();
+    const normalizedItemKey = String(itemKey || '').trim();
+    if (!shop || !normalizedSessionId || !normalizedBarcode || !normalizedItemKey) return false;
+
+    const nowIso = new Date().toISOString();
+    const safeStartedAt = startedAt || nowIso;
+    const safeLastSeenAt = lastSeenAt || safeStartedAt;
+
+    db.prepare(`
+      INSERT OR REPLACE INTO builder_time_sessions
+      (
+        shop, sessionId, barcode, orderId, orderNumber, itemKey, itemLabel, sku, staff,
+        startedAt, lastSeenAt, endedAt, elapsedMs, stopReason
+      )
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, 0, NULL)
+    `).run(
+      String(shop),
+      normalizedSessionId,
+      normalizedBarcode,
+      orderId ? String(orderId).trim() : null,
+      orderNumber ? String(orderNumber).trim() : null,
+      normalizedItemKey,
+      String(itemLabel || '').trim(),
+      normalizeBarcode(sku),
+      staff ? String(staff).trim() : null,
+      safeStartedAt,
+      safeLastSeenAt
+    );
+
+    return true;
+  },
+
+  heartbeatBuilderTimeSession({ shop, sessionId, lastSeenAt = null }) {
+    const normalizedSessionId = String(sessionId || '').trim();
+    if (!shop || !normalizedSessionId) return false;
+
+    const result = db.prepare(`
+      UPDATE builder_time_sessions
+      SET lastSeenAt = ?
+      WHERE shop = ?
+        AND sessionId = ?
+        AND endedAt IS NULL
+    `).run(lastSeenAt || new Date().toISOString(), String(shop), normalizedSessionId);
+
+    return Number(result?.changes || 0) > 0;
+  },
+
+  stopBuilderTimeSession({
+    shop,
+    sessionId,
+    elapsedMs = 0,
+    endedAt = null,
+    stopReason = '',
+  }) {
+    const normalizedSessionId = String(sessionId || '').trim();
+    if (!shop || !normalizedSessionId) return false;
+
+    const endedAtValue = endedAt || new Date().toISOString();
+    const safeElapsedMs = Math.max(0, Math.floor(Number(elapsedMs) || 0));
+    const result = db.prepare(`
+      UPDATE builder_time_sessions
+      SET
+        endedAt = ?,
+        lastSeenAt = ?,
+        elapsedMs = ?,
+        stopReason = ?
+      WHERE shop = ?
+        AND sessionId = ?
+        AND endedAt IS NULL
+    `).run(
+      endedAtValue,
+      endedAtValue,
+      safeElapsedMs,
+      String(stopReason || '').trim(),
+      String(shop),
+      normalizedSessionId
+    );
+
+    return Number(result?.changes || 0) > 0;
+  },
+
+  getBuilderTimeByItemKey({ shop, barcode, now = new Date() }) {
+    const normalizedBarcode = normalizeBarcode(barcode);
+    if (!shop || !normalizedBarcode) return {};
+
+    const rows = db.prepare(`
+      SELECT *
+      FROM builder_time_sessions
+      WHERE shop = ? AND barcode = ?
+      ORDER BY startedAt ASC
+    `).all(String(shop), normalizedBarcode);
+    const totals = {};
+    rows
+      .map((row) => normalizeBuilderTimeSessionRecord(row, { now }))
+      .filter(Boolean)
+      .forEach((session) => {
+        if (!session.itemKey) return;
+        totals[session.itemKey] = (totals[session.itemKey] || 0) + Math.max(0, Number(session.elapsedMs) || 0);
+      });
+
+    return totals;
+  },
+
+  getBuilderTimeSummary({ shop, limit = 120, now = new Date() } = {}) {
+    const normalizedShop = String(shop || '').trim();
+    if (!normalizedShop) return summarizeBuilderTimeSessions([], { now });
+
+    const safeLimit = Math.max(1, Math.min(500, Math.floor(Number(limit) || 120)));
+    const rows = db.prepare(`
+      SELECT *
+      FROM builder_time_sessions
+      WHERE shop = ?
+      ORDER BY startedAt DESC
+      LIMIT ?
+    `).all(normalizedShop, safeLimit);
+
+    return summarizeBuilderTimeSessions(rows, { now });
   },
 
   getPickListPickedProgress({ shop, barcode }) {
@@ -3039,6 +3282,71 @@ module.exports = {
     return buildPrintQueueItemRecord(row);
   },
 
+  updatePrintQueueItemQuantity({ shop, id, quantity }) {
+    const normalizedShop = String(shop || '').trim();
+    const normalizedId = Number(id);
+    const safeQuantity = Math.max(1, Math.floor(Number(quantity) || 0));
+    if (!normalizedShop || !Number.isInteger(normalizedId) || normalizedId <= 0 || !Number.isFinite(safeQuantity)) {
+      return null;
+    }
+
+    const existingRow = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+        AND removedAt IS NULL
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+    const existingItem = buildPrintQueueItemRecord(existingRow);
+    if (!existingItem) return null;
+
+    const previousQuantity = Math.max(1, Number(existingItem.quantity) || 1);
+    const childItems = (Array.isArray(existingItem.childItems) ? existingItem.childItems : [])
+      .map((childItem) => {
+        const explicitMultiplier = Number(childItem?.quantityMultiplier);
+        const fallbackMultiplier = Math.max(1, Math.round((Number(childItem?.quantity) || 1) / previousQuantity));
+        const multiplier = Number.isFinite(explicitMultiplier) && explicitMultiplier > 0
+          ? explicitMultiplier
+          : fallbackMultiplier;
+        return {
+          ...childItem,
+          quantity: Math.max(1, Math.floor(safeQuantity * multiplier)),
+          quantityMultiplier: multiplier,
+        };
+      });
+
+    const nowIso = new Date().toISOString();
+    const result = db.prepare(`
+      UPDATE print_queue_items
+      SET quantity = ?,
+          childItemsJson = ?,
+          updatedAt = ?
+      WHERE shop = ?
+        AND id = ?
+        AND removedAt IS NULL
+    `).run(
+      safeQuantity,
+      JSON.stringify(childItems),
+      nowIso,
+      normalizedShop,
+      normalizedId
+    );
+
+    if (Number(result?.changes || 0) === 0) return null;
+
+    const row = db.prepare(`
+      SELECT *
+      FROM print_queue_items
+      WHERE shop = ?
+        AND id = ?
+        AND removedAt IS NULL
+      LIMIT 1
+    `).get(normalizedShop, normalizedId);
+
+    return buildPrintQueueItemRecord(row);
+  },
+
   putAwayPrintQueueItem({ shop, id, putAwayAt = null }) {
     const normalizedShop = String(shop || '').trim();
     const normalizedId = Number(id);
@@ -3322,7 +3630,9 @@ module.exports = {
 
     const bounds = getDailyOperationPeriodBounds({ date, now });
     const allStageKeys = Array.from(new Set(
-      DAILY_OPERATION_METRICS.flatMap((metric) => metric.stageKeys || [])
+      DAILY_OPERATION_METRICS
+        .filter((metric) => metric.source !== 'builder_time_average')
+        .flatMap((metric) => metric.stageKeys || [])
     ));
 
     const trendStart = new Date(bounds.todayStartIso);
@@ -3369,6 +3679,40 @@ module.exports = {
       })
       .filter((row) => row.stageKey && Number.isFinite(row.time));
 
+    const rawBuilderTimeRows = db.prepare(`
+      SELECT
+        sessionId, barcode, orderId, orderNumber, itemKey, itemLabel, sku, staff,
+        startedAt, lastSeenAt, endedAt, elapsedMs, stopReason
+      FROM builder_time_sessions
+      WHERE shop = ?
+        AND endedAt IS NOT NULL
+        AND endedAt >= ?
+        AND endedAt < ?
+        AND elapsedMs > 0
+      ORDER BY endedAt ASC
+    `).all(normalizedShop, queryStartIso, bounds.todayEndIso);
+    const builderTimeRows = rawBuilderTimeRows
+      .map((row) => {
+        const time = Date.parse(row.endedAt || '');
+        const elapsedMs = Math.max(0, Math.floor(Number(row.elapsedMs) || 0));
+        return {
+          sessionId: String(row.sessionId || '').trim(),
+          barcode: normalizeBarcode(row.barcode),
+          orderId: String(row.orderId || '').trim(),
+          orderNumber: String(row.orderNumber || '').trim(),
+          itemKey: String(row.itemKey || '').trim(),
+          itemLabel: String(row.itemLabel || '').trim(),
+          sku: normalizeBarcode(row.sku),
+          staff: String(row.staff || '').trim() || 'Unknown',
+          createdAt: row.endedAt || null,
+          startedAt: row.startedAt || null,
+          endedAt: row.endedAt || null,
+          elapsedMs,
+          time,
+        };
+      })
+      .filter((row) => row.elapsedMs > 0 && Number.isFinite(row.time));
+
     const getRowsForMetric = (metric, startIso, endIso) => {
       const stageKeys = new Set((Array.isArray(metric.stageKeys) ? metric.stageKeys : [])
         .map((stageKey) => String(stageKey || '').trim())
@@ -3386,6 +3730,14 @@ module.exports = {
     const countRows = (metric, metricRows) => {
       if (metric.countMode === 'events') return metricRows.length;
       return new Set(metricRows.map((row) => row.orderId).filter(Boolean)).size;
+    };
+
+    const averageElapsedMs = (metricRows) => {
+      const safeRows = (Array.isArray(metricRows) ? metricRows : [])
+        .filter((row) => Number(row.elapsedMs) > 0);
+      if (!safeRows.length) return 0;
+      const totalElapsedMs = safeRows.reduce((sum, row) => sum + Math.max(0, Number(row.elapsedMs) || 0), 0);
+      return Math.round(totalElapsedMs / safeRows.length);
     };
 
     const buildHourly = (metric, metricRows) => {
@@ -3484,6 +3836,95 @@ module.exports = {
       };
     });
 
+    const getBuilderRowsForPeriod = (startIso, endIso) => {
+      const startMs = Date.parse(startIso);
+      const endMs = Date.parse(endIso);
+      if (!Number.isFinite(startMs) || !Number.isFinite(endMs)) return [];
+      return builderTimeRows.filter((row) => row.time >= startMs && row.time < endMs);
+    };
+
+    const buildBuilderHourly = (metricRows) => {
+      const buckets = Array.from({ length: 24 }, (_item, hour) => ({
+        hour,
+        label: `${String(hour).padStart(2, '0')}:00`,
+        count: 0,
+        sessionCount: 0,
+      }));
+      metricRows.forEach((row) => {
+        const dateValue = new Date(row.time);
+        const hour = dateValue.getHours();
+        if (!Number.isInteger(hour) || hour < 0 || hour > 23) return;
+        const bucket = buckets[hour];
+        bucket.count += Math.max(0, Number(row.elapsedMs) || 0);
+        bucket.sessionCount += 1;
+      });
+      return buckets.map((bucket) => ({
+        ...bucket,
+        count: bucket.sessionCount ? Math.round(bucket.count / bucket.sessionCount) : 0,
+      }));
+    };
+
+    const buildBuilderStaff = (metricRows) => {
+      const staffTotals = new Map();
+      metricRows.forEach((row) => {
+        const staff = row.staff || 'Unknown';
+        const current = staffTotals.get(staff) || { staff, elapsedMs: 0, sessionCount: 0 };
+        current.elapsedMs += Math.max(0, Number(row.elapsedMs) || 0);
+        current.sessionCount += 1;
+        staffTotals.set(staff, current);
+      });
+      return Array.from(staffTotals.values())
+        .map((item) => ({
+          staff: item.staff,
+          count: item.sessionCount ? Math.round(item.elapsedMs / item.sessionCount) : 0,
+          sessionCount: item.sessionCount,
+        }))
+        .sort((left, right) => {
+          const countDiff = right.sessionCount - left.sessionCount;
+          return countDiff || left.staff.localeCompare(right.staff);
+        })
+        .slice(0, 10);
+    };
+
+    const buildBuilderRecentRows = (metricRows) => [...metricRows]
+      .sort((left, right) => {
+        const timeDiff = right.time - left.time;
+        return timeDiff || String(right.sessionId).localeCompare(String(left.sessionId));
+      })
+      .slice(0, 12)
+      .map((row) => ({
+        orderId: row.orderId,
+        orderNumber: row.orderNumber || row.barcode || row.orderId,
+        barcode: row.barcode,
+        itemKey: row.itemKey,
+        itemLabel: row.itemLabel || row.sku || row.itemKey,
+        sku: row.sku,
+        staff: row.staff,
+        createdAt: row.createdAt,
+        value: row.elapsedMs,
+      }));
+
+    const buildBuilderTrend = () => Array.from({ length: 7 }, (_item, index) => {
+      const start = new Date(trendStart);
+      start.setDate(trendStart.getDate() + index);
+      const end = new Date(start);
+      end.setDate(start.getDate() + 1);
+      const rowsForDay = getBuilderRowsForPeriod(start.toISOString(), end.toISOString());
+      return {
+        date: [
+          start.getFullYear(),
+          String(start.getMonth() + 1).padStart(2, '0'),
+          String(start.getDate()).padStart(2, '0'),
+        ].join('-'),
+        label: new Intl.DateTimeFormat('en-GB', {
+          weekday: 'short',
+          day: 'numeric',
+          month: 'short',
+        }).format(start),
+        count: averageElapsedMs(rowsForDay),
+      };
+    });
+
     const todayAllRows = rows.filter((row) => (
       row.time >= Date.parse(bounds.todayStartIso) &&
       row.time < Date.parse(bounds.todayEndIso)
@@ -3511,6 +3952,31 @@ module.exports = {
         weekStart: bounds.weekStartIso,
       },
       metrics: DAILY_OPERATION_METRICS.map((metric) => {
+        if (metric.source === 'builder_time_average') {
+          const todayRows = getBuilderRowsForPeriod(bounds.todayStartIso, bounds.todayEndIso);
+          const yesterdayRows = getBuilderRowsForPeriod(bounds.yesterdayStartIso, bounds.yesterdayEndIso);
+          const weekRows = getBuilderRowsForPeriod(bounds.weekStartIso, bounds.todayEndIso);
+          const today = averageElapsedMs(todayRows);
+          const yesterday = averageElapsedMs(yesterdayRows);
+          const week = averageElapsedMs(weekRows);
+          return {
+            key: metric.key,
+            label: metric.label,
+            today,
+            yesterday,
+            week,
+            delta: today - yesterday,
+            countMode: 'average',
+            valueType: metric.valueType || 'duration_ms',
+            lowerIsBetter: Boolean(metric.lowerIsBetter),
+            stageKeys: [],
+            hourly: buildBuilderHourly(todayRows),
+            trend: buildBuilderTrend(),
+            staff: buildBuilderStaff(todayRows),
+            recentOrders: buildBuilderRecentRows(todayRows),
+          };
+        }
+
         const todayRows = getRowsForMetric(metric, bounds.todayStartIso, bounds.todayEndIso);
         const yesterdayRows = getRowsForMetric(metric, bounds.yesterdayStartIso, bounds.yesterdayEndIso);
         const weekRows = getRowsForMetric(metric, bounds.weekStartIso, bounds.todayEndIso);
@@ -3525,6 +3991,8 @@ module.exports = {
           week,
           delta: today - yesterday,
           countMode: metric.countMode,
+          valueType: metric.valueType || 'count',
+          lowerIsBetter: Boolean(metric.lowerIsBetter),
           stageKeys: [...metric.stageKeys],
           hourly: buildHourly(metric, todayRows),
           trend: buildTrend(metric),

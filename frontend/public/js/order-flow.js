@@ -47,6 +47,7 @@ const ORDER_FLOW_STAGE_SORT_ORDER = [
 let orderFlowLoading = false;
 let orderFlowPollId = null;
 let orderFlowData = null;
+let orderFlowBuilderTimeData = null;
 let orderFlowActiveFilter = 'all';
 let orderFlowActiveGridOrderId = '';
 
@@ -100,6 +101,17 @@ function formatOrderValue(value) {
       maximumFractionDigits: 2,
     })}`;
   }
+}
+
+function formatDurationMs(value) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value) || 0) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
 }
 
 function setStatus(message, type = 'info') {
@@ -373,6 +385,79 @@ function renderOverview() {
       <strong>${escapeHtml(stat.value)}</strong>
     </article>
   `).join('');
+}
+
+function renderBuilderTime() {
+  const container = document.getElementById('orderFlowBuilderTime');
+  const summaryEl = document.getElementById('orderFlowBuilderTimeSummary');
+  if (!container) return;
+
+  const data = orderFlowBuilderTimeData || {};
+  const summary = data.summary || {};
+  const activeSessions = Array.isArray(data.activeSessions) ? data.activeSessions : [];
+  const recentSessions = Array.isArray(data.recentSessions) ? data.recentSessions : [];
+  const staffTotals = Array.isArray(data.staffTotals) ? data.staffTotals : [];
+
+  if (summaryEl) {
+    summaryEl.textContent = [
+      `${activeSessions.length} active`,
+      `${summary.completedSessionCount || 0} completed sessions`,
+      `${formatDurationMs(summary.totalElapsedMs || 0)} total`,
+      summary.averageElapsedMs ? `${formatDurationMs(summary.averageElapsedMs)} average` : '',
+    ].filter(Boolean).join(' / ');
+  }
+
+  if (!recentSessions.length && !activeSessions.length) {
+    container.innerHTML = '<p class="order-flow-empty">No builder time has been recorded yet.</p>';
+    return;
+  }
+
+  const activeHtml = activeSessions.length ? `
+    <section class="order-flow-builder-time__section">
+      <h3>Active Now</h3>
+      <div class="order-flow-builder-time-list">
+        ${activeSessions.map((session) => `
+          <article class="order-flow-builder-time-row is-active">
+            <div>
+              <strong>${escapeHtml(session.itemLabel || session.sku || session.itemKey || 'Builder item')}</strong>
+              <span>${escapeHtml(session.orderNumber || session.barcode || '')} / ${escapeHtml(session.staff || 'Unknown')}</span>
+            </div>
+            <time>${escapeHtml(formatDurationMs(session.elapsedMs || 0))}</time>
+          </article>
+        `).join('')}
+      </div>
+    </section>
+  ` : '';
+
+  const recentHtml = `
+    <section class="order-flow-builder-time__section">
+      <h3>Recent Lines</h3>
+      <div class="order-flow-builder-time-list">
+        ${recentSessions.slice(0, 12).map((session) => `
+          <article class="order-flow-builder-time-row">
+            <div>
+              <strong>${escapeHtml(session.itemLabel || session.sku || session.itemKey || 'Builder item')}</strong>
+              <span>${escapeHtml(session.orderNumber || session.barcode || '')} / ${escapeHtml(session.staff || 'Unknown')}</span>
+            </div>
+            <time>${escapeHtml(formatDurationMs(session.elapsedMs || 0))}</time>
+          </article>
+        `).join('')}
+      </div>
+    </section>
+  `;
+
+  const staffHtml = staffTotals.length ? `
+    <section class="order-flow-builder-time__section">
+      <h3>Staff Totals</h3>
+      <div class="order-flow-builder-time-staff">
+        ${staffTotals.slice(0, 8).map((staff) => `
+          <span><strong>${escapeHtml(staff.label || staff.key)}</strong> ${escapeHtml(formatDurationMs(staff.elapsedMs || 0))}</span>
+        `).join('')}
+      </div>
+    </section>
+  ` : '';
+
+  container.innerHTML = `${activeHtml}${recentHtml}${staffHtml}`;
 }
 
 function renderScanSummary() {
@@ -806,6 +891,7 @@ function renderIssues() {
 
 function renderOrderFlow() {
   renderOverview();
+  renderBuilderTime();
   renderOrderGrid();
   renderScanSummary();
   renderFilters();
@@ -920,6 +1006,11 @@ async function fetchOrderFlow({ silent = false } = {}) {
     }
 
     orderFlowData = data;
+    const builderTimeResponse = await fetch('/api/builder-time/summary?limit=120', {
+      headers: { Accept: 'application/json' },
+    });
+    const builderTimeData = await builderTimeResponse.json().catch(() => ({}));
+    orderFlowBuilderTimeData = builderTimeResponse.ok && builderTimeData.success ? builderTimeData : null;
     updateLastUpdatedLabel(data.generatedAt);
     renderOrderFlow();
     if (!silent) {

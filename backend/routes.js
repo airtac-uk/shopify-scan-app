@@ -6123,6 +6123,46 @@ router.post('/api/print-queue/preform-build', async (req, res) => {
   }
 });
 
+router.post('/api/print-queue/:id/quantity', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
+    if (!auth) return;
+
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      return res.status(400).json({
+        success: false,
+        error: 'Missing print item id',
+      });
+    }
+
+    const quantity = parsePositiveInteger(req.body?.quantity, 1);
+    const item = sessionsStore.updatePrintQueueItemQuantity({
+      shop: auth.shop,
+      id,
+      quantity,
+    });
+
+    if (!item) {
+      return res.status(404).json({
+        success: false,
+        error: 'Print queue item not found',
+      });
+    }
+
+    return res.json({
+      success: true,
+      item,
+    });
+  } catch (err) {
+    console.error('Error in /api/print-queue/:id/quantity:', err);
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Server error',
+    });
+  }
+});
+
 router.post('/api/print-queue/:id/stage', async (req, res) => {
   try {
     const auth = resolveAuthenticatedRequest(req, res, { requireUser: true });
@@ -7189,6 +7229,114 @@ router.post('/api/wholesale-progress', async (req, res) => {
   }
 });
 
+router.post('/api/builder-time/start', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const {
+      sessionId,
+      barcode,
+      orderId,
+      orderNumber,
+      itemKey,
+      itemLabel,
+      sku,
+      startedAt,
+      lastSeenAt,
+    } = req.body || {};
+    const normalizedBarcode = normalizeScanBarcode(barcode);
+    if (!sessionId || !normalizedBarcode || !itemKey) {
+      return res.status(400).json({ success: false, error: 'Missing builder timer session data' });
+    }
+
+    sessionsStore.startBuilderTimeSession({
+      shop: auth.shop,
+      sessionId,
+      barcode: normalizedBarcode,
+      orderId,
+      orderNumber,
+      itemKey,
+      itemLabel,
+      sku,
+      staff: String(req.cookies.userId || '').trim() || 'Unknown',
+      startedAt,
+      lastSeenAt,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /api/builder-time/start:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/builder-time/heartbeat', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const { sessionId, lastSeenAt } = req.body || {};
+    if (!sessionId) {
+      return res.status(400).json({ success: false, error: 'Missing builder timer session id' });
+    }
+
+    sessionsStore.heartbeatBuilderTimeSession({
+      shop: auth.shop,
+      sessionId,
+      lastSeenAt,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /api/builder-time/heartbeat:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.post('/api/builder-time/stop', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    const { sessionId, elapsedMs, endedAt, reason } = req.body || {};
+    if (!sessionId) {
+      return res.status(400).json({ success: false, error: 'Missing builder timer session id' });
+    }
+
+    sessionsStore.stopBuilderTimeSession({
+      shop: auth.shop,
+      sessionId,
+      elapsedMs,
+      endedAt,
+      stopReason: reason,
+    });
+
+    return res.json({ success: true });
+  } catch (err) {
+    console.error('Error in /api/builder-time/stop:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Server error' });
+  }
+});
+
+router.get('/api/builder-time/summary', async (req, res) => {
+  try {
+    const auth = resolveAuthenticatedRequest(req, res);
+    if (!auth) return;
+
+    return res.json({
+      success: true,
+      ...sessionsStore.getBuilderTimeSummary({
+        shop: auth.shop,
+        limit: req.query?.limit,
+      }),
+    });
+  } catch (err) {
+    console.error('Error in /api/builder-time/summary:', err);
+    return res.status(500).json({ success: false, error: err.message || 'Failed to load builder time summary' });
+  }
+});
+
 router.post('/api/pick-list', async (req, res) => {
   try {
     const { barcode } = req.body || {};
@@ -7265,6 +7413,10 @@ router.post('/api/pick-list', async (req, res) => {
       shop,
       barcode: normalizedBarcode,
     });
+    const builderTimeByItemKey = sessionsStore.getBuilderTimeByItemKey({
+      shop,
+      barcode: normalizedBarcode,
+    });
     const verifyProgressByItemKey = sessionsStore.getVerifyOrderProgress({
       shop,
       barcode: normalizedBarcode,
@@ -7308,6 +7460,7 @@ router.post('/api/pick-list', async (req, res) => {
     return res.json({
       success: true,
       barcode: normalizedBarcode,
+      orderId: order.id,
       orderNumber: order.name,
       orderTags: normalizeOrderTags(order.tags),
       orderStatus: order.cancelledAt ? 'CANCELLED' : (order.displayFulfillmentStatus || ''),
@@ -7338,6 +7491,7 @@ router.post('/api/pick-list', async (req, res) => {
       trackerToken: trackerInfo.trackerToken,
       trackerUrl: trackerInfo.trackerUrl,
       wholesaleProgressByItemKey,
+      builderTimeByItemKey,
       verifyProgressByItemKey,
       qcProgressByItemKey,
       pickedRowCounts,

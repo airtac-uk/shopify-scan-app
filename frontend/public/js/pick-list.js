@@ -11,7 +11,9 @@ let lastOrderItems = [];
 let lastWholesaleProgressByItemKey = {};
 let lastVerifyProgressByItemKey = {};
 let lastQcProgressByItemKey = {};
+let builderTimeByItemKey = {};
 let hasRenderedPickList = false;
+let currentOrderId = '';
 let currentOrderBarcode = '';
 let currentOrderNumber = '';
 let currentOrderNote = '';
@@ -60,6 +62,16 @@ let verifyShippingPreloadTimeoutId = null;
 let verifyShippingAutoRateTimeoutId = null;
 let activeShippingWeightPackageIndex = null;
 let suppressShippingWeightBlurRefresh = false;
+let builderTimerState = {
+  sessionId: '',
+  itemKey: '',
+  startedAtMs: 0,
+  startedAtIso: '',
+};
+let builderTimerPaused = false;
+let builderTimerPausedItemKey = '';
+let builderTimerHeartbeatId = null;
+let builderTimerUiTickId = null;
 let bagLabelRows = [];
 let bagLabelActionLoading = '';
 let pendingAwaitingPrintQueueResultCloseAction = null;
@@ -71,6 +83,7 @@ let newOrderQueueState = {
   index: -1,
   error: '',
 };
+let locallyCompletedNewOrderQueueCodes = new Set();
 
 const PICKER_MODE_COOKIE = 'pick_list_picker_mode';
 const VERIFY_MODE_COOKIE = 'pick_list_verify_mode';
@@ -82,6 +95,8 @@ const VERIFY_RESTRICTED_PICK_TYPES = new Set(['DROP IN', '3RD PARTY']);
 const VERIFY_RESTRICTED_LONG_PRESS_MS = 5000;
 const HPA_TANK_REG_REMOVAL_SKUS = new Set(['T1P_TANK-1', 'T1P_TANK-2']);
 const SHIPPING_PACKAGE_DIMENSION_UNIT = 'centimeter';
+const BUILDER_TIMER_HEARTBEAT_MS = 15000;
+const BUILDER_TIMER_UI_TICK_MS = 1000;
 const SHIPPING_PACKAGE_PRESETS = [
   { key: 'small', label: 'Small', length: 23, width: 16, height: 17 },
   { key: 'medium', label: 'Medium', length: 30, width: 20, height: 20 },
@@ -1765,11 +1780,14 @@ function isCurrentOrderWorkflowBlocked() {
 }
 
 function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
+  void stopActiveBuilderTimer({ reason: 'order_cleared', pause: false, useBeacon: true });
   lastRenderedLineItems = [];
   lastOrderItems = [];
   lastWholesaleProgressByItemKey = {};
   lastVerifyProgressByItemKey = {};
+  builderTimeByItemKey = {};
   hasRenderedPickList = false;
+  currentOrderId = '';
   currentOrderBarcode = '';
   currentOrderNumber = '';
   currentOrderNote = '';
@@ -1789,6 +1807,9 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   currentAwaitingPartsCatalog = new Map();
   currentPickedRowCounts = new Map();
   lastQcProgressByItemKey = {};
+  builderTimerPaused = false;
+  builderTimerPausedItemKey = '';
+  stopBuilderTimerIntervals();
   if (pickedRowsSaveTimeoutId) {
     clearTimeout(pickedRowsSaveTimeoutId);
     pickedRowsSaveTimeoutId = null;
@@ -2067,10 +2088,49 @@ function getActiveNewOrderQueueItem() {
   return newOrderQueueState.orders[newOrderQueueState.index] || null;
 }
 
+function getNewOrderQueueOrderCode(order) {
+  return normalizeVerifyCode(order?.barcode || order?.orderNumber);
+}
+
+function findNewOrderQueueOrderIndexByCode(orders, code) {
+  const normalizedCode = normalizeVerifyCode(code);
+  if (!normalizedCode) return -1;
+  return (Array.isArray(orders) ? orders : [])
+    .findIndex((order) => getNewOrderQueueOrderCode(order) === normalizedCode);
+}
+
+function markNewOrderQueueOrderCompletedLocally(code) {
+  const normalizedCode = normalizeVerifyCode(code);
+  if (normalizedCode) {
+    locallyCompletedNewOrderQueueCodes.add(normalizedCode);
+  }
+  newOrderQueueState = {
+    ...newOrderQueueState,
+    orders: filterNewOrderQueueOrders(newOrderQueueState.orders),
+  };
+  if (newOrderQueueState.index >= newOrderQueueState.orders.length) {
+    newOrderQueueState.index = newOrderQueueState.orders.length
+      ? newOrderQueueState.orders.length - 1
+      : -1;
+  }
+  if (newOrderQueueState.active && newOrderQueueState.index < 0 && newOrderQueueState.orders.length) {
+    newOrderQueueState.index = 0;
+  }
+  renderNewOrderQueuePanel();
+}
+
+function filterNewOrderQueueOrders(orders) {
+  return (Array.isArray(orders) ? orders : [])
+    .filter((order) => {
+      const orderCode = getNewOrderQueueOrderCode(order);
+      return !orderCode || !locallyCompletedNewOrderQueueCodes.has(orderCode);
+    });
+}
+
 function isCurrentNewOrderQueueOrder() {
   const activeItem = getActiveNewOrderQueueItem();
   if (!activeItem) return false;
-  const activeBarcode = normalizeVerifyCode(activeItem.barcode || activeItem.orderNumber);
+  const activeBarcode = getNewOrderQueueOrderCode(activeItem);
   return Boolean(activeBarcode && activeBarcode === normalizeVerifyCode(currentOrderBarcode || currentOrderNumber));
 }
 
@@ -2135,6 +2195,7 @@ function renderNewOrderQueuePanel() {
   const startButton = document.getElementById('newOrderQueueStartBtn');
   const refreshButton = document.getElementById('newOrderQueueRefreshBtn');
   const printButton = document.getElementById('newOrderQueuePrintBtn');
+  const previousButton = document.getElementById('newOrderQueuePreviousBtn');
   const nextButton = document.getElementById('newOrderQueueNextBtn');
   const list = document.getElementById('newOrderQueueList');
   const activeItem = getActiveNewOrderQueueItem();
@@ -2173,7 +2234,15 @@ function renderNewOrderQueuePanel() {
   }
   if (refreshButton) refreshButton.disabled = busy;
   if (printButton) printButton.disabled = busy || !hasRenderedPickList || !currentOrderBarcode;
-  if (nextButton) nextButton.disabled = busy || !newOrderQueueState.active || !orderCount;
+  if (previousButton) {
+    previousButton.disabled = busy || !newOrderQueueState.active || !orderCount || newOrderQueueState.index <= 0;
+  }
+  if (nextButton) {
+    nextButton.disabled = busy
+      || !newOrderQueueState.active
+      || !orderCount
+      || newOrderQueueState.index >= orderCount - 1;
+  }
 
   if (list) {
     list.hidden = true;
@@ -2201,12 +2270,17 @@ async function loadNewOrderQueue({ activate = false } = {}) {
       ...newOrderQueueState,
       active: activate || newOrderQueueState.active,
       loading: false,
-      orders: Array.isArray(data.orders) ? data.orders : [],
+      orders: filterNewOrderQueueOrders(data.orders),
       index: activate && Array.isArray(data.orders) && data.orders.length ? 0 : newOrderQueueState.index,
       error: '',
     };
     if (newOrderQueueState.index >= newOrderQueueState.orders.length) {
-      newOrderQueueState.index = newOrderQueueState.orders.length ? 0 : -1;
+      newOrderQueueState.index = newOrderQueueState.orders.length
+        ? newOrderQueueState.orders.length - 1
+        : -1;
+    }
+    if (newOrderQueueState.active && newOrderQueueState.index < 0 && newOrderQueueState.orders.length) {
+      newOrderQueueState.index = 0;
     }
     renderNewOrderQueuePanel();
     if (activate && newOrderQueueState.orders.length) {
@@ -2295,30 +2369,54 @@ async function advanceNewOrderQueue() {
   if (!newOrderQueueState.active) return;
   const nextIndex = newOrderQueueState.index + 1;
   if (nextIndex >= newOrderQueueState.orders.length) {
-    await loadNewOrderQueue({ activate: false });
-    if (!newOrderQueueState.orders.length) {
-      newOrderQueueState = {
-        ...newOrderQueueState,
-        active: false,
-        index: -1,
-      };
-      renderNewOrderQueuePanel();
-      setStatus('New order queue complete.', 'success');
-      return;
-    }
-    await loadNewOrderQueueOrder(0);
+    setStatus('Already at the end of the new order queue.', 'info');
+    renderNewOrderQueuePanel();
     return;
   }
   await loadNewOrderQueueOrder(nextIndex);
 }
 
+async function previousNewOrderQueue() {
+  if (!newOrderQueueState.active) return;
+  const previousIndex = newOrderQueueState.index - 1;
+  if (previousIndex < 0) {
+    setStatus('Already at the start of the new order queue.', 'info');
+    renderNewOrderQueuePanel();
+    return;
+  }
+  await loadNewOrderQueueOrder(previousIndex);
+}
+
 async function completeCurrentNewOrderQueueOrder({ completeStatus = 'Packing label printed. New order queue complete.' } = {}) {
   if (!isCurrentNewOrderQueueOrder()) return;
+  const previousOrders = Array.isArray(newOrderQueueState.orders)
+    ? [...newOrderQueueState.orders]
+    : [];
+  const completedCode = normalizeVerifyCode(currentOrderBarcode || currentOrderNumber);
+  const matchedCompletedIndex = findNewOrderQueueOrderIndexByCode(previousOrders, completedCode);
+  const completedIndex = matchedCompletedIndex >= 0
+    ? matchedCompletedIndex
+    : Math.max(0, Math.floor(Number(newOrderQueueState.index) || 0));
+  const nextQueuedOrder = previousOrders
+    .slice(completedIndex + 1)
+    .find((order) => getNewOrderQueueOrderCode(order) && getNewOrderQueueOrderCode(order) !== completedCode);
+  const nextQueuedCode = getNewOrderQueueOrderCode(nextQueuedOrder);
   const printed = await printCurrentPackingSlip();
   if (!printed) return;
+  markNewOrderQueueOrderCompletedLocally(completedCode);
   await loadNewOrderQueue({ activate: false });
-  const currentCode = normalizeVerifyCode(currentOrderBarcode || currentOrderNumber);
-  const nextIndex = newOrderQueueState.orders.findIndex((order) => normalizeVerifyCode(order.barcode || order.orderNumber) !== currentCode);
+
+  let nextIndex = findNewOrderQueueOrderIndexByCode(newOrderQueueState.orders, nextQueuedCode);
+  if (nextIndex < 0) {
+    const refreshedCompletedIndex = findNewOrderQueueOrderIndexByCode(newOrderQueueState.orders, completedCode);
+    if (refreshedCompletedIndex >= 0 && refreshedCompletedIndex + 1 < newOrderQueueState.orders.length) {
+      nextIndex = refreshedCompletedIndex + 1;
+    }
+  }
+  if (nextIndex < 0 && completedIndex < newOrderQueueState.orders.length) {
+    nextIndex = completedIndex;
+  }
+
   if (nextIndex >= 0) {
     await loadNewOrderQueueOrder(nextIndex);
     return;
@@ -3435,6 +3533,7 @@ function getPickRowsFromLineSummary(line) {
         location: String(row?.location || '').trim(),
         note: String(row?.note || '').trim(),
         type: String(row?.type || row?.typeRaw || '').trim(),
+        pickType: String(row?.pickType || row?.type || '').trim(),
         typeRaw: String(row?.typeRaw || '').trim(),
         sectionTitle,
       });
@@ -3479,6 +3578,7 @@ function findPickRowsForOrderItem(orderItem = {}) {
         row.location,
         row.note,
         row.type,
+        row.pickType,
         row.typeRaw,
         row.sectionTitle,
       ].join('|');
@@ -3497,12 +3597,12 @@ function mergeVerifyPickRows(targetRow, pickRows = []) {
   if (!targetRow || !Array.isArray(pickRows) || !pickRows.length) return;
   const existingRows = Array.isArray(targetRow.pickRows) ? targetRow.pickRows : [];
   const rowMap = new Map(existingRows.map((row) => ([
-    [row.sku, row.location, row.note, row.type, row.typeRaw, row.sectionTitle].join('|'),
+    [row.sku, row.location, row.note, row.type, row.pickType, row.typeRaw, row.sectionTitle].join('|'),
     { ...row },
   ])));
 
   pickRows.forEach((row) => {
-    const key = [row.sku, row.location, row.note, row.type, row.typeRaw, row.sectionTitle].join('|');
+    const key = [row.sku, row.location, row.note, row.type, row.pickType, row.typeRaw, row.sectionTitle].join('|');
     if (!rowMap.has(key)) {
       rowMap.set(key, { ...row });
       return;
@@ -3551,6 +3651,334 @@ function getQcWholesaleRowTypeCandidates(row) {
 
   candidates.push(row?.sku, row?.productName, row?.bundleGroupTitle);
   return candidates.filter((candidate) => String(candidate || '').trim());
+}
+
+function getBuilderPickTypeLabelsFromRows(rows = []) {
+  const labels = [];
+  const seen = new Set();
+
+  (Array.isArray(rows) ? rows : []).forEach((row) => {
+    const label = String(row?.pickType || '').trim();
+    const normalizedLabel = label.toUpperCase();
+    if (!label || normalizedLabel !== 'RACKED' || seen.has(normalizedLabel)) return;
+    seen.add(normalizedLabel);
+    labels.push(label);
+  });
+
+  return labels;
+}
+
+function isBuilderRackedPickRow(row) {
+  return normalizeVerifyPickType(row?.pickType) === 'RACKED';
+}
+
+function hasBuilderRackedPickRow(row) {
+  return (Array.isArray(row?.pickRows) ? row.pickRows : []).some(isBuilderRackedPickRow);
+}
+
+function getBuilderPickTypeLabel(row) {
+  const labels = getBuilderPickTypeLabelsFromRows(row?.pickRows);
+  if (labels.length > 0) return labels.join(' | ');
+  return '';
+}
+
+function setBuilderTimeByItemKeyFromPayload(value) {
+  builderTimeByItemKey = {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return;
+
+  Object.entries(value).forEach(([itemKey, elapsedMs]) => {
+    const key = String(itemKey || '').trim();
+    const safeElapsedMs = Math.max(0, Math.floor(Number(elapsedMs) || 0));
+    if (!key || safeElapsedMs <= 0) return;
+    builderTimeByItemKey[key] = safeElapsedMs;
+  });
+}
+
+function makeBuilderTimerSessionId() {
+  const randomValue = Math.random().toString(36).slice(2, 10);
+  return [
+    'builder',
+    Date.now().toString(36),
+    randomValue,
+  ].join('-');
+}
+
+function formatBuilderDuration(value) {
+  const totalSeconds = Math.max(0, Math.floor(Number(value) || 0) / 1000);
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = Math.floor(totalSeconds % 60);
+  if (hours > 0) {
+    return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+  }
+  return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+function isBuilderTimerActiveForRow(itemKey) {
+  return Boolean(builderTimerState.sessionId && builderTimerState.itemKey === String(itemKey || '').trim());
+}
+
+function isBuilderTimerPausedForRow(itemKey) {
+  const key = String(itemKey || '').trim();
+  if (!builderTimerPaused || builderTimerState.sessionId || !key) return false;
+  return builderTimerPausedItemKey === key;
+}
+
+function getActiveBuilderTimerElapsedMs() {
+  if (!builderTimerState.sessionId || !builderTimerState.startedAtMs) return 0;
+  return Math.max(0, Date.now() - builderTimerState.startedAtMs);
+}
+
+function getBuilderElapsedMsForRow(row) {
+  const itemKey = String(row?.key || '').trim();
+  const savedElapsedMs = Math.max(0, Math.floor(Number(builderTimeByItemKey[itemKey]) || 0));
+  return savedElapsedMs + (isBuilderTimerActiveForRow(itemKey) ? getActiveBuilderTimerElapsedMs() : 0);
+}
+
+function getBuilderTimerSummaryState() {
+  const activeRow = builderTimerState.itemKey
+    ? verifyItems.find((row) => row.key === builderTimerState.itemKey)
+    : null;
+  if (activeRow) {
+    return {
+      row: activeRow,
+      label: 'Running',
+      elapsedMs: getBuilderElapsedMsForRow(activeRow),
+      active: true,
+    };
+  }
+
+  const pausedRow = builderTimerPausedItemKey
+    ? verifyItems.find((row) => row.key === builderTimerPausedItemKey)
+    : null;
+  if (pausedRow && isBuilderTimerPausedForRow(pausedRow.key)) {
+    return {
+      row: pausedRow,
+      label: 'Paused',
+      elapsedMs: getBuilderElapsedMsForRow(pausedRow),
+      active: false,
+    };
+  }
+
+  const nextRow = getBuilderTimerCandidate();
+  if (nextRow) {
+    return {
+      row: nextRow,
+      label: 'Ready',
+      elapsedMs: getBuilderElapsedMsForRow(nextRow),
+      active: false,
+    };
+  }
+
+  return {
+    row: null,
+    label: 'Complete',
+    elapsedMs: 0,
+    active: false,
+  };
+}
+
+function createBuilderSummaryTimer() {
+  const timerState = getBuilderTimerSummaryState();
+  const timer = document.createElement('div');
+  timer.className = `pick-builder-summary-timer${timerState.active ? ' is-running' : ''}${timerState.label === 'Paused' ? ' is-paused' : ''}`;
+
+  const label = document.createElement('span');
+  label.className = 'pick-builder-summary-timer__label';
+  label.textContent = timerState.label;
+  label.setAttribute('data-builder-summary-timer-label', '1');
+
+  const value = document.createElement('strong');
+  value.className = 'pick-builder-summary-timer__value';
+  value.textContent = formatBuilderDuration(timerState.elapsedMs);
+  value.setAttribute('data-builder-summary-timer-value', '1');
+
+  const item = document.createElement('span');
+  item.className = 'pick-builder-summary-timer__item';
+  item.textContent = timerState.row ? getVerifyDisplayLabel(timerState.row) : 'No active line';
+  item.setAttribute('data-builder-summary-timer-item', '1');
+
+  timer.append(label, value, item);
+  return timer;
+}
+
+function getBuilderTimerCandidate() {
+  if (!wholesaleModeEnabled || !hasRenderedPickList) return null;
+  return verifyItems.find((row) => row && row.scannedQty < row.requiredQty) || null;
+}
+
+function getBuilderTimerItemLabel(row) {
+  return String(row?.productName || getVerifyDisplayLabel(row) || row?.sku || row?.key || '').trim();
+}
+
+function getBuilderTimerItemSku(row) {
+  if (!row || row.sku === 'Bundle' || row.sku === '(No SKU)') return '';
+  return String(row.sku || '').trim();
+}
+
+function postBuilderTimerEvent(path, payload, { useBeacon = false } = {}) {
+  if (useBeacon && navigator.sendBeacon) {
+    const blob = new Blob([JSON.stringify(payload)], { type: 'application/json' });
+    navigator.sendBeacon(path, blob);
+    return Promise.resolve(true);
+  }
+
+  return fetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Accept: 'application/json' },
+    body: JSON.stringify(payload),
+    keepalive: useBeacon,
+  }).then((response) => response.ok).catch(() => false);
+}
+
+function stopBuilderTimerIntervals() {
+  if (builderTimerHeartbeatId) {
+    clearInterval(builderTimerHeartbeatId);
+    builderTimerHeartbeatId = null;
+  }
+  if (builderTimerUiTickId) {
+    clearInterval(builderTimerUiTickId);
+    builderTimerUiTickId = null;
+  }
+}
+
+function updateBuilderTimerDisplays() {
+  document.querySelectorAll('[data-builder-time-key]').forEach((element) => {
+    const itemKey = String(element.getAttribute('data-builder-time-key') || '').trim();
+    const row = verifyItems.find((item) => item.key === itemKey);
+    if (!row) return;
+    element.textContent = formatBuilderDuration(getBuilderElapsedMsForRow(row));
+  });
+
+  const summaryTimerValue = document.querySelector('[data-builder-summary-timer-value]');
+  if (!summaryTimerValue) return;
+
+  const timerState = getBuilderTimerSummaryState();
+  const timer = summaryTimerValue.closest('.pick-builder-summary-timer');
+  if (timer) {
+    timer.classList.toggle('is-running', Boolean(timerState.active));
+    timer.classList.toggle('is-paused', timerState.label === 'Paused');
+  }
+  summaryTimerValue.textContent = formatBuilderDuration(timerState.elapsedMs);
+
+  const summaryTimerLabel = document.querySelector('[data-builder-summary-timer-label]');
+  if (summaryTimerLabel) {
+    summaryTimerLabel.textContent = timerState.label;
+  }
+
+  const summaryTimerItem = document.querySelector('[data-builder-summary-timer-item]');
+  if (summaryTimerItem) {
+    summaryTimerItem.textContent = timerState.row ? getVerifyDisplayLabel(timerState.row) : 'No active line';
+  }
+}
+
+function startBuilderTimerIntervals() {
+  stopBuilderTimerIntervals();
+  builderTimerHeartbeatId = window.setInterval(() => {
+    if (!builderTimerState.sessionId) return;
+    postBuilderTimerEvent('/api/builder-time/heartbeat', {
+      sessionId: builderTimerState.sessionId,
+      lastSeenAt: new Date().toISOString(),
+    });
+  }, BUILDER_TIMER_HEARTBEAT_MS);
+  builderTimerUiTickId = window.setInterval(updateBuilderTimerDisplays, BUILDER_TIMER_UI_TICK_MS);
+}
+
+async function stopActiveBuilderTimer({ reason = 'stopped', pause = true, useBeacon = false } = {}) {
+  if (!builderTimerState.sessionId) {
+    if (!pause) {
+      builderTimerPaused = false;
+      builderTimerPausedItemKey = '';
+    }
+    return false;
+  }
+
+  const sessionId = builderTimerState.sessionId;
+  const itemKey = builderTimerState.itemKey;
+  const elapsedMs = getActiveBuilderTimerElapsedMs();
+  const endedAt = new Date().toISOString();
+  builderTimeByItemKey[itemKey] = Math.max(0, Math.floor(Number(builderTimeByItemKey[itemKey]) || 0)) + elapsedMs;
+  builderTimerState = {
+    sessionId: '',
+    itemKey: '',
+    startedAtMs: 0,
+    startedAtIso: '',
+  };
+  if (pause) {
+    builderTimerPaused = true;
+    builderTimerPausedItemKey = itemKey;
+  } else {
+    builderTimerPaused = false;
+    builderTimerPausedItemKey = '';
+  }
+  stopBuilderTimerIntervals();
+  updateBuilderTimerDisplays();
+
+  await postBuilderTimerEvent('/api/builder-time/stop', {
+    sessionId,
+    elapsedMs,
+    endedAt,
+    reason,
+  }, { useBeacon });
+  return true;
+}
+
+async function startBuilderTimerForRow(row, { force = false } = {}) {
+  if (!wholesaleModeEnabled || !row || !currentOrderBarcode || isCurrentOrderWorkflowBlocked()) return false;
+  if (row.scannedQty >= row.requiredQty) return false;
+  if (isBuilderTimerActiveForRow(row.key)) return true;
+  if (builderTimerPaused && !force) return false;
+
+  if (builderTimerState.sessionId) {
+    await stopActiveBuilderTimer({ reason: 'switch_item', pause: false });
+  }
+
+  const startedAt = new Date();
+  const sessionId = makeBuilderTimerSessionId();
+  builderTimerState = {
+    sessionId,
+    itemKey: row.key,
+    startedAtMs: startedAt.getTime(),
+    startedAtIso: startedAt.toISOString(),
+  };
+  builderTimerPaused = false;
+  builderTimerPausedItemKey = '';
+  startBuilderTimerIntervals();
+
+  await postBuilderTimerEvent('/api/builder-time/start', {
+    sessionId,
+    barcode: currentOrderBarcode,
+    orderId: currentOrderId,
+    orderNumber: currentOrderNumber,
+    itemKey: row.key,
+    itemLabel: getBuilderTimerItemLabel(row),
+    sku: getBuilderTimerItemSku(row),
+    startedAt: builderTimerState.startedAtIso,
+    lastSeenAt: builderTimerState.startedAtIso,
+  });
+  updateBuilderTimerDisplays();
+  return true;
+}
+
+async function syncBuilderTimerForCurrentState({ force = false } = {}) {
+  if (!wholesaleModeEnabled || !hasRenderedPickList || isCurrentOrderWorkflowBlocked()) {
+    await stopActiveBuilderTimer({ reason: 'mode_changed', pause: false });
+    return;
+  }
+
+  const activeRow = builderTimerState.itemKey
+    ? verifyItems.find((row) => row.key === builderTimerState.itemKey)
+    : null;
+  if (activeRow && activeRow.scannedQty >= activeRow.requiredQty) {
+    await stopActiveBuilderTimer({ reason: 'line_complete', pause: false });
+  }
+
+  const nextRow = getBuilderTimerCandidate();
+  if (!nextRow) {
+    await stopActiveBuilderTimer({ reason: 'order_complete', pause: false });
+    return;
+  }
+  await startBuilderTimerForRow(nextRow, { force });
 }
 
 function getQcWholesaleBestSubTypeRank(row) {
@@ -4568,7 +4996,10 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     expandVerifyCodeVariants(normalizedUpc).forEach((code) => row.codes.add(code));
   });
 
-  const builtVerifyRows = Array.from(grouped.values());
+  let builtVerifyRows = Array.from(grouped.values());
+  if (wholesaleModeEnabled) {
+    builtVerifyRows = builtVerifyRows.filter(hasBuilderRackedPickRow);
+  }
   builtVerifyRows.forEach(annotateBuilderQcFailReasons);
 
   verifyItems = builtVerifyRows.sort((a, b) => {
@@ -6322,7 +6753,7 @@ function renderVerifyOrderCards() {
   container.innerHTML = '';
 
   if (!verifyItems.length) {
-    container.innerHTML = `<p class="pick-list-empty">No order line items found for ${qcModeEnabled ? 'QC' : 'verification'}.</p>`;
+    container.innerHTML = `<p class="pick-list-empty">No order line items found for ${qcModeEnabled ? 'QC' : (wholesaleModeEnabled ? 'builder mode' : 'verification')}.</p>`;
     return;
   }
 
@@ -6351,6 +6782,9 @@ function renderVerifyOrderCards() {
       <p>${summarySubtitle}</p>
     </header>
   `;
+  if (wholesaleModeEnabled) {
+    summaryCard.appendChild(createBuilderSummaryTimer());
+  }
   if (canOpenShippingPanel) {
     summaryCard.setAttribute('role', 'button');
     summaryCard.tabIndex = 0;
@@ -6487,6 +6921,7 @@ function renderVerifyOrderCards() {
     title.title = row.productName;
 
     const meta = document.createElement('p');
+    const builderPickTypeLabel = wholesaleModeEnabled ? getBuilderPickTypeLabel(row) : '';
     if (row.isWholesaleBundle) {
       const bundleParts = [
         row.requiredQty > 1 ? `${row.requiredQty} bundle adapters` : '1 bundle adapter',
@@ -6505,7 +6940,34 @@ function renderVerifyOrderCards() {
         ? 'Manual build only (no SKU/UPC barcode)'
         : 'Manual verify only (no SKU/UPC barcode)');
     }
-    meta.title = meta.textContent;
+    const metaBaseText = meta.textContent;
+    if (builderPickTypeLabel) {
+      if (metaBaseText) {
+        meta.appendChild(document.createTextNode(' | '));
+      }
+      const pickType = document.createElement('span');
+      pickType.className = 'pick-builder-pick-type-inline';
+      pickType.textContent = builderPickTypeLabel;
+      meta.appendChild(pickType);
+    }
+    if (wholesaleModeEnabled) {
+      if (meta.textContent) {
+        meta.appendChild(document.createTextNode(' | '));
+      }
+      const timeLabel = document.createElement('span');
+      timeLabel.className = 'pick-builder-time-inline';
+      timeLabel.textContent = 'Time ';
+      const timeValue = document.createElement('span');
+      timeValue.setAttribute('data-builder-time-key', row.key);
+      timeValue.textContent = formatBuilderDuration(getBuilderElapsedMsForRow(row));
+      timeLabel.appendChild(timeValue);
+      meta.appendChild(timeLabel);
+    }
+    meta.title = [
+      metaBaseText,
+      builderPickTypeLabel,
+      wholesaleModeEnabled ? `Time ${formatBuilderDuration(getBuilderElapsedMsForRow(row))}` : '',
+    ].filter(Boolean).join(' | ');
 
     info.appendChild(title);
     info.appendChild(meta);
@@ -6650,7 +7112,12 @@ function renderVerifyOrderCards() {
       button.textContent = getVerificationIncrementLabel(row, complete);
       button.dataset.role = 'increment';
       button.dataset.complete = complete ? '1' : '0';
-      button.disabled = loading || complete;
+      const builderTimerActive = wholesaleModeEnabled && isBuilderTimerActiveForRow(row.key);
+      const builderTimerPausedForRow = wholesaleModeEnabled && isBuilderTimerPausedForRow(row.key);
+      button.disabled = loading || complete || builderTimerPausedForRow;
+      if (builderTimerPausedForRow) {
+        button.title = 'Resume the builder timer before marking this line built.';
+      }
       button.addEventListener('click', () => {
         processVerifyManual(row.key);
       });
@@ -6658,16 +7125,39 @@ function renderVerifyOrderCards() {
       const undoButton = document.createElement('button');
       undoButton.type = 'button';
       undoButton.className = 'pick-verify-item-btn pick-verify-item-btn--undo';
-      undoButton.textContent = '-1';
-      undoButton.dataset.role = 'undo';
-      undoButton.dataset.canUndo = row.scannedQty > 0 ? '1' : '0';
-      undoButton.disabled = loading || row.scannedQty <= 0;
+      undoButton.textContent = wholesaleModeEnabled
+        ? (builderTimerPausedForRow ? 'Resume' : 'Pause')
+        : '-1';
+      undoButton.dataset.role = wholesaleModeEnabled ? 'timer-toggle' : 'undo';
+      undoButton.dataset.canUndo = wholesaleModeEnabled
+        ? (builderTimerActive || builderTimerPausedForRow ? '1' : '0')
+        : (row.scannedQty > 0 ? '1' : '0');
+      undoButton.disabled = loading || (wholesaleModeEnabled
+        ? (complete || (!builderTimerActive && !builderTimerPausedForRow))
+        : row.scannedQty <= 0);
       undoButton.addEventListener('click', () => {
+        if (wholesaleModeEnabled) {
+          processBuilderTimerPauseResume(row.key);
+          return;
+        }
         processVerifyUndo(row.key);
       });
 
       actions.appendChild(button);
       actions.appendChild(undoButton);
+      if (wholesaleModeEnabled) {
+        const builderUndoButton = document.createElement('button');
+        builderUndoButton.type = 'button';
+        builderUndoButton.className = 'pick-verify-item-btn pick-verify-item-btn--undo';
+        builderUndoButton.textContent = '-1';
+        builderUndoButton.dataset.role = 'undo';
+        builderUndoButton.dataset.canUndo = row.scannedQty > 0 ? '1' : '0';
+        builderUndoButton.disabled = loading || row.scannedQty <= 0;
+        builderUndoButton.addEventListener('click', () => {
+          processVerifyUndo(row.key);
+        });
+        actions.appendChild(builderUndoButton);
+      }
       item.appendChild(actions);
     }
     list.appendChild(item);
@@ -7145,6 +7635,37 @@ async function processVerifyLongPress(key) {
   }
 }
 
+async function processBuilderTimerPauseResume(key) {
+  if (!wholesaleModeEnabled) return;
+  const row = verifyItems.find((item) => item.key === key);
+  if (!row) {
+    setStatus('Error: Builder item not found.', 'error');
+    return;
+  }
+
+  if (isBuilderTimerActiveForRow(key)) {
+    await stopActiveBuilderTimer({ reason: 'pause_button', pause: true });
+    renderVerifyOrderCards();
+    setStatus(`Builder timer paused for ${getVerifyDisplayLabel(row)}. Press Resume before continuing.`, 'info');
+    return;
+  }
+
+  if (isBuilderTimerPausedForRow(key)) {
+    const didStart = await startBuilderTimerForRow(row, { force: true });
+    renderVerifyOrderCards();
+    setStatus(
+      didStart
+        ? `Builder timer resumed for ${getVerifyDisplayLabel(row)}.`
+        : `Could not resume builder timer for ${getVerifyDisplayLabel(row)}.`,
+      didStart ? 'success' : 'error'
+    );
+    return;
+  }
+
+  renderVerifyOrderCards();
+  setStatus('The builder timer is already running on the active line.', 'info');
+}
+
 async function processVerifyManual(key) {
   if (!isVerificationStyleModeEnabled()) return;
   if (qcModeEnabled) {
@@ -7167,9 +7688,21 @@ async function processVerifyManual(key) {
     return;
   }
 
+  if (wholesaleModeEnabled && isBuilderTimerPausedForRow(row.key)) {
+    renderVerifyOrderCards();
+    setStatus(`Resume the builder timer for ${getVerifyDisplayLabel(row)} before marking it built.`, 'info');
+    return;
+  }
+
+  if (wholesaleModeEnabled) {
+    await startBuilderTimerForRow(row, { force: true });
+  }
+
   if (wholesaleModeEnabled) {
     const actionResult = await runOrderAction('wholesale_adapter_built');
     if (actionResult !== true) {
+      await stopActiveBuilderTimer({ reason: 'build_action_failed', pause: true });
+      renderVerifyOrderCards();
       return;
     }
   }
@@ -7178,6 +7711,11 @@ async function processVerifyManual(key) {
   if (!result.success) {
     setStatus(`${getVerifyDisplayLabel(row)} is already fully ${wholesaleModeEnabled ? 'built' : 'scanned'}.`, 'info');
     return;
+  }
+
+  if (wholesaleModeEnabled && row.scannedQty >= row.requiredQty) {
+    await stopActiveBuilderTimer({ reason: 'line_complete', pause: false });
+    await syncBuilderTimerForCurrentState({ force: true });
   }
 
   renderVerifyOrderCards();
@@ -7272,9 +7810,21 @@ async function processVerifyScan(scannedCode) {
     return true;
   }
 
+  if (wholesaleModeEnabled && isBuilderTimerPausedForRow(target.key)) {
+    renderVerifyOrderCards();
+    setStatus(`Resume the builder timer for ${getVerifyDisplayLabel(target)} before marking it built.`, 'info');
+    return true;
+  }
+
+  if (wholesaleModeEnabled) {
+    await startBuilderTimerForRow(target, { force: true });
+  }
+
   if (wholesaleModeEnabled) {
     const actionResult = await runOrderAction('wholesale_adapter_built');
     if (actionResult !== true) {
+      await stopActiveBuilderTimer({ reason: 'build_action_failed', pause: true });
+      renderVerifyOrderCards();
       return true;
     }
   }
@@ -7284,6 +7834,11 @@ async function processVerifyScan(scannedCode) {
   if (!result.success) {
     setStatus(`${getVerifyDisplayLabel(target)} is already fully ${wholesaleModeEnabled ? 'built' : 'scanned'}.`, 'info');
     return true;
+  }
+
+  if (wholesaleModeEnabled && target.scannedQty >= target.requiredQty) {
+    await stopActiveBuilderTimer({ reason: 'line_complete', pause: false });
+    await syncBuilderTimerForCurrentState({ force: true });
   }
 
   renderVerifyOrderCards();
@@ -7873,6 +8428,9 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     return;
   }
 
+  if (currentOrderBarcode && !isCurrentOrderLookup(barcode)) {
+    await stopActiveBuilderTimer({ reason: 'order_changed', pause: false });
+  }
   await flushPendingPickedRowCountsSave();
   await flushPendingVerifyProgressSave();
   await flushPendingQcProgressSave();
@@ -7910,6 +8468,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
       throw new Error(data.error || 'Failed to load pick list');
     }
 
+    currentOrderId = String(data.orderId || '').trim();
     currentOrderBarcode = data.barcode;
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';
@@ -7949,6 +8508,9 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
       data.qcProgressByItemKey && typeof data.qcProgressByItemKey === 'object'
         ? data.qcProgressByItemKey
         : {};
+    setBuilderTimeByItemKeyFromPayload(data.builderTimeByItemKey);
+    builderTimerPaused = false;
+    builderTimerPausedItemKey = '';
     setPickedRowCountsFromPayload(data.pickedRowCounts);
     buildVerifyState(
       lastOrderItems,
@@ -7958,6 +8520,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     );
     hasRenderedPickList = true;
     prunePickedRowCountsToRenderedRows();
+    await syncBuilderTimerForCurrentState({ force: true });
     renderCurrentOrderSection();
     renderOrderTimeline();
 
@@ -8067,11 +8630,24 @@ function registerOrderActionReminderNavigationGuards() {
     sendPickedRowCountsBeacon();
     sendVerifyProgressBeacon();
     sendQcProgressBeacon();
+    void stopActiveBuilderTimer({ reason: 'beforeunload', pause: true, useBeacon: true });
     if (suppressNextActionReminderUnload) return;
     if (!shouldShowOrderActionReminder()) return;
 
     event.preventDefault();
     event.returnValue = '';
+  });
+
+  window.addEventListener('pagehide', () => {
+    void stopActiveBuilderTimer({ reason: 'pagehide', pause: true, useBeacon: true });
+  });
+
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'hidden') {
+      void stopActiveBuilderTimer({ reason: 'hidden', pause: true, useBeacon: true });
+    } else if (document.visibilityState === 'visible' && wholesaleModeEnabled && hasRenderedPickList) {
+      renderCurrentOrderSection();
+    }
   });
 
   document.querySelectorAll('a[href]').forEach((link) => {
@@ -8243,6 +8819,7 @@ document.addEventListener('DOMContentLoaded', () => {
   const newOrderQueueStartBtn = document.getElementById('newOrderQueueStartBtn');
   const newOrderQueueRefreshBtn = document.getElementById('newOrderQueueRefreshBtn');
   const newOrderQueuePrintBtn = document.getElementById('newOrderQueuePrintBtn');
+  const newOrderQueuePreviousBtn = document.getElementById('newOrderQueuePreviousBtn');
   const newOrderQueueNextBtn = document.getElementById('newOrderQueueNextBtn');
 
   actionButtons = Array.from(document.querySelectorAll('.pick-list-action-btn'));
@@ -8269,6 +8846,9 @@ document.addEventListener('DOMContentLoaded', () => {
   }
   if (newOrderQueuePrintBtn) {
     newOrderQueuePrintBtn.addEventListener('click', printCurrentPackingSlip);
+  }
+  if (newOrderQueuePreviousBtn) {
+    newOrderQueuePreviousBtn.addEventListener('click', previousNewOrderQueue);
   }
   if (newOrderQueueNextBtn) {
     newOrderQueueNextBtn.addEventListener('click', advanceNewOrderQueue);
@@ -8373,10 +8953,18 @@ document.addEventListener('DOMContentLoaded', () => {
     renderNewOrderQueuePanel();
     setActionButtonsEnabled(actionButtonsUnlocked);
     syncVerificationStateForMode();
+    if (!wholesaleModeEnabled) {
+      void stopActiveBuilderTimer({ reason: 'mode_changed', pause: false });
+    }
     if (hasRenderedPickList) {
       renderOrderHeaderMeta();
       renderCurrentOrderSection();
       renderOrderTimeline();
+      if (wholesaleModeEnabled) {
+        void syncBuilderTimerForCurrentState({ force: true }).then(() => {
+          renderCurrentOrderSection();
+        });
+      }
     }
   };
 

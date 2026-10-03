@@ -15,7 +15,6 @@
         <a href="/awaiting_parts.html" class="pick-list-link">Awaiting Parts Queue</a>
         <a href="/print_queue.html" class="pick-list-link">Print Queue</a>
         <a href="/fdm_print_queue.html" class="pick-list-link">FDM Print Queue</a>
-        <a href="/scan.html" class="pick-list-link">Tag Scanner Mode</a>
       </nav>
       <h1>Monitor</h1>
       <p>Manager view for open orders that have not entered or progressed through the internal workflow.</p>
@@ -61,6 +60,16 @@
     </section>
 
     <section id="orderFlowOverview" class="order-flow-summary-grid"></section>
+
+    <section class="order-flow-builder-time-panel" aria-labelledby="orderFlowBuilderTimeTitle">
+      <div class="order-flow-builder-time-panel__head">
+        <div>
+          <h2 id="orderFlowBuilderTimeTitle" class="pick-list-section-title">Builder Time</h2>
+          <p id="orderFlowBuilderTimeSummary">No builder time loaded yet.</p>
+        </div>
+      </div>
+      <div id="orderFlowBuilderTime" class="order-flow-builder-time"></div>
+    </section>
 
     <section class="order-flow-grid-panel" aria-labelledby="orderFlowGridTitle">
       <div class="order-flow-grid-panel__head">

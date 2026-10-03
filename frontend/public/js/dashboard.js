@@ -29,6 +29,26 @@
     return number.toLocaleString('en-GB', { maximumFractionDigits: 0 });
   }
 
+  function formatDurationMs(value) {
+    const totalSeconds = Math.max(0, Math.round((Number(value) || 0) / 1000));
+    const hours = Math.floor(totalSeconds / 3600);
+    const minutes = Math.floor((totalSeconds % 3600) / 60);
+    const seconds = totalSeconds % 60;
+    if (hours > 0) {
+      return `${hours}:${String(minutes).padStart(2, '0')}:${String(seconds).padStart(2, '0')}`;
+    }
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
+  }
+
+  function isDurationMetric(metric) {
+    return String(metric?.valueType || '').trim() === 'duration_ms';
+  }
+
+  function formatMetricValue(metric, value) {
+    if (isDurationMetric(metric)) return formatDurationMs(value);
+    return formatNumber(value);
+  }
+
   function formatDateLabel(dateKey) {
     const date = parseDateKey(dateKey);
     if (!date) return dateKey || '';
@@ -133,14 +153,19 @@
 
   function getDeltaTone(metric) {
     const delta = Number(metric?.delta || 0);
-    if (delta > 0) return 'up';
-    if (delta < 0) return 'down';
+    if (delta > 0) return metric?.lowerIsBetter ? 'down' : 'up';
+    if (delta < 0) return metric?.lowerIsBetter ? 'up' : 'down';
     return 'flat';
   }
 
   function formatDelta(metric) {
     const delta = Number(metric?.delta || 0);
-    return delta > 0 ? `+${formatNumber(delta)}` : formatNumber(delta);
+    const formatted = isDurationMetric(metric)
+      ? formatDurationMs(Math.abs(delta))
+      : formatNumber(Math.abs(delta));
+    if (delta > 0) return `+${formatted}`;
+    if (delta < 0) return `-${formatted}`;
+    return isDurationMetric(metric) ? formatDurationMs(0) : '0';
   }
 
   function renderMetricCard(metric) {
@@ -154,11 +179,19 @@
         aria-pressed="${isActive ? 'true' : 'false'}"
       >
         <p>${escapeHtml(metric.label || 'Output')}</p>
-        <strong>${escapeHtml(formatNumber(metric.today))}</strong>
+        <div class="dashboard-output-card__values">
+          <span>
+            <em>Today</em>
+            <strong>${escapeHtml(formatMetricValue(metric, metric.today))}</strong>
+          </span>
+          <span>
+            <em>This Week</em>
+            <strong>${escapeHtml(formatMetricValue(metric, metric.week))}</strong>
+          </span>
+        </div>
         <div class="dashboard-output-card__meta">
-          <span>Yesterday <b>${escapeHtml(formatNumber(metric.yesterday))}</b></span>
+          <span>Yesterday <b>${escapeHtml(formatMetricValue(metric, metric.yesterday))}</b></span>
           <span class="dashboard-output-delta">${escapeHtml(formatDelta(metric))}</span>
-          <span>Week <b>${escapeHtml(formatNumber(metric.week))}</b></span>
         </div>
       </button>
     `;
@@ -175,7 +208,7 @@
           const active = point.date === state.selectedDate;
           return `
             <div class="dashboard-chart-bar${active ? ' is-active' : ''}">
-              <span class="dashboard-chart-bar__value">${escapeHtml(formatNumber(count))}</span>
+              <span class="dashboard-chart-bar__value">${escapeHtml(formatMetricValue(metric, count))}</span>
               <div class="dashboard-chart-bar__track">
                 <span style="height: ${escapeHtmlAttribute(height)}%;"></span>
               </div>
@@ -201,7 +234,7 @@
           const height = Math.max(3, Math.round((count / max) * 100));
           return `
             <div class="dashboard-hourly-bar">
-              <span class="dashboard-hourly-bar__value">${count ? escapeHtml(formatNumber(count)) : ''}</span>
+              <span class="dashboard-hourly-bar__value">${count ? escapeHtml(formatMetricValue(metric, count)) : ''}</span>
               <div class="dashboard-hourly-bar__track">
                 <span style="height: ${escapeHtmlAttribute(height)}%;"></span>
               </div>
@@ -226,7 +259,7 @@
         <div class="dashboard-staff-row">
           <div>
             <span>${escapeHtml(item.staff || 'Unknown')}</span>
-            <strong>${escapeHtml(formatNumber(count))}</strong>
+            <strong>${escapeHtml(formatMetricValue(metric, count))}</strong>
           </div>
           <div class="dashboard-staff-row__bar">
             <span style="width: ${escapeHtmlAttribute(width)}%;"></span>
@@ -243,9 +276,9 @@
     }
     return rows.map((row) => `
       <div class="dashboard-recent-row">
-        <strong>${escapeHtml(row.orderNumber || row.barcode || row.orderId || 'Unknown')}</strong>
+        <strong>${escapeHtml(row.itemLabel || row.orderNumber || row.barcode || row.orderId || 'Unknown')}</strong>
         <span>${escapeHtml(row.staff || 'Unknown')}</span>
-        <span>${escapeHtml(formatTime(row.createdAt))}</span>
+        <span>${escapeHtml(row.value != null ? formatMetricValue(metric, row.value) : formatTime(row.createdAt))}</span>
       </div>
     `).join('');
   }
@@ -258,25 +291,27 @@
         </section>
       `;
     }
+    const staffTitle = isDurationMetric(metric) ? 'Staff Avg' : 'Staff';
+    const recentTitle = isDurationMetric(metric) ? 'Recent Builds' : 'Recent Orders';
 
     return `
       <section class="dashboard-panel dashboard-detail-panel">
         <div class="dashboard-detail-head">
           <div>
             <p>${escapeHtml(metric.label)}</p>
-            <strong>${escapeHtml(formatNumber(metric.today))}</strong>
+            <strong>${escapeHtml(formatMetricValue(metric, metric.today))}</strong>
           </div>
           <div class="dashboard-detail-head__meta">
-            <span>Yesterday <b>${escapeHtml(formatNumber(metric.yesterday))}</b></span>
+            <span>Yesterday <b>${escapeHtml(formatMetricValue(metric, metric.yesterday))}</b></span>
             <span>Change <b>${escapeHtml(formatDelta(metric))}</b></span>
-            <span>Week <b>${escapeHtml(formatNumber(metric.week))}</b></span>
+            <span>This Week <b>${escapeHtml(formatMetricValue(metric, metric.week))}</b></span>
           </div>
         </div>
 
         <div class="dashboard-detail-grid">
           <section class="dashboard-detail-block dashboard-detail-block--wide">
             <div class="dashboard-detail-block__head">
-              <span>Last 7 Days</span>
+              <span>Daily Trend</span>
             </div>
             ${renderTrendChart(metric)}
           </section>
@@ -290,7 +325,7 @@
 
           <section class="dashboard-detail-block">
             <div class="dashboard-detail-block__head">
-              <span>Staff</span>
+              <span>${escapeHtml(staffTitle)}</span>
             </div>
             <div class="dashboard-staff-list">
               ${renderStaffRows(metric)}
@@ -299,7 +334,7 @@
 
           <section class="dashboard-detail-block">
             <div class="dashboard-detail-block__head">
-              <span>Recent Orders</span>
+              <span>${escapeHtml(recentTitle)}</span>
             </div>
             <div class="dashboard-recent-list">
               ${renderRecentRows(metric)}

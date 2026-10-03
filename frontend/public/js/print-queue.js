@@ -1148,6 +1148,36 @@ function renderQueueCard(item) {
   const quantityBadgeClass = isComplete
     ? 'print-queue-card__qty print-queue-card__qty--location'
     : 'print-queue-card__qty';
+  const quantityControl = isComplete
+    ? `<span class="${quantityBadgeClass}" title="${escapeHtmlAttribute(quantityBadgeLabel)}">${escapeHtml(quantityBadgeLabel)}</span>`
+    : `
+        <div class="print-queue-card__quantity" aria-label="Requested quantity">
+          <button
+            type="button"
+            data-print-quantity-step-id="${escapeHtmlAttribute(item.id)}"
+            data-print-quantity-delta="-1"
+            draggable="false"
+            aria-label="Decrease quantity for ${escapeHtmlAttribute(getItemLabel(item))}"
+          >-</button>
+          <input
+            type="number"
+            min="1"
+            step="1"
+            inputmode="numeric"
+            value="${escapeHtmlAttribute(item.quantity)}"
+            data-print-quantity-input-id="${escapeHtmlAttribute(item.id)}"
+            draggable="false"
+            aria-label="Requested quantity for ${escapeHtmlAttribute(getItemLabel(item))}"
+          />
+          <button
+            type="button"
+            data-print-quantity-step-id="${escapeHtmlAttribute(item.id)}"
+            data-print-quantity-delta="1"
+            draggable="false"
+            aria-label="Increase quantity for ${escapeHtmlAttribute(getItemLabel(item))}"
+          >+</button>
+        </div>
+      `;
   const rootMeta = rootSku && rootSku !== sku
     ? `<span>Root ${escapeHtml(rootSku)}</span>`
     : '';
@@ -1280,7 +1310,7 @@ function renderQueueCard(item) {
           ${isCustom && item.customFileName ? `<p>${escapeHtml(item.customFileName)}</p>` : ''}
         </div>
         <div class="print-queue-card__head-actions">
-          <span class="${quantityBadgeClass}" title="${escapeHtmlAttribute(quantityBadgeLabel)}">${escapeHtml(quantityBadgeLabel)}</span>
+          ${quantityControl}
           ${deleteButton}
         </div>
       </div>
@@ -1538,6 +1568,42 @@ async function movePrintItem(itemId, stageKey) {
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
     setLoading(false);
+  }
+}
+
+async function updatePrintItemQuantity(itemId, quantity) {
+  const normalizedId = Number(itemId);
+  const safeQuantity = Math.max(1, Math.floor(Number(quantity) || 0));
+  if (!Number.isInteger(normalizedId) || normalizedId <= 0 || !Number.isFinite(safeQuantity) || printQueueLoading) {
+    return;
+  }
+
+  const existingItem = printQueueItems.find((item) => String(item.id) === String(normalizedId));
+  if (existingItem && Number(existingItem.quantity) === safeQuantity) {
+    return;
+  }
+
+  setLoading(true);
+  setStatus('Updating print quantity...', 'info');
+
+  try {
+    const response = await fetch(`/api/print-queue/${encodeURIComponent(normalizedId)}/quantity`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Accept: 'application/json',
+      },
+      body: JSON.stringify({ quantity: safeQuantity }),
+    });
+    await readJsonResponse(response, 'Failed to update print quantity');
+
+    setLoading(false);
+    await fetchPrintQueue({ silent: true, includeCatalog: false });
+    setStatus(`Updated print quantity to x${safeQuantity}.`, 'success');
+  } catch (err) {
+    setStatus(`Error: ${err.message}`, 'error');
+    setLoading(false);
+    renderBoard();
   }
 }
 
@@ -1901,6 +1967,23 @@ function bindBoardEvents(board) {
 
   board.addEventListener('click', (event) => {
     const target = event.target instanceof Element ? event.target : null;
+    const quantityStep = target
+      ? target.closest('[data-print-quantity-step-id]')
+      : null;
+    if (quantityStep) {
+      event.preventDefault();
+      event.stopPropagation();
+      const itemId = quantityStep.getAttribute('data-print-quantity-step-id');
+      const delta = Math.trunc(Number(quantityStep.getAttribute('data-print-quantity-delta')) || 0);
+      const card = quantityStep.closest('.print-queue-card');
+      const input = card?.querySelector('[data-print-quantity-input-id]');
+      const currentQuantity = Math.max(1, Math.floor(Number(input?.value) || 1));
+      const nextQuantity = Math.max(1, currentQuantity + delta);
+      if (input) input.value = String(nextQuantity);
+      updatePrintItemQuantity(itemId, nextQuantity);
+      return;
+    }
+
     const childrenToggle = target
       ? target.closest('[data-print-children-toggle-id]')
       : null;
@@ -1958,9 +2041,34 @@ function bindBoardEvents(board) {
     openPutAwayReview(button.getAttribute('data-print-put-away-id'));
   });
 
+  board.addEventListener('change', (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    const input = target ? target.closest('[data-print-quantity-input-id]') : null;
+    if (!input) return;
+
+    const itemId = input.getAttribute('data-print-quantity-input-id');
+    const quantity = Math.max(1, Math.floor(Number(input.value) || 1));
+    input.value = String(quantity);
+    updatePrintItemQuantity(itemId, quantity);
+  });
+
+  board.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    const target = event.target instanceof Element ? event.target : null;
+    const input = target ? target.closest('[data-print-quantity-input-id]') : null;
+    if (!input) return;
+
+    event.preventDefault();
+    const itemId = input.getAttribute('data-print-quantity-input-id');
+    const quantity = Math.max(1, Math.floor(Number(input.value) || 1));
+    input.value = String(quantity);
+    updatePrintItemQuantity(itemId, quantity);
+    input.blur();
+  });
+
   board.addEventListener('dragstart', (event) => {
     clearPrintQueueDiscoPressTimer();
-    if (event.target instanceof Element && event.target.closest('button, a')) {
+    if (event.target instanceof Element && event.target.closest('button, a, input, select, textarea')) {
       event.preventDefault();
       return;
     }

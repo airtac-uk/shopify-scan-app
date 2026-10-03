@@ -506,6 +506,7 @@ function mapCountsToDisplayRows({ skuMap, counts }) {
       sku,
       quantity: qty,
       location: meta.location,
+      pickType: meta.type,
       type: meta.type,
       typeRaw: meta.typeRaw || '',
       note: meta.note,
