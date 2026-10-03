@@ -673,6 +673,7 @@ function buildPickListForOrder({ skuMap, lineItems }) {
     originalSku: line.originalSku,
     skuFallbackUsed: line.skuFallbackUsed,
     quantity: line.quantity,
+    pickType: line.lineType,
     lineType: line.lineType,
     bundleGroupId: line.bundleGroupId,
     bundleGroupTitle: line.bundleGroupTitle,

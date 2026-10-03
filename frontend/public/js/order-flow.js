@@ -103,6 +103,53 @@ function formatOrderValue(value) {
   }
 }
 
+function getOrderFlowPickTypeLabel(value) {
+  const label = String(value || '')
+    .trim()
+    .toUpperCase()
+    .replace(/[-_]+/g, ' ')
+    .replace(/\s+/g, ' ');
+  return label && label !== 'UNKNOWN' ? label : '';
+}
+
+function formatOrderFlowItemSku(item = {}) {
+  const sku = String(item?.sku || '').trim();
+  const quantity = Math.max(1, Math.floor(Number(item?.quantity) || 1));
+  if (!sku) return '';
+  return quantity > 1 ? `${sku} x${quantity}` : sku;
+}
+
+function renderOrderFlowItemList(items = [], fallbackTitle = '') {
+  const rows = (Array.isArray(items) ? items : [])
+    .map((item) => {
+      const skuLabel = formatOrderFlowItemSku(item);
+      const title = String(item?.title || '').trim();
+      const variantTitle = String(item?.variantTitle || '').trim();
+      const subtitle = [title, variantTitle].filter(Boolean).join(' - ');
+      const pickType = getOrderFlowPickTypeLabel(item?.pickType);
+      const primaryLabel = skuLabel || subtitle;
+      if (!primaryLabel) return '';
+
+      return `
+        <div class="order-flow-sku-row">
+          <span class="order-flow-sku-row__main">
+            <strong>${escapeHtml(primaryLabel)}</strong>
+            ${pickType ? `<em>${escapeHtml(pickType)}</em>` : ''}
+          </span>
+          ${skuLabel && subtitle ? `<span class="order-flow-sku-row__title">${escapeHtml(subtitle)}</span>` : ''}
+        </div>
+      `;
+    })
+    .filter(Boolean);
+
+  if (rows.length) {
+    return `<div class="order-flow-sku-list">${rows.join('')}</div>`;
+  }
+
+  const fallback = String(fallbackTitle || '').trim();
+  return fallback ? `<p class="order-flow-sku-fallback">${escapeHtml(fallback)}</p>` : '';
+}
+
 function formatDurationMs(value) {
   const totalSeconds = Math.max(0, Math.floor(Number(value) || 0) / 1000);
   const hours = Math.floor(totalSeconds / 3600);
@@ -674,6 +721,7 @@ function renderOrderGridPreview(order = null) {
   const issueStack = String(order.issueStack || '').trim();
   const markerLabel = getOrderGridMarkerLabel(order);
   const viewerUrl = buildOrderViewerUrl(order);
+  const itemListHtml = renderOrderFlowItemList(order.items, itemTitle);
 
   container.innerHTML = `
     <div class="order-flow-grid-preview__head">
@@ -699,7 +747,7 @@ function renderOrderGridPreview(order = null) {
       ${staffLabel ? `<span>Last staff <strong>${escapeHtml(staffLabel)}</strong></span>` : ''}
       ${markerLabel ? `<span>Marker <strong>${escapeHtml(markerLabel)}</strong></span>` : ''}
     </div>
-    ${itemTitle ? `<p class="order-flow-grid-preview__item">${escapeHtml(itemTitle)}</p>` : ''}
+    ${itemListHtml}
     <a class="order-flow-grid-preview__open" href="${escapeHtmlAttribute(viewerUrl)}" target="_blank" rel="noopener noreferrer">Open order</a>
   `;
 }
@@ -799,6 +847,7 @@ function renderIssue(issue, { stackKey = '' } = {}) {
   const stackedAt = issue.exceptionStack?.at || issue.snoozed?.at || null;
   const stackedBy = String(issue.exceptionStack?.by || issue.snoozed?.by || '').trim();
   const stackedAtLabel = stackedAt ? formatTimestamp(stackedAt) : '';
+  const itemListHtml = renderOrderFlowItemList(issue.items, itemTitle);
   const actionButtons = activeStackKey
     ? `
         <button
@@ -862,7 +911,7 @@ function renderIssue(issue, { stackKey = '' } = {}) {
           ${stackedAtLabel && stackConfig ? `<span>${escapeHtml(stackConfig.label)} <strong>${escapeHtml(stackedAtLabel)}</strong></span>` : ''}
           ${stackedBy ? `<span>By <strong>${escapeHtml(stackedBy)}</strong></span>` : ''}
         </div>
-        ${itemTitle ? `<p class="order-flow-issue__item">${escapeHtml(itemTitle)}</p>` : ''}
+        ${itemListHtml}
         ${renderIssueTags(issue)}
       </div>
       <div class="order-flow-issue__action">

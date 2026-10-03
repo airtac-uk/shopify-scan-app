@@ -1219,6 +1219,42 @@ function getOrderFlowFirstItemTitle(lineItems) {
   return String(firstItem?.title || '').trim();
 }
 
+function buildOrderFlowItemSummaries({ lineItems = [], skuMap = null } = {}) {
+  return (Array.isArray(lineItems) ? lineItems : [])
+    .map((item) => {
+      const sku = normalizeSku(item?.sku);
+      const sheetRow = sku && skuMap instanceof Map ? skuMap.get(sku) : null;
+      const quantity = Math.max(1, Number(item?.quantity) || 1);
+      const title = String(item?.title || '').trim();
+      const variantTitle = String(item?.variantTitle || '').trim();
+      const pickType = normalizePickType(item?.pickType || sheetRow?.pickType || '');
+
+      if (!sku && !title) return null;
+
+      return {
+        sku,
+        title,
+        variantTitle,
+        quantity,
+        pickType: pickType === 'UNKNOWN' ? '' : pickType,
+      };
+    })
+    .filter(Boolean);
+}
+
+function getOrderFlowDisplayLineItems({ shopifyOrder = null, tracker = null } = {}) {
+  const shopifyLineItems = Array.isArray(shopifyOrder?.lineItems) ? shopifyOrder.lineItems : [];
+  if (shopifyLineItems.length) return shopifyLineItems;
+  return Array.isArray(tracker?.lineItems) ? tracker.lineItems : [];
+}
+
+function buildOrderFlowDisplayItems({ shopifyOrder = null, tracker = null, skuMap = null } = {}) {
+  return buildOrderFlowItemSummaries({
+    lineItems: getOrderFlowDisplayLineItems({ shopifyOrder, tracker }),
+    skuMap,
+  });
+}
+
 function summarizeOrderFlowShopifyOrder(order) {
   if (!order?.id) return null;
   const lineItems = Array.isArray(order.lineItems?.edges)
@@ -1250,6 +1286,7 @@ function summarizeOrderFlowShopifyOrder(order) {
     itemCount,
     orderValue,
     firstItemTitle: getOrderFlowFirstItemTitle(lineItems),
+    lineItems: buildOrderFlowItemSummaries({ lineItems }),
     orderNote: order.note ? stripAppOrderNoteBlocks(order.note) : '',
   };
 }
@@ -1486,9 +1523,11 @@ function buildOrderFlowIssue({
   nowMs,
   thresholdWorkingDays = null,
   source = 'shopify',
+  skuMap = null,
 }) {
   const stage = getOrderFlowTrackerStage(tracker, shopifyOrder);
   const trackerLineItems = Array.isArray(tracker?.lineItems) ? tracker.lineItems : [];
+  const displayItems = buildOrderFlowDisplayItems({ shopifyOrder, tracker, skuMap });
   const orderId = String(shopifyOrder?.id || tracker?.orderId || '').trim();
   const orderNumber = String(shopifyOrder?.orderNumber || tracker?.orderNumber || '').trim();
   const barcode = normalizeScanBarcode(shopifyOrder?.barcode || tracker?.barcode || orderNumber);
@@ -1534,6 +1573,7 @@ function buildOrderFlowIssue({
     itemCount: Math.max(0, Number(shopifyOrder?.itemCount ?? getOrderFlowLineItemCount(trackerLineItems)) || 0),
     orderValue: shopifyOrder?.orderValue || null,
     firstItemTitle: String(shopifyOrder?.firstItemTitle || getOrderFlowFirstItemTitle(trackerLineItems)).trim(),
+    items: displayItems,
     lastStaff: getOrderFlowLatestStaff(tracker),
   };
 }
@@ -1598,9 +1638,11 @@ function buildOrderFlowGridOrder({
   fallbackStaleWorkingDays,
   stageWorkingDays,
   source = 'shopify',
+  skuMap = null,
 } = {}) {
   const stage = getOrderFlowTrackerStage(tracker, shopifyOrder);
   const trackerLineItems = Array.isArray(tracker?.lineItems) ? tracker.lineItems : [];
+  const displayItems = buildOrderFlowDisplayItems({ shopifyOrder, tracker, skuMap });
   const orderId = String(shopifyOrder?.id || tracker?.orderId || '').trim();
   const orderNumber = String(shopifyOrder?.orderNumber || tracker?.orderNumber || '').trim();
   const barcode = normalizeScanBarcode(shopifyOrder?.barcode || tracker?.barcode || orderNumber);
@@ -1657,6 +1699,7 @@ function buildOrderFlowGridOrder({
     itemCount: Math.max(0, Number(shopifyOrder?.itemCount ?? getOrderFlowLineItemCount(trackerLineItems)) || 0),
     orderValue: shopifyOrder?.orderValue || null,
     firstItemTitle: String(shopifyOrder?.firstItemTitle || getOrderFlowFirstItemTitle(trackerLineItems)).trim(),
+    items: displayItems,
     lastStaff: getOrderFlowLatestStaff(tracker),
   };
 }
@@ -1691,6 +1734,15 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
     { min: 0.25, max: 60 }
   );
   const stageWorkingDays = parseOrderFlowStageWorkingDays(query.stageWorkingDays);
+  let orderFlowSkuMap = new Map();
+  try {
+    const pickListSheet = await fetchPickListSheet();
+    if (pickListSheet?.skuMap instanceof Map) {
+      orderFlowSkuMap = pickListSheet.skuMap;
+    }
+  } catch (err) {
+    console.error('Order Flow pick type enrichment failed:', err);
+  }
 
   const openOrderResult = await listOrderFlowOpenOrders({
     client,
@@ -1775,6 +1827,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
         nowMs,
         thresholdWorkingDays: newOrderWorkingDays,
         source: 'shopify',
+        skuMap: orderFlowSkuMap,
       }));
       return;
     }
@@ -1789,6 +1842,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
         nowMs,
         thresholdWorkingDays: newOrderWorkingDays,
         source: 'shopify',
+        skuMap: orderFlowSkuMap,
       }));
       return;
     }
@@ -1811,6 +1865,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
         nowMs,
         thresholdWorkingDays,
         source: 'tracker',
+        skuMap: orderFlowSkuMap,
       }));
     }
   });
@@ -1843,6 +1898,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       nowMs,
       thresholdWorkingDays,
       source: 'local_tracker',
+      skuMap: orderFlowSkuMap,
     }));
   });
 
@@ -1942,6 +1998,7 @@ async function buildOrderFlowOverview({ client, shop, query = {} }) {
       fallbackStaleWorkingDays,
       stageWorkingDays,
       source,
+      skuMap: orderFlowSkuMap,
     });
     if (!gridOrder) return;
     gridOrderIds.add(orderId);

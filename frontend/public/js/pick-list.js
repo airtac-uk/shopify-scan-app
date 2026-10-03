@@ -203,6 +203,49 @@ function normalizeVerifyPickType(value) {
     .replace(/\s+/g, ' ');
 }
 
+function getPickTypeDisplayLabel(value) {
+  const label = normalizeVerifyPickType(value);
+  return label && label !== 'UNKNOWN' ? label : '';
+}
+
+function createPickTypeBadge(pickType) {
+  const label = getPickTypeDisplayLabel(pickType);
+  if (!label) return null;
+
+  const badge = document.createElement('span');
+  badge.className = 'pick-sku-type-badge';
+  badge.textContent = label;
+  return badge;
+}
+
+function appendSkuWithPickType(parent, skuLabel, pickType, { className = '' } = {}) {
+  if (!parent) return null;
+
+  const wrapper = document.createElement('span');
+  wrapper.className = ['pick-sku-with-type', className].filter(Boolean).join(' ');
+
+  const text = document.createElement('span');
+  text.className = 'pick-sku-with-type__sku';
+  text.textContent = String(skuLabel || '').trim();
+  wrapper.appendChild(text);
+
+  const badge = createPickTypeBadge(pickType);
+  if (badge) wrapper.appendChild(badge);
+
+  parent.appendChild(wrapper);
+  return wrapper;
+}
+
+function formatSkuWithPickTypeText(skuLabel, pickType) {
+  const label = String(skuLabel || '').trim();
+  const pickTypeLabel = getPickTypeDisplayLabel(pickType);
+  return pickTypeLabel ? `${label} [${pickTypeLabel}]` : label;
+}
+
+function getPickRowDisplayPickType(row) {
+  return getPickTypeDisplayLabel(row?.pickType);
+}
+
 function getNormalizedVerifyPickTypes(value) {
   return String(value || '')
     .split(/[,;/|]+/)
@@ -374,6 +417,7 @@ function buildAwaitingPartsCatalog(lineItems) {
         location: String(row?.location || '').trim(),
         note: String(row?.note || '').trim(),
         type: String(row?.type || '').trim(),
+        pickType: String(row?.pickType || '').trim(),
       });
     }
 
@@ -391,6 +435,9 @@ function buildAwaitingPartsCatalog(lineItems) {
     }
     if (!existing.type) {
       existing.type = String(row?.type || '').trim();
+    }
+    if (!existing.pickType) {
+      existing.pickType = String(row?.pickType || '').trim();
     }
   };
 
@@ -1085,6 +1132,7 @@ function getShippingAllocationRows() {
         rowKey: row.key,
         skuLabel,
         productLabel,
+        pickTypeLabel: getVerifyPickTypeLabel(row),
         requiredQty,
         unitValueAmount: Number.isFinite(valueAmount) && valueAmount > 0 ? valueAmount : 0,
         valueCurrency,
@@ -2559,7 +2607,9 @@ function buildQcFailReasonsNoteText(reasons = currentQcFailReasons) {
 
   const lines = ['Previous QC fail reasons'];
   items.forEach((item) => {
-    const head = [item.sku, item.reason].filter(Boolean).join(': ');
+    const pickTypeLabel = getVerifyPickTypeLabel(findQcRowForSku(item.sku));
+    const skuLabel = item.sku ? formatSkuWithPickTypeText(item.sku, pickTypeLabel) : '';
+    const head = [skuLabel, item.reason].filter(Boolean).join(': ');
     const meta = [
       item.reportedBy ? `Reported by ${item.reportedBy}` : '',
       item.builtBy ? `Built by ${item.builtBy}` : '',
@@ -3682,6 +3732,39 @@ function getBuilderPickTypeLabel(row) {
   return '';
 }
 
+function getVerifyPickTypeLabel(row) {
+  const labels = [];
+  const seen = new Set();
+
+  (Array.isArray(row?.pickRows) ? row.pickRows : []).forEach((pickRow) => {
+    const label = getPickRowDisplayPickType(pickRow);
+    if (!label || seen.has(label)) return;
+    seen.add(label);
+    labels.push(label);
+  });
+
+  return labels.join(' | ');
+}
+
+function getVerifyBundlePartPickTypeLabel(row, partSku) {
+  const normalizedPartSku = normalizeDisplaySku(partSku);
+  if (!normalizedPartSku) return '';
+
+  const matchingRows = (Array.isArray(row?.pickRows) ? row.pickRows : [])
+    .filter((pickRow) => normalizeDisplaySku(pickRow?.sku) === normalizedPartSku);
+  const labels = [];
+  const seen = new Set();
+
+  matchingRows.forEach((pickRow) => {
+    const label = getPickRowDisplayPickType(pickRow);
+    if (!label || seen.has(label)) return;
+    seen.add(label);
+    labels.push(label);
+  });
+
+  return labels.join(' | ');
+}
+
 function setBuilderTimeByItemKeyFromPayload(value) {
   builderTimeByItemKey = {};
   if (!value || typeof value !== 'object' || Array.isArray(value)) return;
@@ -4556,9 +4639,11 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
       pickedCheckbox = pickedControl.checkbox;
       main.appendChild(pickedControl.label);
     }
-    const skuText = document.createElement('span');
-    skuText.textContent = Number(row.quantity) > 1 ? `${row.sku} x${row.quantity}` : `${row.sku}`;
-    main.appendChild(skuText);
+    appendSkuWithPickType(
+      main,
+      Number(row.quantity) > 1 ? `${row.sku} x${row.quantity}` : `${row.sku}`,
+      getPickRowDisplayPickType(row)
+    );
     if (pickProgress && !shouldReplaceNoteWithProgress) {
       main.appendChild(pickProgress);
     }
@@ -4668,7 +4753,7 @@ function renderLineCards(lineItems) {
     const header = document.createElement('header');
     header.className = 'pick-list-card-header';
     const title = document.createElement('h3');
-    title.textContent = `${line.sku} x${line.quantity}`;
+    appendSkuWithPickType(title, `${line.sku} x${line.quantity}`, line.pickType || line.lineType);
     const subtitle = document.createElement('p');
     subtitle.textContent = `${line.title || ''}${line.variantTitle ? ` - ${line.variantTitle}` : ''}`;
     header.appendChild(title);
@@ -4997,7 +5082,7 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
   });
 
   let builtVerifyRows = Array.from(grouped.values());
-  if (wholesaleModeEnabled) {
+  if (wholesaleModeEnabled || qcModeEnabled) {
     builtVerifyRows = builtVerifyRows.filter(hasBuilderRackedPickRow);
   }
   builtVerifyRows.forEach(annotateBuilderQcFailReasons);
@@ -5606,7 +5691,11 @@ function renderShippingPackageAllocationControls(packageRows) {
     const itemCell = document.createElement('div');
     itemCell.className = 'pick-shipping-allocation-cell pick-shipping-allocation-cell--item';
     const itemTitle = document.createElement('strong');
-    itemTitle.textContent = allocationRow.skuLabel || allocationRow.productLabel;
+    if (allocationRow.skuLabel) {
+      appendSkuWithPickType(itemTitle, allocationRow.skuLabel, allocationRow.pickTypeLabel);
+    } else {
+      itemTitle.textContent = allocationRow.productLabel;
+    }
     itemCell.appendChild(itemTitle);
     if (allocationRow.skuLabel && allocationRow.productLabel && allocationRow.productLabel !== allocationRow.skuLabel) {
       const itemSubtitle = document.createElement('span');
@@ -6643,10 +6732,12 @@ function renderVerifyPickLocations(row) {
     line.className = 'pick-verify-location-row';
 
     if (rows.length > 1 || normalizeDisplaySku(pickRow.sku) !== normalizeDisplaySku(row?.sku)) {
-      const sku = document.createElement('span');
-      sku.className = 'pick-verify-location-sku';
-      sku.textContent = pickRow.sku;
-      line.appendChild(sku);
+      appendSkuWithPickType(
+        line,
+        pickRow.sku,
+        getPickRowDisplayPickType(pickRow),
+        { className: 'pick-verify-location-sku' }
+      );
     }
 
     line.appendChild(renderLocationCell(pickRow.location));
@@ -6674,7 +6765,13 @@ function createBuilderQcFailReasonsBlock(reasons = []) {
 
     const reasonText = document.createElement('span');
     reasonText.className = 'pick-builder-qc-fails__reason';
-    reasonText.textContent = [item.sku, item.reason].filter(Boolean).join(': ');
+    const pickTypeLabel = getVerifyPickTypeLabel(findQcRowForSku(item.sku));
+    if (item.sku) {
+      appendSkuWithPickType(reasonText, item.sku, pickTypeLabel);
+      if (item.reason) reasonText.appendChild(document.createTextNode(`: ${item.reason}`));
+    } else {
+      reasonText.textContent = item.reason;
+    }
     li.appendChild(reasonText);
 
     const meta = [
@@ -6753,7 +6850,10 @@ function renderVerifyOrderCards() {
   container.innerHTML = '';
 
   if (!verifyItems.length) {
-    container.innerHTML = `<p class="pick-list-empty">No order line items found for ${qcModeEnabled ? 'QC' : (wholesaleModeEnabled ? 'builder mode' : 'verification')}.</p>`;
+    const emptyText = qcModeEnabled
+      ? 'No RACKED SKUs found for QC on this order.'
+      : `No order line items found for ${wholesaleModeEnabled ? 'builder mode' : 'verification'}.`;
+    container.innerHTML = `<p class="pick-list-empty">${emptyText}</p>`;
     return;
   }
 
@@ -6921,7 +7021,11 @@ function renderVerifyOrderCards() {
     title.title = row.productName;
 
     const meta = document.createElement('p');
-    const builderPickTypeLabel = wholesaleModeEnabled ? getBuilderPickTypeLabel(row) : '';
+    const rowPickTypeLabel = getVerifyPickTypeLabel(row);
+    const rawBuilderPickTypeLabel = wholesaleModeEnabled ? getBuilderPickTypeLabel(row) : '';
+    const builderPickTypeLabel = rawBuilderPickTypeLabel && rawBuilderPickTypeLabel !== rowPickTypeLabel
+      ? rawBuilderPickTypeLabel
+      : '';
     if (row.isWholesaleBundle) {
       const bundleParts = [
         row.requiredQty > 1 ? `${row.requiredQty} bundle adapters` : '1 bundle adapter',
@@ -6929,10 +7033,14 @@ function renderVerifyOrderCards() {
       ].filter(Boolean);
       meta.textContent = bundleParts.join(' | ');
     } else if (row.codes.size > 0) {
-      const labels = [];
-      if (row.sku && row.sku !== '(No SKU)') labels.push(`SKU: ${row.sku}`);
-      if (row.upc) labels.push(`UPC: ${row.upc}`);
-      meta.textContent = labels.join(' | ');
+      if (row.sku && row.sku !== '(No SKU)') {
+        meta.appendChild(document.createTextNode('SKU: '));
+        appendSkuWithPickType(meta, row.sku, rowPickTypeLabel, { className: 'pick-sku-with-type--inline' });
+      }
+      if (row.upc) {
+        if (meta.textContent) meta.appendChild(document.createTextNode(' | '));
+        meta.appendChild(document.createTextNode(`UPC: ${row.upc}`));
+      }
     } else {
       meta.textContent = qcModeEnabled
         ? 'Manual QC only (no SKU/UPC barcode)'
@@ -7000,7 +7108,11 @@ function renderVerifyOrderCards() {
         const label = [partSku, partName && partName !== partSku ? partName : '']
           .filter(Boolean)
           .join(' - ');
-        partItem.textContent = partQty > 1 ? `${label} x${partQty}` : label;
+        appendSkuWithPickType(
+          partItem,
+          partQty > 1 ? `${label} x${partQty}` : label,
+          getVerifyBundlePartPickTypeLabel(row, partSku)
+        );
         partsList.appendChild(partItem);
       });
 
@@ -7881,6 +7993,7 @@ function openAwaitingPartsDialog(orderId, lineItems = lastRenderedLineItems) {
       location: '',
       note: '',
       type: '',
+      pickType: '',
     });
   });
 
@@ -7914,7 +8027,11 @@ function openAwaitingPartsDialog(orderId, lineItems = lastRenderedLineItems) {
     textWrap.className = 'pick-modal-item__text';
 
     const text = document.createElement('span');
-    text.textContent = suggestedQty > 1 ? `${item.sku} x${suggestedQty}` : item.sku;
+    appendSkuWithPickType(
+      text,
+      suggestedQty > 1 ? `${item.sku} x${suggestedQty}` : item.sku,
+      item.pickType || item.type
+    );
 
     const metaParts = [];
     if (item.contexts.length > 0) {
@@ -8040,7 +8157,7 @@ function openQcFailDialog(orderId, lineItems, defaults = {}) {
       option.value = row.key;
       option.dataset.qcItemKey = row.key;
       option.dataset.sku = sku;
-      option.textContent = `${sku} - ${row.productName || sku} (${checkedQty}/${requiredQty} checked)`;
+      option.textContent = `${formatSkuWithPickTypeText(sku, getVerifyPickTypeLabel(row))} - ${row.productName || sku} (${checkedQty}/${requiredQty} checked)`;
       option.disabled = checkedQty >= requiredQty && row.key !== defaultItemKey;
       skuSelect.appendChild(option);
 
@@ -8076,7 +8193,7 @@ function openQcFailDialog(orderId, lineItems, defaults = {}) {
       const option = document.createElement('option');
       option.value = item.sku;
       option.dataset.sku = item.sku;
-      option.textContent = `${item.sku} - ${item.title || ''}`;
+      option.textContent = `${formatSkuWithPickTypeText(item.sku, item.pickType || item.lineType)} - ${item.title || ''}`;
       skuSelect.appendChild(option);
     });
 
