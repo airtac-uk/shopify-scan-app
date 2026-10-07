@@ -3003,6 +3003,9 @@ function cleanBagLabelText(value) {
   return String(value || '')
     .replace(/\s*[\([{][^\])}]*[\])}]\s*/g, ' ')
     .replace(/(?:[-\u2013\u2014]\s*)?2026\s+edition(?:\s*[-\u2013\u2014])?/gi, ' ')
+    .replace(/\bspare\b/gi, ' ')
+    .replace(/\bx\s*[- ]?\s*t1p\b/gi, ' ')
+    .replace(/\btokyo\s*[- ]?\s*marui\b/gi, 'TM')
     .replace(/\bair\s*[- ]?\s*tac\b/gi, ' ')
     .replace(/\bplug\s*(?:and|&|\+)?\s*play\b/gi, ' ')
     .replace(/\binjection\s*[- ]?\s*mou?lded\b/gi, ' ')
@@ -3011,8 +3014,51 @@ function cleanBagLabelText(value) {
     .trim();
 }
 
+function isDefaultBagLabelVariant(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return !normalized || normalized === 'default' || normalized === 'default title';
+}
+
+function getFirstBagLabelVariant(value) {
+  const raw = String(value || '').trim();
+  if (isDefaultBagLabelVariant(raw)) return '';
+
+  const parts = raw
+    .split(/\s*(?:\/|\|)\s*|\s+[-\u2013\u2014]\s+/)
+    .map((part) => cleanBagLabelText(part))
+    .filter((part) => part && !isDefaultBagLabelVariant(part));
+
+  return parts[0] || '';
+}
+
+function bagLabelTextContainsVariant(text, variant) {
+  const normalizedText = cleanBagLabelText(text).toUpperCase();
+  const normalizedVariant = cleanBagLabelText(variant).toUpperCase();
+  if (!normalizedText || !normalizedVariant) return false;
+  if (normalizedText === normalizedVariant) return true;
+
+  const paddedText = ` ${normalizedText} `;
+  return paddedText.includes(` ${normalizedVariant} `)
+    || normalizedText.endsWith(`- ${normalizedVariant}`);
+}
+
+function addVariantToBagLabelText(text, variantTitle) {
+  const baseText = cleanBagLabelText(text);
+  const variant = getFirstBagLabelVariant(variantTitle);
+  if (!baseText) return variant;
+  if (!variant || bagLabelTextContainsVariant(baseText, variant)) return baseText;
+  return cleanBagLabelText(`${baseText} - ${variant}`);
+}
+
 function getBagLabelTextForOrderItem(item) {
-  return cleanBagLabelText(item?.title || item?.sku || '');
+  return addVariantToBagLabelText(item?.title || item?.sku || '', item?.variantTitle);
+}
+
+function getBagLabelTextForBundleItem(item) {
+  return addVariantToBagLabelText(
+    item?.bundleGroup?.title || item?.title || item?.sku || '',
+    item?.variantTitle
+  );
 }
 
 function buildSuggestedBagLabels(orderItems = lastOrderItems) {
@@ -3025,7 +3071,7 @@ function buildSuggestedBagLabels(orderItems = lastOrderItems) {
     const bundleGroupId = String(item?.bundleGroup?.id || '').trim();
 
     if (bundleGroupId) {
-      const bundleText = cleanBagLabelText(item?.bundleGroup?.title || item?.title || item?.sku || '');
+      const bundleText = getBagLabelTextForBundleItem(item);
       if (!bundleText) return;
       const bundleQuantity = Math.max(1, Math.floor(Number(item?.bundleGroup?.quantity) || quantity));
       if (!bundleRows.has(bundleGroupId)) {
@@ -3088,7 +3134,7 @@ function syncBagLabelsDialogDisabledState() {
 function getBagLabelsForSubmission() {
   return bagLabelRows
     .map((row) => ({
-      text: String(row.text || '').trim(),
+      text: cleanBagLabelText(row.text),
       quantity: Math.max(1, Math.floor(Number(row.quantity) || 1)),
     }))
     .filter((row) => row.text && row.quantity > 0);

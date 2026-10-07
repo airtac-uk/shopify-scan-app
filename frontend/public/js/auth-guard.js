@@ -10,7 +10,7 @@
   }
 
   function getReturnTo() {
-    return `${window.location.pathname}${window.location.search}${window.location.hash}` || '/scan.html';
+    return `${window.location.pathname}${window.location.search}${window.location.hash}` || '/pick_list.html';
   }
 
   function getCookie(name) {

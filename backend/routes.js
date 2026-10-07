@@ -154,10 +154,10 @@ async function appendOrderNoteOrWarn(client, orderGid, appendText, context = {})
 // ---------------------
 function getSafeAuthReturnTo(value) {
   const raw = String(value || '').trim();
-  if (!raw || raw === '/') return '/scan.html';
-  if (!raw.startsWith('/')) return '/scan.html';
-  if (raw.startsWith('//')) return '/scan.html';
-  if (raw.startsWith('/auth')) return '/scan.html';
+  if (!raw || raw === '/') return '/pick_list.html';
+  if (!raw.startsWith('/')) return '/pick_list.html';
+  if (raw.startsWith('//')) return '/pick_list.html';
+  if (raw.startsWith('/auth')) return '/pick_list.html';
   return raw;
 }
 

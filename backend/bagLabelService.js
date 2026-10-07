@@ -49,6 +49,9 @@ function sanitizeLabelText(value) {
     .replace(/[^\x20-\x7E]/g, '')
     .replace(/\s*[\([{][^\])}]*[\])}]\s*/g, ' ')
     .replace(/(?:[-\u2013\u2014]\s*)?2026\s+edition(?:\s*[-\u2013\u2014])?/gi, ' ')
+    .replace(/\bspare\b/gi, ' ')
+    .replace(/\bx\s*[- ]?\s*t1p\b/gi, ' ')
+    .replace(/\btokyo\s*[- ]?\s*marui\b/gi, 'TM')
     .replace(/\bair\s*[- ]?\s*tac\b/gi, ' ')
     .replace(/\bplug\s*(?:and|&|\+)?\s*play\b/gi, ' ')
     .replace(/\binjection\s*[- ]?\s*mou?lded\b/gi, ' ')
@@ -57,12 +60,48 @@ function sanitizeLabelText(value) {
     .trim();
 }
 
+function isDefaultVariantTitle(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  return !normalized || normalized === 'default' || normalized === 'default title';
+}
+
+function getFirstVariantTitle(value) {
+  const raw = String(value || '').trim();
+  if (isDefaultVariantTitle(raw)) return '';
+
+  const parts = raw
+    .split(/\s*(?:\/|\|)\s*|\s+[-\u2013\u2014]\s+/)
+    .map((part) => sanitizeLabelText(part))
+    .filter((part) => part && !isDefaultVariantTitle(part));
+
+  return parts[0] || '';
+}
+
+function labelTextContainsVariant(text, variant) {
+  const normalizedText = sanitizeLabelText(text).toUpperCase();
+  const normalizedVariant = sanitizeLabelText(variant).toUpperCase();
+  if (!normalizedText || !normalizedVariant) return false;
+  if (normalizedText === normalizedVariant) return true;
+
+  const paddedText = ` ${normalizedText} `;
+  return paddedText.includes(` ${normalizedVariant} `)
+    || normalizedText.endsWith(`- ${normalizedVariant}`);
+}
+
+function buildLabelText(label) {
+  const baseText = sanitizeLabelText(label?.text || label?.title || label?.label);
+  const variant = getFirstVariantTitle(label?.variantTitle || label?.variant || label?.option1);
+  if (!baseText) return variant;
+  if (!variant || labelTextContainsVariant(baseText, variant)) return baseText;
+  return sanitizeLabelText(`${baseText} - ${variant}`);
+}
+
 function normalizeBagLabelRows(labels = []) {
   const rows = [];
   let totalQuantity = 0;
 
   (labels || []).forEach((label) => {
-    const text = sanitizeLabelText(label?.text || label?.title || label?.label);
+    const text = buildLabelText(label);
     const quantity = normalizeLabelQuantity(label?.quantity);
     if (!text || quantity <= 0) return;
     if (totalQuantity >= MAX_LABELS_PER_JOB) return;

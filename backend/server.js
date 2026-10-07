@@ -46,8 +46,16 @@ function isAuthenticatedPageRequest(req) {
 function buildLoginRedirect(req) {
   const returnTo = req.originalUrl && req.originalUrl.startsWith('/')
     ? req.originalUrl
-    : '/scan.html';
+    : '/pick_list.html';
   return `/?returnTo=${encodeURIComponent(returnTo)}`;
+}
+
+function getSafeRootReturnTo(value) {
+  const raw = String(value || '').trim();
+  if (!raw || raw === '/' || !raw.startsWith('/') || raw.startsWith('//') || raw.startsWith('/auth')) {
+    return '/pick_list.html';
+  }
+  return raw;
 }
 
 app.use((req, res, next) => {
@@ -63,6 +71,16 @@ app.use((req, res, next) => {
   }
 
   next();
+});
+
+app.get('/', (req, res) => {
+  const shop = String(req.cookies?.shop || '').trim();
+  if (shop && sessionsStore.get(shop)) {
+    res.redirect(getSafeRootReturnTo(req.query?.returnTo));
+    return;
+  }
+
+  res.sendFile(path.join(__dirname, '..', 'frontend/public', 'index.html'));
 });
 
 app.use(express.static(path.join(__dirname, '..', 'frontend/public')));

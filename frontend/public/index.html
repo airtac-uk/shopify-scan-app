@@ -39,7 +39,7 @@
           required
         />
       </label>
-      <p id="loginReturnTo" class="login-return">Continuing to Scanner.</p>
+      <p id="loginReturnTo" class="login-return">Continuing to Orders.</p>
       <button type="submit" class="login-submit">Continue with Shopify</button>
       <p class="login-footnote">Access is managed through Shopify authorization.</p>
     </form>
@@ -78,7 +78,7 @@
 
   function getReturnTo() {
     const params = new URLSearchParams(window.location.search);
-    return params.get('returnTo') || '/scan.html';
+    return params.get('returnTo') || '/pick_list.html';
   }
 
   function normalizeShopDomain(value) {
