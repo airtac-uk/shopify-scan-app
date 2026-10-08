@@ -3613,8 +3613,55 @@ function getPickRowKey(row, sectionTitle, rowIndex) {
   ].join('|');
 }
 
+function lineHasVisibleOwnPickRow(line) {
+  const lineSku = normalizeDisplaySku(line?.sku);
+  if (!lineSku) return false;
+
+  return [
+    line?.mustPick,
+    line?.deskItems,
+    line?.reviewItems,
+  ].some((rows) => (Array.isArray(rows) ? rows : [])
+    .some((row) => normalizeDisplaySku(row?.sku) === lineSku));
+}
+
+function getQcOwnPickRowFromLineSummary(line) {
+  const ownPickRow = line?.ownPickRow;
+  const sku = normalizeDisplaySku(ownPickRow?.sku || line?.sku);
+  const pickType = String(ownPickRow?.pickType || ownPickRow?.type || line?.pickType || line?.lineType || '').trim();
+
+  if (
+    !qcModeEnabled
+    || !sku
+    || !ownPickRow?.hiddenByShowPick
+    || normalizeVerifyPickType(pickType) !== 'RACKED'
+    || lineHasVisibleOwnPickRow(line)
+  ) {
+    return null;
+  }
+
+  const type = String(ownPickRow.type || pickType || '').trim();
+
+  return {
+    sku,
+    quantity: Math.max(1, Number(ownPickRow.quantity || line?.quantity) || 1),
+    location: String(ownPickRow.location || '').trim(),
+    note: String(ownPickRow.note || '').trim(),
+    type,
+    pickType,
+    typeRaw: String(ownPickRow.typeRaw || '').trim(),
+    sectionTitle: 'QC Hidden Pick',
+    hiddenByShowPick: true,
+  };
+}
+
 function getPickRowsFromLineSummary(line) {
   const rows = [];
+  const qcOwnPickRow = getQcOwnPickRowFromLineSummary(line);
+  if (qcOwnPickRow) {
+    rows.push(qcOwnPickRow);
+  }
+
   [
     ['Must Pick', line?.mustPick],
     ['Desk Items', line?.deskItems],

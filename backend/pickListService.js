@@ -603,6 +603,19 @@ function buildPickListForOrder({ skuMap, lineItems }) {
 
     const grouped = mapCountsToDisplayRows({ skuMap, counts: lineCounts });
     const lineMeta = classifyComponent(skuMap, sku);
+    const sheetRow = skuMap.get(sku);
+    const ownPickRow = {
+      sku,
+      quantity,
+      location: lineMeta.location,
+      pickType: lineMeta.type || 'UNKNOWN',
+      type: lineMeta.type || 'UNKNOWN',
+      typeRaw: lineMeta.typeRaw || '',
+      note: lineMeta.note || '',
+      rsq: lineMeta.rsq || 0,
+      classification: lineMeta.classification,
+      hiddenByShowPick: Boolean(sheetRow?.hideOwnPickRow),
+    };
     const bundleGroupId = normalizeBundleGroupId(item.bundleGroup?.id);
     const bundleGroupTitle = String(item.bundleGroup?.title || '').trim();
     const bundleGroupQuantity = Number(item.bundleGroup?.quantity) || null;
@@ -617,6 +630,7 @@ function buildPickListForOrder({ skuMap, lineItems }) {
       skuFallbackUsed: resolvedSku.fallbackUsed,
       quantity,
       lineType: lineMeta.type || 'UNKNOWN',
+      ownPickRow,
       bundleGroupId,
       bundleGroupTitle,
       bundleGroupQuantity,
@@ -675,6 +689,7 @@ function buildPickListForOrder({ skuMap, lineItems }) {
     quantity: line.quantity,
     pickType: line.lineType,
     lineType: line.lineType,
+    ownPickRow: line.ownPickRow,
     bundleGroupId: line.bundleGroupId,
     bundleGroupTitle: line.bundleGroupTitle,
     bundleGroupQuantity: line.bundleGroupQuantity,
