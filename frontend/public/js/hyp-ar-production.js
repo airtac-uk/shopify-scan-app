@@ -428,6 +428,17 @@ function renderStageButtons(receiver) {
   }).join('');
 }
 
+function isB2bReceiver(receiver = {}) {
+  return Boolean(receiver?.isB2bOrder);
+}
+
+function getB2bReceiverDetail(receiver = {}) {
+  return [
+    String(receiver.b2bCompanyName || '').trim(),
+    String(receiver.b2bLocationName || '').trim(),
+  ].filter(Boolean).join(' | ');
+}
+
 function renderReceiverTable(receivers = []) {
   const container = document.getElementById('hypReceiverTable');
   if (!container) return;
@@ -455,10 +466,16 @@ function renderReceiverTable(receivers = []) {
       <tbody>
         ${safeReceivers.map((receiver) => {
           const archived = Boolean(receiver.archivedAt);
+          const isB2b = isB2bReceiver(receiver);
+          const rowClass = [
+            archived ? 'is-archived' : '',
+            isB2b ? 'is-b2b' : '',
+          ].filter(Boolean).join(' ');
           const subtitle = [receiver.title, receiver.variantTitle].filter(Boolean).join(' | ');
           const orderStatus = getReceiverOrderStatus(receiver);
+          const b2bDetail = getB2bReceiverDetail(receiver);
           return `
-            <tr class="${archived ? 'is-archived' : ''}">
+            <tr class="${escapeHtmlAttribute(rowClass)}">
               <td>
                 <strong class="hyp-production-code">${escapeHtml(receiver.receiverCode)}</strong>
                 ${archived ? `<span class="hyp-production-archive-pill">${escapeHtml(receiver.archiveReason || 'archived')}</span>` : ''}
@@ -467,6 +484,8 @@ function renderReceiverTable(receivers = []) {
                 <a class="hyp-production-order-link" href="${escapeHtmlAttribute(buildOrderViewerUrl(receiver.orderNumber || receiver.orderId))}">
                   ${escapeHtml(receiver.orderNumber || receiver.orderId)}
                 </a>
+                ${isB2b ? '<span class="hyp-b2b-pill">B2B</span>' : ''}
+                ${isB2b && b2bDetail ? `<small class="hyp-b2b-detail">${escapeHtml(b2bDetail)}</small>` : ''}
               </td>
               <td>${escapeHtml(formatDatePlaced(receiver.orderCreatedAt))}</td>
               <td>

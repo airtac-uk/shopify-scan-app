@@ -748,6 +748,18 @@ button:hover { background: #0056b3; }
   line-height: 0.95;
 }
 
+.pick-list-order-meta__link {
+  color: inherit;
+  text-decoration: none;
+}
+
+.pick-list-order-meta__link:hover,
+.pick-list-order-meta__link:focus-visible {
+  color: #8fd1ff;
+  text-decoration: underline;
+  text-underline-offset: 0.12em;
+}
+
 .pick-list-order-summary {
   min-width: 220px;
   max-width: 420px;
@@ -1554,6 +1566,13 @@ button:hover { background: #0056b3; }
 .pick-qc-item.has-qc-failures.is-complete {
   border-color: #df5b67;
   background: #321a1f;
+}
+
+.pick-qc-item.has-qc-mixed,
+.pick-qc-item.has-qc-mixed.is-complete {
+  border-color: #d5a23a;
+  background: #2a2112;
+  box-shadow: inset 3px 0 0 rgba(245, 180, 62, 0.9);
 }
 
 .pick-verify-item--hpa-tank-warning {
@@ -7486,6 +7505,13 @@ html.theme-light .pick-qc-item.has-qc-failures.is-complete {
   box-shadow: inset 3px 0 0 rgba(213, 45, 58, 0.72);
 }
 
+html.theme-light .pick-qc-item.has-qc-mixed,
+html.theme-light .pick-qc-item.has-qc-mixed.is-complete {
+  border-color: #d39a26;
+  background: #fff7df;
+  box-shadow: inset 3px 0 0 rgba(211, 154, 38, 0.78);
+}
+
 html.theme-light .pick-verify-hpa-tank-badge {
   background: #d52d3a;
   color: #ffffff;
@@ -11058,6 +11084,15 @@ html.theme-light .order-flow-issue--warning .order-flow-severity {
   border-bottom: none;
 }
 
+.hyp-production-table tr.is-b2b td {
+  background: rgba(21, 115, 99, 0.22);
+  border-bottom-color: rgba(96, 211, 184, 0.28);
+}
+
+.hyp-production-table tr.is-b2b td:first-child {
+  box-shadow: inset 4px 0 0 #34d399;
+}
+
 .hyp-production-table td strong {
   display: block;
   color: #edf3fa;
@@ -11074,6 +11109,25 @@ html.theme-light .order-flow-issue--warning .order-flow-severity {
 
 .hyp-production-table tr.is-archived {
   opacity: 0.7;
+}
+
+.hyp-b2b-pill {
+  display: inline-flex !important;
+  width: fit-content;
+  margin-top: 8px !important;
+  padding: 4px 8px;
+  border: 1px solid #34d399;
+  border-radius: 999px;
+  background: rgba(52, 211, 153, 0.16);
+  color: #bfffe5 !important;
+  font-size: 11px !important;
+  font-weight: 900;
+  line-height: 1;
+  text-transform: uppercase;
+}
+
+.hyp-b2b-detail {
+  color: #bdebdc !important;
 }
 
 .hyp-production-code {

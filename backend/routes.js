@@ -2498,21 +2498,37 @@ function buildHpaTankShippingWarning({ order, lineItems = [] } = {}) {
 }
 
 function buildWholesaleOrderWarning(order = {}) {
-  const purchasingEntity = order?.purchasingEntity || null;
-  const purchasingEntityType = String(purchasingEntity?.__typename || '').trim();
-  const isNativeB2bOrder = purchasingEntityType === 'PurchasingCompany';
-  const companyName = String(purchasingEntity?.company?.name || '').trim();
-  const locationName = String(purchasingEntity?.location?.name || '').trim();
-
-  if (!isNativeB2bOrder) return null;
+  const b2bInfo = getShopifyB2bOrderInfo(order);
+  if (!b2bInfo.isB2bOrder) return null;
 
   return {
     active: true,
     source: 'shopify_b2b',
-    companyName,
-    locationName,
+    companyName: b2bInfo.companyName,
+    locationName: b2bInfo.locationName,
     title: 'Wholesale order',
     message: 'Print bag topper labels before dispatch. A team member can help you apply them.',
+  };
+}
+
+function getShopifyB2bOrderInfo(order = {}) {
+  const purchasingEntity = order?.purchasingEntity || null;
+  const purchasingEntityType = String(purchasingEntity?.__typename || '').trim();
+  const isNativeB2bOrder = purchasingEntityType === 'PurchasingCompany';
+  const normalizedTags = normalizeOrderTags(order?.tags).map((tag) => tag.toLowerCase());
+  const hasB2bTag = normalizedTags.some((tag) => (
+    tag === 'b2b'
+    || tag === 'b2b order'
+    || tag === 'wholesale'
+    || tag.includes('wholesale')
+  ));
+  const companyName = String(purchasingEntity?.company?.name || '').trim();
+  const locationName = String(purchasingEntity?.location?.name || '').trim();
+
+  return {
+    isB2bOrder: isNativeB2bOrder || hasB2bTag,
+    companyName,
+    locationName,
   };
 }
 
@@ -2926,6 +2942,14 @@ function normalizeTrackerOrderId(ref) {
   return '';
 }
 
+function buildShopifyAdminOrderUrl({ shop, orderId } = {}) {
+  const normalizedShop = String(shop || '').trim().replace(/^https?:\/\//i, '').replace(/\/.*$/, '');
+  const numericOrderId = String(orderId || '').trim().match(/(?:^|\/)(\d+)$/)?.[1] || '';
+  if (!normalizedShop || !numericOrderId) return '';
+  if (!/^[a-z0-9][a-z0-9.-]*$/i.test(normalizedShop)) return '';
+  return `https://${normalizedShop}/admin/orders/${numericOrderId}`;
+}
+
 function getHypArOrderLineItemFields() {
   return `
     lineItems(first: 200) {
@@ -2999,7 +3023,7 @@ async function fetchOrderForTrackerById({ client, orderId }) {
   return order;
 }
 
-async function fetchHypArOrderById({ client, orderId }) {
+async function fetchHypArOrderById({ client, orderId, includePurchasingEntity = true }) {
   if (!client || !orderId) {
     return null;
   }
@@ -3012,14 +3036,23 @@ async function fetchHypArOrderById({ client, orderId }) {
         createdAt
         tags
         ${ORDER_WORKFLOW_STATUS_FIELDS}
+        ${includePurchasingEntity ? ORDER_FLOW_PURCHASING_ENTITY_FIELD : ''}
         ${getHypArOrderLineItemFields()}
       }
     }
   `;
 
-  const response = await client.graphql(query, {
-    variables: { id: orderId },
-  });
+  let response;
+  try {
+    response = await client.graphql(query, {
+      variables: { id: orderId },
+    });
+  } catch (err) {
+    if (includePurchasingEntity && includesMissingPurchasingEntityFieldError(err)) {
+      return fetchHypArOrderById({ client, orderId, includePurchasingEntity: false });
+    }
+    throw err;
+  }
 
   return response.data?.order || null;
 }
@@ -3659,67 +3692,82 @@ async function listHypArOpenOrders({
   shopifyQuery = 'status:open',
   sortKey = 'CREATED_AT',
   reverse = false,
+  includePurchasingEntity = true,
 } = {}) {
   const safeMaxOrders = Math.max(1, Math.min(2000, Math.floor(Number(maxOrders) || 1000)));
   const safePageSize = Math.max(1, Math.min(250, Math.floor(Number(pageSize) || 100)));
   const safeShopifyQuery = getSafeHypArOrderQuery(shopifyQuery, 'status:open');
   const safeSortKey = getSafeHypArOrderSortKey(sortKey);
   const safeReverse = reverse ? 'true' : 'false';
-  const query = `
-    query getHypArOpenOrders($first: Int!, $after: String) {
-      orders(first: $first, after: $after, query: "${safeShopifyQuery}", sortKey: ${safeSortKey}, reverse: ${safeReverse}) {
-        edges {
-          cursor
-          node {
-            id
-            name
-            createdAt
-            tags
-            ${ORDER_WORKFLOW_STATUS_FIELDS}
-            ${getHypArOrderLineItemFields()}
+  let usePurchasingEntity = Boolean(includePurchasingEntity);
+
+  while (true) {
+    const query = `
+      query getHypArOpenOrders($first: Int!, $after: String) {
+        orders(first: $first, after: $after, query: "${safeShopifyQuery}", sortKey: ${safeSortKey}, reverse: ${safeReverse}) {
+          edges {
+            cursor
+            node {
+              id
+              name
+              createdAt
+              tags
+              ${ORDER_WORKFLOW_STATUS_FIELDS}
+              ${usePurchasingEntity ? ORDER_FLOW_PURCHASING_ENTITY_FIELD : ''}
+              ${getHypArOrderLineItemFields()}
+            }
+          }
+          pageInfo {
+            hasNextPage
+            endCursor
           }
         }
-        pageInfo {
-          hasNextPage
-          endCursor
-        }
       }
+    `;
+
+    const orders = [];
+    const seenOrderIds = new Set();
+    let after = null;
+    let hasNextPage = true;
+    let pagesFetched = 0;
+
+    try {
+      while (hasNextPage && orders.length < safeMaxOrders) {
+        const first = Math.min(safePageSize, safeMaxOrders - orders.length);
+        const response = await client.graphql(query, {
+          variables: { first, after },
+        });
+        pagesFetched += 1;
+
+        const connection = response.data?.orders || {};
+        const edges = Array.isArray(connection.edges) ? connection.edges : [];
+        edges.forEach((edge) => {
+          const order = edge?.node || null;
+          if (!order?.id || seenOrderIds.has(order.id)) return;
+          seenOrderIds.add(order.id);
+          orders.push(order);
+        });
+
+        hasNextPage = Boolean(connection.pageInfo?.hasNextPage);
+        after = hasNextPage ? connection.pageInfo?.endCursor || null : null;
+        if (hasNextPage && !after) break;
+      }
+
+      return {
+        orders,
+        pagesFetched,
+        hasMore: hasNextPage && orders.length >= safeMaxOrders,
+        maxOrders: safeMaxOrders,
+        purchasingEntitySupported: usePurchasingEntity,
+      };
+    } catch (err) {
+      if (usePurchasingEntity && includesMissingPurchasingEntityFieldError(err)) {
+        usePurchasingEntity = false;
+        continue;
+      }
+      throw err;
     }
-  `;
-
-  const orders = [];
-  const seenOrderIds = new Set();
-  let after = null;
-  let hasNextPage = true;
-  let pagesFetched = 0;
-
-  while (hasNextPage && orders.length < safeMaxOrders) {
-    const first = Math.min(safePageSize, safeMaxOrders - orders.length);
-    const response = await client.graphql(query, {
-      variables: { first, after },
-    });
-    pagesFetched += 1;
-
-    const connection = response.data?.orders || {};
-    const edges = Array.isArray(connection.edges) ? connection.edges : [];
-    edges.forEach((edge) => {
-      const order = edge?.node || null;
-      if (!order?.id || seenOrderIds.has(order.id)) return;
-      seenOrderIds.add(order.id);
-      orders.push(order);
-    });
-
-    hasNextPage = Boolean(connection.pageInfo?.hasNextPage);
-    after = hasNextPage ? connection.pageInfo?.endCursor || null : null;
-    if (hasNextPage && !after) break;
   }
-
-  return {
-    orders,
-    pagesFetched,
-    hasMore: hasNextPage && orders.length >= safeMaxOrders,
-    maxOrders: safeMaxOrders,
-  };
 }
 
 async function listHypArHistoricalSearchOrders({ client, maxOrdersPerQuery = 1000 } = {}) {
@@ -3793,6 +3841,7 @@ async function syncHypArOrderFromShopify({ shop, order }) {
   const archiveReason = getHypArArchiveReasonForOrder(order);
   const lineItems = buildCurrentOrderLineItems(order.lineItems?.edges || []);
   const receiverUnits = buildHypArReceiverUnits(lineItems);
+  const b2bInfo = getShopifyB2bOrderInfo(order);
   const activeSourceKeys = receiverUnits.map((receiver) => receiver.sourceKey);
   const excludedSourceKeys = buildHypArExcludedSourceKeys(lineItems);
   const excludedArchivedCount = sessionsStore.archiveHypReceiversBySourceKeys({
@@ -3840,6 +3889,9 @@ async function syncHypArOrderFromShopify({ shop, order }) {
     initialStageKey: 'op1',
     initialStageLabel: 'OP1',
     reactivateArchived: !archiveReason,
+    isB2bOrder: b2bInfo.isB2bOrder,
+    b2bCompanyName: b2bInfo.companyName,
+    b2bLocationName: b2bInfo.locationName,
   });
 
   let terminalArchivedCount = 0;
@@ -7518,6 +7570,7 @@ router.post('/api/pick-list', async (req, res) => {
       success: true,
       barcode: normalizedBarcode,
       orderId: order.id,
+      orderAdminUrl: buildShopifyAdminOrderUrl({ shop, orderId: order.id }),
       orderNumber: order.name,
       orderTags: normalizeOrderTags(order.tags),
       orderStatus: order.cancelledAt ? 'CANCELLED' : (order.displayFulfillmentStatus || ''),

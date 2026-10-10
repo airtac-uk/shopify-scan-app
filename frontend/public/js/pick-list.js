@@ -14,6 +14,7 @@ let lastQcProgressByItemKey = {};
 let builderTimeByItemKey = {};
 let hasRenderedPickList = false;
 let currentOrderId = '';
+let currentOrderAdminUrl = '';
 let currentOrderBarcode = '';
 let currentOrderNumber = '';
 let currentOrderNote = '';
@@ -1836,6 +1837,7 @@ function clearLoadedOrderState({ preserveOrderLookup = false } = {}) {
   builderTimeByItemKey = {};
   hasRenderedPickList = false;
   currentOrderId = '';
+  currentOrderAdminUrl = '';
   currentOrderBarcode = '';
   currentOrderNumber = '';
   currentOrderNote = '';
@@ -2758,7 +2760,20 @@ function renderOrderHeaderMeta() {
     statusLabel ? `Status: ${statusLabel}` : '',
   ].filter(Boolean);
 
-  orderMeta.textContent = `${orderLabel}${barcodeLabel}`;
+  orderMeta.replaceChildren();
+  const orderMetaText = `${orderLabel}${barcodeLabel}`;
+  if (currentOrderAdminUrl) {
+    const orderLink = document.createElement('a');
+    orderLink.className = 'pick-list-order-meta__link';
+    orderLink.href = currentOrderAdminUrl;
+    orderLink.target = '_blank';
+    orderLink.rel = 'noopener noreferrer';
+    orderLink.title = `Open ${orderLabel} in Shopify`;
+    orderLink.textContent = orderMetaText;
+    orderMeta.appendChild(orderLink);
+  } else {
+    orderMeta.textContent = orderMetaText;
+  }
   orderStatus.textContent = statusParts.length ? statusParts.join(' / ') : 'No tag or status';
   const noteText = String(currentOrderHumanNote || '').trim();
   updateOrderNoteBanner(
@@ -6968,7 +6983,7 @@ function renderVerifyOrderCards() {
     : (canOpenShippingPanel
     ? getVerifyShippingLaunchStatusText()
     : `${getVerificationVerb()} ${totals.scanned} of ${totals.required}${totals.isComplete ? ' - complete' : ''}`);
-  summaryCard.className = `pick-list-card pick-verify-summary${qcModeEnabled || wholesaleModeEnabled ? ' pick-mode-summary' : ''}${qcModeEnabled ? ' pick-qc-summary' : ''}${wholesaleModeEnabled ? ' pick-wholesale-summary' : ''}${totals.isComplete ? ' is-complete' : ''}${canOpenShippingPanel ? ' is-shipping-launch' : ''}${qcModeEnabled && totals.failed > 1 ? ' has-failures' : ''}`;
+  summaryCard.className = `pick-list-card pick-verify-summary${qcModeEnabled || wholesaleModeEnabled ? ' pick-mode-summary' : ''}${qcModeEnabled ? ' pick-qc-summary' : ''}${wholesaleModeEnabled ? ' pick-wholesale-summary' : ''}${totals.isComplete ? ' is-complete' : ''}${canOpenShippingPanel ? ' is-shipping-launch' : ''}${qcModeEnabled && totals.failed > 0 ? ' has-failures' : ''}`;
   summaryCard.innerHTML = `
     <header class="pick-list-card-header">
       <h3>${summaryTitle}</h3>
@@ -7052,8 +7067,11 @@ function renderVerifyOrderCards() {
     }
     if (qcModeEnabled) {
       item.classList.add('pick-qc-item');
-      if (getQcRowPassedQty(row) > 0) item.classList.add('has-qc-passes');
-      if (getQcRowFailedQty(row) > 1) item.classList.add('has-qc-failures');
+      const qcPassedQty = getQcRowPassedQty(row);
+      const qcFailedQty = getQcRowFailedQty(row);
+      if (qcPassedQty > 0) item.classList.add('has-qc-passes');
+      if (qcFailedQty > 0) item.classList.add('has-qc-failures');
+      if (qcPassedQty > 0 && qcFailedQty > 0) item.classList.add('has-qc-mixed');
     }
     const pendingTypeClass = (
       (qcModeEnabled && getQcRowCheckedQty(row) <= 0)
@@ -8679,6 +8697,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     }
 
     currentOrderId = String(data.orderId || '').trim();
+    currentOrderAdminUrl = String(data.orderAdminUrl || '').trim();
     currentOrderBarcode = data.barcode;
     currentOrderNumber = data.orderNumber;
     currentOrderNote = data.orderNote || '';

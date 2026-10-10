@@ -604,6 +604,9 @@ db.prepare(`
     sku TEXT NOT NULL,
     title TEXT,
     variantTitle TEXT,
+    isB2bOrder INTEGER NOT NULL DEFAULT 0,
+    b2bCompanyName TEXT,
+    b2bLocationName TEXT,
     currentStageKey TEXT NOT NULL,
     currentStageLabel TEXT NOT NULL,
     workflowStatus TEXT,
@@ -639,6 +642,27 @@ if (!hypReceiverColumns.some((column) => column?.name === 'productId')) {
   db.prepare(`
     ALTER TABLE hyp_receivers
     ADD COLUMN productId TEXT
+  `).run();
+}
+
+if (!hypReceiverColumns.some((column) => column?.name === 'isB2bOrder')) {
+  db.prepare(`
+    ALTER TABLE hyp_receivers
+    ADD COLUMN isB2bOrder INTEGER NOT NULL DEFAULT 0
+  `).run();
+}
+
+if (!hypReceiverColumns.some((column) => column?.name === 'b2bCompanyName')) {
+  db.prepare(`
+    ALTER TABLE hyp_receivers
+    ADD COLUMN b2bCompanyName TEXT
+  `).run();
+}
+
+if (!hypReceiverColumns.some((column) => column?.name === 'b2bLocationName')) {
+  db.prepare(`
+    ALTER TABLE hyp_receivers
+    ADD COLUMN b2bLocationName TEXT
   `).run();
 }
 
@@ -1116,6 +1140,9 @@ function normalizeHypReceiverRecord(row) {
     sku: normalizeBarcode(row.sku),
     title: String(row.title || '').trim(),
     variantTitle: String(row.variantTitle || '').trim(),
+    isB2bOrder: Boolean(Number(row.isB2bOrder) || row.isB2bOrder === true),
+    b2bCompanyName: String(row.b2bCompanyName || '').trim(),
+    b2bLocationName: String(row.b2bLocationName || '').trim(),
     currentStageKey: String(row.currentStageKey || 'op1').trim(),
     currentStageLabel: String(row.currentStageLabel || 'OP1').trim(),
     workflowStatus: String(row.workflowStatus || '').trim(),
@@ -1320,6 +1347,9 @@ module.exports = {
     initialStageKey = 'op1',
     initialStageLabel = 'OP1',
     reactivateArchived = true,
+    isB2bOrder = false,
+    b2bCompanyName = '',
+    b2bLocationName = '',
   } = {}) {
     const normalizedShop = String(shop || '').trim();
     const normalizedOrderId = String(orderId || '').trim();
@@ -1328,6 +1358,9 @@ module.exports = {
 
     const nowIso = new Date().toISOString();
     const safeWorkflowStatus = workflowStatus ? String(workflowStatus).trim() : null;
+    const safeIsB2bOrder = isB2bOrder ? 1 : 0;
+    const safeB2bCompanyName = String(b2bCompanyName || '').trim() || null;
+    const safeB2bLocationName = String(b2bLocationName || '').trim() || null;
     const normalizedReceivers = (Array.isArray(receivers) ? receivers : [])
       .map((receiver) => ({
         sourceKey: String(receiver?.sourceKey || '').trim(),
@@ -1360,9 +1393,10 @@ module.exports = {
     const insertStmt = db.prepare(`
       INSERT INTO hyp_receivers (
         shop, orderId, orderNumber, orderCreatedAt, sourceKey, lineItemId, unitIndex,
-        receiverCode, productId, sku, title, variantTitle, currentStageKey, currentStageLabel,
+        receiverCode, productId, sku, title, variantTitle, isB2bOrder, b2bCompanyName,
+        b2bLocationName, currentStageKey, currentStageLabel,
         workflowStatus, createdAt, updatedAt, stageStartedAt, archivedAt, archiveReason
-      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL)
     `);
     const updateStmt = db.prepare(`
       UPDATE hyp_receivers
@@ -1374,6 +1408,9 @@ module.exports = {
           sku = ?,
           title = ?,
           variantTitle = ?,
+          isB2bOrder = ?,
+          b2bCompanyName = ?,
+          b2bLocationName = ?,
           workflowStatus = ?,
           updatedAt = ?,
           archivedAt = CASE
@@ -1410,6 +1447,9 @@ module.exports = {
             receiver.sku,
             receiver.title || null,
             receiver.variantTitle || null,
+            safeIsB2bOrder,
+            safeB2bCompanyName,
+            safeB2bLocationName,
             safeWorkflowStatus,
             nowIso,
             reactivateArchived ? 1 : 0,
@@ -1442,6 +1482,9 @@ module.exports = {
               receiver.sku,
               receiver.title || null,
               receiver.variantTitle || null,
+              safeIsB2bOrder,
+              safeB2bCompanyName,
+              safeB2bLocationName,
               initialStageKey,
               initialStageLabel,
               safeWorkflowStatus,
