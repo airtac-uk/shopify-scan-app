@@ -1,6 +1,14 @@
 const ORDER_FLOW_POLL_MS = 60000;
 const ORDER_FLOW_SETTINGS_KEY = 'orderFlow.settings.v2';
 const ORDER_FLOW_STAGE_FILTER_PREFIX = 'stage:';
+const ORDER_FLOW_GRID_COLOUR_LABELS = {
+  fresh: 'Fresh',
+  active: 'In progress',
+  aging: 'Approaching limit',
+  warning: 'Over limit',
+  critical: 'Critical',
+  'hyp-ar': 'HYP-AR',
+};
 const ORDER_FLOW_EXCEPTION_STACKS = {
   snoozed: { label: 'Snoozed', verb: 'Snoozing' },
   wholesale: { label: 'Wholesale', verb: 'Moving to Wholesale' },
@@ -50,6 +58,7 @@ let orderFlowData = null;
 let orderFlowBuilderTimeData = null;
 let orderFlowActiveFilter = 'all';
 let orderFlowActiveGridOrderId = '';
+let orderFlowGridColourFilter = '';
 
 function escapeHtml(value) {
   return String(value || '')
@@ -672,6 +681,10 @@ function hasOrderGridMarker(order, markerKey) {
     .some((marker) => marker.key === normalizedMarkerKey);
 }
 
+function getOrderGridColour(order) {
+  return hasOrderGridMarker(order, 'hyp_ar') ? 'hyp-ar' : getOrderGridAgeLevel(order);
+}
+
 function formatOrderGridTitle(order) {
   const orderLabel = order?.orderNumber || order?.barcode || 'Unknown order';
   const stageLabel = getOperationalStageLabel(order?.currentStage?.key, order?.currentStage?.label);
@@ -688,23 +701,31 @@ function renderOrderGridLegend() {
   const container = document.getElementById('orderFlowGridLegend');
   if (!container) return;
 
-  container.innerHTML = `
-    <div class="order-flow-grid-legend__age">
-      ${['fresh', 'active', 'aging', 'warning', 'critical'].map((level) => `
-        <span class="order-flow-grid-age-swatch order-flow-grid-age-swatch--${escapeHtmlAttribute(level)}"></span>
-      `).join('')}
-      <span>Newer in stage</span>
-      <span>Older in stage / needs attention</span>
-    </div>
-  `;
+  if (!container.querySelector('[data-order-grid-colour]')) {
+    container.innerHTML = `
+      <div class="order-flow-grid-legend__age">
+        ${[['', 'All colours'], ...Object.entries(ORDER_FLOW_GRID_COLOUR_LABELS)].map(([colour, label]) => `
+          <button type="button" class="order-flow-grid-colour-filter"
+            data-order-grid-colour="${escapeHtmlAttribute(colour)}"
+            aria-controls="orderFlowGrid" aria-pressed="false">
+            ${colour ? `<span class="order-flow-grid-age-swatch order-flow-grid-age-swatch--${escapeHtmlAttribute(colour)}" aria-hidden="true"></span>` : ''}
+            ${escapeHtml(label)}
+          </button>
+        `).join('')}
+      </div>
+    `;
+  }
+  container.querySelectorAll('[data-order-grid-colour]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.orderGridColour === orderFlowGridColourFilter));
+  });
 }
 
-function renderOrderGridPreview(order = null) {
+function renderOrderGridPreview(order = null, emptyMessage = 'Hover an order square to inspect it. Click to open in a new tab.') {
   const container = document.getElementById('orderFlowGridPreview');
   if (!container) return;
 
   if (!order) {
-    container.innerHTML = '<p class="order-flow-grid-preview__empty">Hover an order square to inspect it. Click to open in a new tab.</p>';
+    container.innerHTML = `<p class="order-flow-grid-preview__empty">${escapeHtml(emptyMessage)}</p>`;
     return;
   }
 
@@ -757,18 +778,25 @@ function renderOrderGrid() {
   const summary = document.getElementById('orderFlowGridSummary');
   if (!grid) return;
 
-  const orders = getOrderGridOrders();
+  const allOrders = getOrderGridOrders();
+  const orders = orderFlowGridColourFilter
+    ? allOrders.filter((order) => getOrderGridColour(order) === orderFlowGridColourFilter)
+    : allOrders;
   renderOrderGridLegend();
 
   if (summary) {
     const criticalCount = orders.filter((order) => getOrderGridAgeLevel(order) === 'critical').length;
     const warningCount = orders.filter((order) => getOrderGridAgeLevel(order) === 'warning').length;
-    summary.textContent = `${orders.length} active orders shown. ${criticalCount} critical, ${warningCount} over current-stage limit.`;
+    const shownLabel = orderFlowGridColourFilter
+      ? `${orders.length} of ${allOrders.length} active orders shown (${ORDER_FLOW_GRID_COLOUR_LABELS[orderFlowGridColourFilter]}).`
+      : `${orders.length} active orders shown.`;
+    summary.textContent = `${shownLabel} ${criticalCount} critical, ${warningCount} over current-stage limit.`;
   }
 
   if (!orders.length) {
-    grid.innerHTML = '<p class="order-flow-empty">No active orders loaded for the grid.</p>';
-    renderOrderGridPreview(null);
+    orderFlowActiveGridOrderId = '';
+    grid.innerHTML = `<p class="order-flow-empty">${orderFlowGridColourFilter ? 'No orders match this colour.' : 'No active orders loaded for the grid.'}</p>`;
+    renderOrderGridPreview(null, orderFlowGridColourFilter ? 'Select another key colour or All colours to show orders.' : undefined);
     return;
   }
 
@@ -1100,6 +1128,13 @@ document.addEventListener('DOMContentLoaded', () => {
   if (layout) {
     layout.addEventListener('click', (event) => {
       const target = event.target instanceof Element ? event.target : null;
+      const colourButton = target?.closest('[data-order-grid-colour]');
+      if (colourButton) {
+        const colour = colourButton.dataset.orderGridColour;
+        orderFlowGridColourFilter = colour === orderFlowGridColourFilter ? '' : colour;
+        renderOrderGrid();
+        return;
+      }
       const stackButton = target?.closest('[data-order-flow-stack]');
       const unsnoozeButton = target?.closest('[data-order-flow-unsnooze]');
       const deleteButton = target?.closest('[data-order-flow-delete]');

@@ -1,4 +1,5 @@
 const HYP_PRODUCTION_POLL_MS = 60000;
+const HYP_PRODUCTION_VIEW_KEY = 'hyp-ar-production-view';
 
 let hypProductionData = null;
 let hypProductionLoading = false;
@@ -6,6 +7,12 @@ let hypProductionSyncing = false;
 let hypProductionPollId = null;
 let hypProductionSyncPollId = null;
 let hypStageFilter = '';
+let hypProductionView = 'table';
+let hypPendingAction = null;
+let hypRecentReceiverId = '';
+let hypRecentReceiverTimeout = null;
+let hypFeedbackTimeout = null;
+let hypDraggedReceiverId = '';
 
 function escapeHtml(value) {
   return String(value || '')
@@ -162,6 +169,91 @@ function setLoading(isLoading) {
   if (spinner) spinner.style.display = hypProductionLoading ? 'inline-block' : 'none';
   if (refreshBtn) refreshBtn.disabled = hypProductionLoading;
   if (printBtn) printBtn.disabled = hypProductionLoading;
+  const archivedToggle = document.getElementById('hypShowArchived');
+  if (archivedToggle) archivedToggle.disabled = hypProductionLoading;
+  updateReceiverInteractionState();
+}
+
+function updateReceiverInteractionState() {
+  document.querySelectorAll('[data-hyp-receiver-id]').forEach((element) => {
+    const isPending = String(hypPendingAction?.receiverId) === element.dataset.hypReceiverId;
+    const archived = element.dataset.hypArchived === 'true';
+    element.classList.toggle('is-updating', isPending);
+    element.setAttribute('aria-busy', String(isPending));
+    if (element.classList.contains('hyp-queue-card')) {
+      element.draggable = !archived && !hypProductionLoading;
+    }
+    element.querySelectorAll('button').forEach((button) => {
+      const isStageButton = Boolean(button.dataset.stageKey);
+      const isPendingButton = isPending && (
+        (isStageButton && button.dataset.stageKey === hypPendingAction.stageKey)
+        || (button.dataset.deleteReceiverId && hypPendingAction.type === 'delete')
+      );
+      button.disabled = hypProductionLoading || (isStageButton && archived);
+      button.classList.toggle('is-pending', Boolean(isPendingButton));
+      if (!button.dataset.idleLabel) button.dataset.idleLabel = button.textContent.trim();
+      button.textContent = isPendingButton
+        ? (hypPendingAction.type === 'delete' ? 'Deleting…' : 'Moving…')
+        : button.dataset.idleLabel;
+    });
+  });
+}
+
+function showActionFeedback(message, type, { stageKey = '' } = {}) {
+  clearTimeout(hypFeedbackTimeout);
+  const feedback = document.getElementById('hypActionFeedback');
+  const messageEl = document.getElementById('hypActionFeedbackMessage');
+  const viewButton = document.getElementById('hypFeedbackViewStage');
+  const dismissButton = document.getElementById('hypFeedbackDismiss');
+  if (!feedback || !messageEl) return;
+  feedback.hidden = false;
+  feedback.dataset.type = type;
+  messageEl.textContent = message;
+  if (viewButton) {
+    const stage = getStages().find((item) => item.key === stageKey);
+    viewButton.hidden = !stage;
+    viewButton.dataset.stageKey = stageKey;
+    viewButton.textContent = stage ? `View ${stage.label}` : '';
+  }
+  if (dismissButton) dismissButton.hidden = type === 'loading';
+  if (type === 'success') {
+    hypFeedbackTimeout = window.setTimeout(() => { feedback.hidden = true; }, 8000);
+  }
+}
+
+function highlightMovedReceiver(receiverId) {
+  clearTimeout(hypRecentReceiverTimeout);
+  hypRecentReceiverId = String(receiverId);
+  hypRecentReceiverTimeout = window.setTimeout(() => {
+    hypRecentReceiverId = '';
+    document.querySelectorAll('.is-recently-moved').forEach((element) => {
+      element.classList.remove('is-recently-moved');
+    });
+  }, 5000);
+}
+
+function setProductionView(view, { persist = true } = {}) {
+  hypProductionView = view === 'board' ? 'board' : 'table';
+  const isBoard = hypProductionView === 'board';
+  document.getElementById('hypStageFilters').hidden = isBoard;
+  document.getElementById('hypReceiverTable').hidden = isBoard;
+  document.getElementById('hypQueueView').hidden = !isBoard;
+  document.querySelectorAll('[data-hyp-view]').forEach((button) => {
+    button.setAttribute('aria-pressed', String(button.dataset.hypView === hypProductionView));
+  });
+  if (persist) {
+    try { window.localStorage.setItem(HYP_PRODUCTION_VIEW_KEY, hypProductionView); } catch (_) { /* Storage may be unavailable. */ }
+  }
+  renderReceiverViews();
+}
+
+function renderReceiverViews() {
+  if (hypProductionView === 'board') {
+    renderQueueBoard(hypProductionData?.receivers || []);
+  } else {
+    renderReceiverTable(getFilteredReceivers());
+  }
+  updateReceiverInteractionState();
 }
 
 function updateLastUpdatedLabel() {
@@ -267,7 +359,7 @@ function refreshProductionView({ updateTimestamp = false } = {}) {
   renderOverview(summary);
   renderOp1Summary(summary.op1BySku);
   renderStageFilters(visibleReceivers);
-  renderReceiverTable(getFilteredReceivers());
+  renderReceiverViews();
   renderActionTimeline(hypProductionData.events || []);
   if (updateTimestamp) updateLastUpdatedLabel();
 }
@@ -419,7 +511,7 @@ function renderStageButtons(receiver) {
         class="hyp-stage-btn hyp-stage-btn--${escapeHtmlAttribute(state)}"
         data-receiver-id="${escapeHtmlAttribute(receiver.id)}"
         data-stage-key="${escapeHtmlAttribute(stage.key)}"
-        ${archived ? 'disabled' : ''}
+        ${archived || hypProductionLoading ? 'disabled' : ''}
         aria-pressed="${state === 'current' ? 'true' : 'false'}"
       >
         ${escapeHtml(stage.label)}
@@ -470,12 +562,13 @@ function renderReceiverTable(receivers = []) {
           const rowClass = [
             archived ? 'is-archived' : '',
             isB2b ? 'is-b2b' : '',
+            String(receiver.id) === hypRecentReceiverId ? 'is-recently-moved' : '',
           ].filter(Boolean).join(' ');
           const subtitle = [receiver.title, receiver.variantTitle].filter(Boolean).join(' | ');
           const orderStatus = getReceiverOrderStatus(receiver);
           const b2bDetail = getB2bReceiverDetail(receiver);
           return `
-            <tr class="${escapeHtmlAttribute(rowClass)}">
+            <tr class="${escapeHtmlAttribute(rowClass)}" data-hyp-receiver-id="${escapeHtmlAttribute(receiver.id)}" data-hyp-archived="${archived}">
               <td>
                 <strong class="hyp-production-code">${escapeHtml(receiver.receiverCode)}</strong>
                 ${archived ? `<span class="hyp-production-archive-pill">${escapeHtml(receiver.archiveReason || 'archived')}</span>` : ''}
@@ -531,6 +624,73 @@ function renderReceiverTable(receivers = []) {
       </tbody>
     </table>
   `;
+}
+
+function renderQueueCard(receiver) {
+  const archived = Boolean(receiver.archivedAt);
+  const isB2b = isB2bReceiver(receiver);
+  const orderStatus = getReceiverOrderStatus(receiver);
+  const b2bDetail = getB2bReceiverDetail(receiver);
+  const classes = [
+    'print-queue-card hyp-queue-card',
+    archived ? 'is-archived' : '',
+    isB2b ? 'is-b2b' : '',
+    String(receiver.id) === hypRecentReceiverId ? 'is-recently-moved' : '',
+  ].filter(Boolean).join(' ');
+
+  return `
+    <article class="${escapeHtmlAttribute(classes)}"
+      data-hyp-receiver-id="${escapeHtmlAttribute(receiver.id)}"
+      data-hyp-archived="${archived}"
+      draggable="${!archived && !hypProductionLoading}"
+      aria-label="${escapeHtmlAttribute(receiver.receiverCode)}">
+      <div class="print-queue-card__head">
+        <div>
+          <h3>${escapeHtml(receiver.receiverCode)}</h3>
+          <p>${escapeHtml(receiver.sku)}</p>
+        </div>
+        ${isB2b ? '<span class="hyp-b2b-pill">B2B</span>' : ''}
+      </div>
+      <p class="hyp-queue-card__description">${escapeHtml([receiver.title, receiver.variantTitle].filter(Boolean).join(' | '))}</p>
+      <a class="hyp-production-order-link" draggable="false" href="${escapeHtmlAttribute(buildOrderViewerUrl(receiver.orderNumber || receiver.orderId))}">
+        ${escapeHtml(receiver.orderNumber || receiver.orderId)}
+      </a>
+      ${isB2b && b2bDetail ? `<p class="hyp-b2b-detail">${escapeHtml(b2bDetail)}</p>` : ''}
+      <p class="hyp-queue-card__date">Placed ${escapeHtml(formatDatePlaced(receiver.orderCreatedAt))}</p>
+      <span class="hyp-status-pill hyp-status-pill--${escapeHtmlAttribute(orderStatus.key)}">${escapeHtml(orderStatus.label)}</span>
+      ${archived ? `<p class="hyp-production-archive-pill">${escapeHtml(receiver.archiveReason || 'archived')}</p>` : ''}
+      <div class="hyp-row-actions">
+        <button type="button" class="hyp-label-btn" data-print-receiver-id="${escapeHtmlAttribute(receiver.id)}">Print</button>
+        <button type="button" class="hyp-delete-btn" data-delete-receiver-id="${escapeHtmlAttribute(receiver.id)}">Delete</button>
+      </div>
+      <p class="hyp-queue-card__date">Updated ${escapeHtml(formatTimestamp(receiver.updatedAt))}</p>
+    </article>
+  `;
+}
+
+function renderQueueBoard(receivers = []) {
+  const container = document.getElementById('hypQueueBoard');
+  if (!container) return;
+  const stages = getStages();
+  if (!stages.length) {
+    container.innerHTML = '<p class="pick-list-empty">No production stages loaded.</p>';
+    return;
+  }
+  container.style.setProperty('--hyp-stage-count', stages.length);
+  container.innerHTML = stages.map((stage) => {
+    const items = receivers.filter((receiver) => receiver.currentStageKey === stage.key);
+    return `
+      <section class="print-queue-column" data-hyp-drop-stage="${escapeHtmlAttribute(stage.key)}" aria-label="${escapeHtmlAttribute(stage.label)}">
+        <header class="print-queue-column__head">
+          <h3>${escapeHtml(stage.label)}</h3>
+          <span aria-label="${items.length} receivers">${items.length}</span>
+        </header>
+        <div class="print-queue-column__body">
+          ${items.length ? items.map(renderQueueCard).join('') : '<p class="print-queue-empty">No receivers.</p>'}
+        </div>
+      </section>
+    `;
+  }).join('');
 }
 
 function renderActionTimeline(events = []) {
@@ -610,7 +770,7 @@ function renderProduction(data, { silent = false } = {}) {
 }
 
 async function fetchProduction({ sync = false, silent = false } = {}) {
-  if (hypProductionLoading) return false;
+  if (hypProductionLoading || hypDraggedReceiverId) return false;
   setLoading(true);
   if (!silent) {
     setStatus(sync ? 'Syncing Shopify orders...' : 'Loading stored HYP-AR records...', 'info');
@@ -727,10 +887,14 @@ async function updateReceiverStage(receiverId, stageKey) {
   if (hypProductionLoading) return;
   const receiver = (hypProductionData?.receivers || [])
     .find((item) => String(item.id) === String(receiverId));
-  if (!receiver || receiver.currentStageKey === stageKey) return;
+  const stage = getStages().find((item) => item.key === stageKey);
+  if (!receiver || receiver.archivedAt || !stage || receiver.currentStageKey === stageKey) return;
 
+  hypPendingAction = { receiverId, stageKey, type: 'move' };
   setLoading(true);
-  setStatus(`Updating ${receiver.receiverCode}...`, 'info');
+  const movingMessage = `Moving ${receiver.receiverCode} to ${stage.label}…`;
+  setStatus(movingMessage, 'info');
+  showActionFeedback(movingMessage, 'loading');
 
   try {
     const response = await fetch(`/api/hyp-ar-production/${encodeURIComponent(receiverId)}/stage`, {
@@ -747,11 +911,18 @@ async function updateReceiverStage(receiverId, stageKey) {
     if (Array.isArray(data.events)) {
       hypProductionData.events = data.events;
     }
+    highlightMovedReceiver(receiverId);
     refreshProductionView({ updateTimestamp: true });
-    setStatus(`${data.receiver.receiverCode} moved to ${data.receiver.currentStageLabel}.`, 'success');
+    const previousStage = receiver.currentStageLabel || getStages().find((item) => item.key === receiver.currentStageKey)?.label;
+    const message = `${data.receiver.receiverCode} moved${previousStage ? ` from ${previousStage}` : ''} to ${data.receiver.currentStageLabel || stage.label}.`;
+    setStatus(message, 'success');
+    showActionFeedback(message, 'success', { stageKey: data.receiver.currentStageKey });
   } catch (err) {
-    setStatus(`Error: ${err.message}`, 'error');
+    const message = `Could not move ${receiver.receiverCode} to ${stage.label}: ${err.message}`;
+    setStatus(message, 'error');
+    showActionFeedback(message, 'error');
   } finally {
+    hypPendingAction = null;
     setLoading(false);
   }
 }
@@ -765,8 +936,10 @@ async function deleteReceiver(receiverId) {
   const confirmed = window.confirm(`Delete ${receiver.receiverCode} from the HYP-AR tracker? Its code will stay reserved.`);
   if (!confirmed) return;
 
+  hypPendingAction = { receiverId, type: 'delete' };
   setLoading(true);
   setStatus(`Deleting ${receiver.receiverCode}...`, 'info');
+  showActionFeedback(`Deleting ${receiver.receiverCode}…`, 'loading');
 
   try {
     const response = await fetch(`/api/hyp-ar-production/${encodeURIComponent(receiverId)}`, {
@@ -784,9 +957,12 @@ async function deleteReceiver(receiverId) {
     }
     refreshProductionView({ updateTimestamp: true });
     setStatus(`${receiver.receiverCode} deleted from the HYP-AR tracker.`, 'success');
+    showActionFeedback(`${receiver.receiverCode} deleted from the HYP-AR tracker.`, 'success');
   } catch (err) {
     setStatus(`Error: ${err.message}`, 'error');
+    showActionFeedback(`Could not delete ${receiver.receiverCode}: ${err.message}`, 'error');
   } finally {
+    hypPendingAction = null;
     setLoading(false);
   }
 }
@@ -829,8 +1005,31 @@ function installEventHandlers() {
   const refreshBtn = document.getElementById('hypRefreshBtn');
   const printActiveBtn = document.getElementById('hypPrintActiveBtn');
   const archivedToggle = document.getElementById('hypShowArchived');
-  const tableContainer = document.getElementById('hypReceiverTable');
+  const receiverPanel = document.getElementById('hypReceiverPanel');
   const filterContainer = document.getElementById('hypStageFilters');
+  const board = document.getElementById('hypQueueBoard');
+
+  document.getElementById('hypViewToggle')?.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-hyp-view]');
+    if (button) setProductionView(button.dataset.hypView);
+  });
+  document.getElementById('hypFeedbackDismiss')?.addEventListener('click', () => {
+    clearTimeout(hypFeedbackTimeout);
+    document.getElementById('hypActionFeedback').hidden = true;
+  });
+  document.getElementById('hypFeedbackViewStage')?.addEventListener('click', (event) => {
+    const stageKey = event.currentTarget.dataset.stageKey;
+    if (hypProductionView === 'table') {
+      hypStageFilter = stageKey;
+      renderStageFilters(hypProductionData?.receivers || []);
+      renderReceiverViews();
+      document.getElementById('hypReceiverTable').scrollIntoView({ block: 'nearest' });
+    } else {
+      const column = Array.from(board.querySelectorAll('[data-hyp-drop-stage]'))
+        .find((element) => element.dataset.hypDropStage === stageKey);
+      column?.scrollIntoView({ block: 'nearest', inline: 'nearest' });
+    }
+  });
 
   refreshBtn?.addEventListener('click', async () => {
     const loaded = await fetchProduction({ sync: false });
@@ -846,10 +1045,11 @@ function installEventHandlers() {
     if (nextFilter === hypStageFilter) return;
     hypStageFilter = nextFilter;
     renderStageFilters(hypProductionData?.receivers || []);
-    renderReceiverTable(getFilteredReceivers());
+    renderReceiverViews();
   });
 
-  tableContainer?.addEventListener('click', (event) => {
+  receiverPanel?.addEventListener('click', (event) => {
+    if (event.target.closest('button')?.disabled) return;
     const stageButton = event.target.closest('[data-receiver-id][data-stage-key]');
     if (stageButton) {
       updateReceiverStage(stageButton.dataset.receiverId, stageButton.dataset.stageKey);
@@ -870,11 +1070,55 @@ function installEventHandlers() {
     }
   });
 
+  function clearDragState() {
+    hypDraggedReceiverId = '';
+    board?.querySelectorAll('.is-dragging, .is-drop-target').forEach((element) => {
+      element.classList.remove('is-dragging', 'is-drop-target');
+    });
+  }
+
+  board?.addEventListener('dragstart', (event) => {
+    const card = event.target.closest('.hyp-queue-card');
+    if (!card || hypProductionLoading || card.dataset.hypArchived === 'true'
+      || event.target.closest('button, a')) {
+      event.preventDefault();
+      return;
+    }
+    hypDraggedReceiverId = card.dataset.hypReceiverId;
+    event.dataTransfer.setData('text/plain', hypDraggedReceiverId);
+    event.dataTransfer.effectAllowed = 'move';
+    card.classList.add('is-dragging');
+  });
+  board?.addEventListener('dragover', (event) => {
+    const column = event.target.closest('[data-hyp-drop-stage]');
+    if (!column || !hypDraggedReceiverId || hypProductionLoading) return;
+    event.preventDefault();
+    event.dataTransfer.dropEffect = 'move';
+    board.querySelectorAll('.is-drop-target').forEach((element) => element.classList.remove('is-drop-target'));
+    column.classList.add('is-drop-target');
+  });
+  board?.addEventListener('dragleave', (event) => {
+    const column = event.target.closest('[data-hyp-drop-stage]');
+    if (column && !column.contains(event.relatedTarget)) column.classList.remove('is-drop-target');
+  });
+  board?.addEventListener('drop', (event) => {
+    const column = event.target.closest('[data-hyp-drop-stage]');
+    if (!column || !hypDraggedReceiverId || hypProductionLoading) return;
+    event.preventDefault();
+    const receiverId = hypDraggedReceiverId;
+    clearDragState();
+    updateReceiverStage(receiverId, column.dataset.hypDropStage);
+  });
+  board?.addEventListener('dragend', clearDragState);
+
   window.addEventListener('afterprint', cleanupPrintArea);
 }
 
 document.addEventListener('DOMContentLoaded', () => {
   installEventHandlers();
+  let savedView = 'table';
+  try { savedView = window.localStorage.getItem(HYP_PRODUCTION_VIEW_KEY); } catch (_) { /* Use the default view. */ }
+  setProductionView(savedView, { persist: false });
   fetchProduction({ sync: false }).then((loaded) => {
     if (loaded) startBackgroundSync();
   });

@@ -35,7 +35,7 @@
           <button id="hypRefreshBtn" type="button">Refresh</button>
         </div>
       </div>
-      <p id="hypProductionStatus" class="hyp-production-status" data-type="info">Ready.</p>
+      <p id="hypProductionStatus" class="hyp-production-status" data-type="info" role="status">Ready.</p>
     </section>
 
     <section id="hypProductionOverview" class="hyp-production-summary-grid"></section>
@@ -47,12 +47,20 @@
       <div id="hypOp1Summary" class="hyp-production-table-wrap"></div>
     </section>
 
-    <section class="hyp-production-panel">
+    <section id="hypReceiverPanel" class="hyp-production-panel">
       <div class="hyp-production-panel__head">
         <h2 class="pick-list-section-title">Receiver Tracker</h2>
+        <div id="hypViewToggle" class="hyp-view-toggle" role="group" aria-label="Receiver view">
+          <button type="button" data-hyp-view="table" aria-pressed="true">Table</button>
+          <button type="button" data-hyp-view="board" aria-pressed="false">Queue board</button>
+        </div>
       </div>
       <div id="hypStageFilters" class="hyp-stage-filters"></div>
       <div id="hypReceiverTable" class="hyp-production-table-wrap"></div>
+      <div id="hypQueueView" hidden>
+        <p class="hyp-queue-help">Drag receivers between stages to move them.</p>
+        <div id="hypQueueBoard" class="print-queue-board hyp-queue-board" aria-label="Receiver production queue" tabindex="0"></div>
+      </div>
     </section>
 
     <section class="hyp-production-panel hyp-production-timeline-panel">
@@ -63,6 +71,12 @@
     </section>
   </main>
 
+  <div id="hypActionFeedback" class="hyp-action-feedback" data-type="loading" hidden>
+    <span class="hyp-action-feedback__icon" aria-hidden="true"></span>
+    <p id="hypActionFeedbackMessage" role="status" aria-live="polite" aria-atomic="true"></p>
+    <button id="hypFeedbackViewStage" type="button" hidden></button>
+    <button id="hypFeedbackDismiss" type="button" aria-label="Dismiss notification" hidden>&times;</button>
+  </div>
   <div id="hypPrintArea" class="hyp-print-area" aria-hidden="true"></div>
 
   <script src="/js/auth-guard.js"></script>
