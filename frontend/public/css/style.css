@@ -4498,6 +4498,7 @@ button.pick-verify-item-image:focus-visible:not(:disabled) {
 
 .pick-sku-with-type {
   display: inline-flex;
+  flex-wrap: wrap;
   max-width: 100%;
   min-width: 0;
   align-items: baseline;
@@ -4507,20 +4508,21 @@ button.pick-verify-item-image:focus-visible:not(:disabled) {
 
 .pick-sku-with-type__sku {
   min-width: 0;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .pick-sku-type-badge {
   flex: 0 0 auto;
+  max-width: 100%;
   color: #8fa4ba;
   font-size: 10px;
   font-weight: 950;
   letter-spacing: 0.04em;
   line-height: 1;
   text-transform: uppercase;
-  white-space: nowrap;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .pick-list-card-header h3 .pick-sku-type-badge {
@@ -4605,9 +4607,8 @@ button.pick-verify-item-image:focus-visible:not(:disabled) {
 }
 
 .pick-list-col-sku {
-  white-space: nowrap;
-  overflow: hidden;
-  text-overflow: ellipsis;
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 .pick-list-col-location {
