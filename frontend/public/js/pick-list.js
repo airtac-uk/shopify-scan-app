@@ -5150,12 +5150,14 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
         unitValueAmount: 0,
         valueCurrency: lineValueCurrency || 'GBP',
         requiresRegRemoval: false,
+        isHypArReceiver: false,
         pickRows: [],
       });
     }
 
     const row = grouped.get(key);
     row.requiresRegRemoval = row.requiresRegRemoval || requiresRegRemoval;
+    row.isHypArReceiver = row.isHypArReceiver || item.isHypArReceiver === true;
     mergeVerifyPickRows(row, pickRows);
     if (!row.imageUrl && imageUrl) {
       row.imageUrl = imageUrl;
@@ -5191,7 +5193,9 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
 
   let builtVerifyRows = Array.from(grouped.values());
   if (wholesaleModeEnabled || qcModeEnabled) {
-    builtVerifyRows = builtVerifyRows.filter(hasBuilderRackedPickRow);
+    builtVerifyRows = builtVerifyRows.filter((row) => (
+      hasBuilderRackedPickRow(row) || (qcModeEnabled && row.isHypArReceiver)
+    ));
   }
   builtVerifyRows.forEach(annotateBuilderQcFailReasons);
 
@@ -6959,7 +6963,7 @@ function renderVerifyOrderCards() {
 
   if (!verifyItems.length) {
     const emptyText = qcModeEnabled
-      ? 'No RACKED SKUs found for QC on this order.'
+      ? 'No QC-eligible line items found on this order.'
       : `No order line items found for ${wholesaleModeEnabled ? 'builder mode' : 'verification'}.`;
     container.innerHTML = `<p class="pick-list-empty">${emptyText}</p>`;
     return;
@@ -7425,7 +7429,7 @@ function createQcModePanel() {
   detail.textContent = selfQcBlocked
     ? getQcSelfReviewBlockedMessage()
     : (currentQcBuilderStaff
-    ? 'Mark each adapter or bundle as QC passed or QC failed.'
+    ? 'Mark each adapter, receiver or bundle as QC passed or QC failed.'
     : 'Mark the order as Waiting QC when the builder hands it over, then reload this order.');
   card.appendChild(detail);
 

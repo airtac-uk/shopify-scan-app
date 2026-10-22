@@ -81,6 +81,7 @@ const {
   normalizeHypArStageKey,
   normalizeShopifyProductId,
   getHypArStage,
+  isHypArLineItem,
   buildHypArReceiverUnits,
   buildHypArExcludedSourceKeys,
   getShopifyWorkflowStatus,
@@ -7607,7 +7608,10 @@ router.post('/api/pick-list', async (req, res) => {
       pickedRowCounts,
       hpaTankShippingWarning,
       wholesaleOrderWarning,
-      orderItems: orderLineItems,
+      orderItems: orderLineItems.map((item) => ({
+        ...item,
+        isHypArReceiver: isHypArLineItem(item),
+      })),
       lineItems: pickListResult.lineItems,
       totals: pickListResult.totals,
     });
