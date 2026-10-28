@@ -1,4 +1,5 @@
 const fetch = require('node-fetch');
+const { isHypArLineItem } = require('./hypArProductionService');
 
 const DEFAULT_SHEET_ID = '12rubfiCDcpz2Vb5AFxaHuXwu0b-ac6Gpu_18iu3IxRQ';
 const DEFAULT_GID = '0';
@@ -623,6 +624,9 @@ function buildPickListForOrder({ skuMap, lineItems }) {
     const lineTypeRank = getTypeSortRank(lineMeta.type || 'UNKNOWN');
 
     lineSummaries.push({
+      orderLineId: String(item.id || '').trim(),
+      variantId: String(item.variantId || '').trim(),
+      isHypArReceiver: isHypArLineItem(item),
       title: item.title,
       variantTitle: item.variantTitle,
       sku,
@@ -681,6 +685,9 @@ function buildPickListForOrder({ skuMap, lineItems }) {
   });
 
   const cleanLineSummaries = lineSummaries.map((line) => ({
+    orderLineId: line.orderLineId,
+    variantId: line.variantId,
+    isHypArReceiver: line.isHypArReceiver,
     title: line.title,
     variantTitle: line.variantTitle,
     sku: line.sku,

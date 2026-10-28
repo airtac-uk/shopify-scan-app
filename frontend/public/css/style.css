@@ -1762,6 +1762,27 @@ button.pick-verify-item-image:focus-visible:not(:disabled) {
   white-space: nowrap;
 }
 
+.pick-verify-item-info p.pick-verify-variant {
+  overflow: visible;
+  color: #e7eef6;
+  font-size: 14px;
+  font-weight: 800;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+.pick-variant-progress-note {
+  grid-column: 1 / -1;
+  margin: 10px 0;
+  padding: 10px 12px;
+  border: 1px solid #b89a54;
+  border-radius: 6px;
+  color: #f0d596;
+  background: #2b2210;
+  font-size: 14px;
+  line-height: 1.4;
+}
+
 .pick-verify-hpa-tank-badge {
   display: inline-flex;
   width: fit-content;
@@ -6994,6 +7015,10 @@ html.theme-light .pick-verify-item-info p {
 }
 
 html.theme-light .pick-list-order-meta {
+  color: #1b2f43;
+}
+
+html.theme-light .pick-verify-item-info p.pick-verify-variant {
   color: #1b2f43;
 }
 

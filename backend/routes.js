@@ -2441,6 +2441,7 @@ function buildCurrentOrderLineItems(edges = []) {
         title: node.title || '',
         sku: node.sku || '',
         quantity,
+        variantId: String(node.variant?.id || '').trim(),
         variantTitle: node.variantTitle || '',
         productId: node.product?.id || node.variant?.product?.id || '',
         upc: node.variant?.barcode || '',
@@ -4221,6 +4222,7 @@ function getPickListOrderQuery({ includeBundleGroup, includePurchasingEntity = f
                       id
                     }
                     variant {
+                      id
                       barcode
                       product {
                         id

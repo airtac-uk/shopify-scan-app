@@ -34,6 +34,7 @@ let hpaTankRegRemovalAlertedKeys = new Set();
 let currentAwaitingPartsSkuMap = new Map();
 let currentAwaitingPartsCatalog = new Map();
 let currentPickedRowCounts = new Map();
+let pickerVariantProgressNeedsReview = false;
 let lastActionTag = '';
 let lastActionBarcode = '';
 let lastRackedOrder = null;
@@ -3616,8 +3617,18 @@ function renderLocationCell(rowLocation) {
   return location;
 }
 
-function getPickRowKey(row, sectionTitle, rowIndex) {
-  return [
+function getHypArVariantKey(item) {
+  if (!item?.isHypArReceiver) return '';
+  const variantId = String(item.variantId || '').trim();
+  if (variantId) return `ID:${variantId}`;
+  const variantTitle = String(item.variantTitle || '').trim().replace(/\s+/g, ' ').toLowerCase();
+  if (variantTitle) return `TITLE:${encodeURIComponent(variantTitle)}`;
+  const lineId = String(item.id || item.orderLineId || '').trim();
+  return lineId ? `LINE:${lineId}` : '';
+}
+
+function getPickRowKey(row, sectionTitle, rowIndex, line = null) {
+  const parts = [
     currentOrderBarcode,
     sectionTitle,
     rowIndex,
@@ -3625,7 +3636,10 @@ function getPickRowKey(row, sectionTitle, rowIndex) {
     String(row?.location || '').trim(),
     String(row?.note || '').trim(),
     Math.max(1, Number(row?.quantity) || 1),
-  ].join('|');
+  ];
+  const variantKey = getHypArVariantKey(line);
+  if (variantKey) parts.push(`VARIANT:${variantKey}`);
+  return parts.join('|');
 }
 
 function lineHasVisibleOwnPickRow(line) {
@@ -3710,6 +3724,16 @@ function findPickRowsForOrderItem(orderItem = {}) {
   if (!sku && !bundleGroupId && !orderProductName && !orderTitleKey) return [];
 
   const matchedLines = (lastRenderedLineItems || []).filter((line) => {
+    if (orderItem.isHypArReceiver) {
+      if (orderItem.id && line.orderLineId) {
+        return String(orderItem.id) === String(line.orderLineId);
+      }
+      if (orderItem.variantId && line.variantId) {
+        if (String(orderItem.variantId) !== String(line.variantId)) return false;
+      } else if (normalizeDisplaySku(line.variantTitle) !== normalizeDisplaySku(variantTitle)) {
+        return false;
+      }
+    }
     const lineSku = normalizeDisplaySku(line?.sku);
     const lineBundleGroupId = String(line?.bundleGroupId || '').trim();
     const lineTitle = String(line?.title || '').trim();
@@ -4675,7 +4699,7 @@ function createPickedCheckbox(rowKey, sku, item, progress, requiredCount, row = 
   return { label, checkbox };
 }
 
-function renderRows(container, rows, emptyText, sectionTitle = '') {
+function renderRows(container, rows, emptyText, sectionTitle = '', line = null) {
   container.innerHTML = '';
 
   if (!rows || rows.length === 0) {
@@ -4719,7 +4743,7 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
   sortedRows.forEach((row, rowIndex) => {
     const item = document.createElement('li');
     item.className = 'pick-list-item';
-    const rowKey = getPickRowKey(row, sectionTitle, rowIndex);
+    const rowKey = getPickRowKey(row, sectionTitle, rowIndex, line);
     const requiredPickCount = getPickRowRequiredCount(row);
     const noteText = String(row.note || '').trim();
     const noteIndicatesQuantity = getNoteQuantityMultiplier(noteText) > 1;
@@ -4803,7 +4827,7 @@ function renderRows(container, rows, emptyText, sectionTitle = '') {
   container.appendChild(list);
 }
 
-function createSection(title, rows, emptyText) {
+function createSection(title, rows, emptyText, line = null) {
   const section = document.createElement('section');
   section.className = 'pick-list-section';
 
@@ -4814,7 +4838,7 @@ function createSection(title, rows, emptyText) {
   const content = document.createElement('div');
   section.appendChild(content);
 
-  renderRows(content, rows, emptyText, title);
+  renderRows(content, rows, emptyText, title, line);
   return section;
 }
 
@@ -4825,6 +4849,13 @@ function renderLineCards(lineItems) {
   if (!lineItems || lineItems.length === 0) {
     container.innerHTML = '<p class="pick-list-empty">No SKU line items found on this order.</p>';
     return;
+  }
+
+  if (pickerModeEnabled && pickerVariantProgressNeedsReview) {
+    const note = document.createElement('p');
+    note.className = 'pick-variant-progress-note';
+    note.textContent = 'Recheck each HYP-AR colour separately. Previous picking counts were saved against the shared SKU.';
+    container.appendChild(note);
   }
 
   let previousBundleGroupId = '';
@@ -4885,13 +4916,13 @@ function renderLineCards(lineItems) {
 
     card.appendChild(header);
     if (Array.isArray(line.mustPick) && line.mustPick.length > 0) {
-      card.appendChild(createSection('Must Pick', line.mustPick, 'No pick-required SKUs.'));
+      card.appendChild(createSection('Must Pick', line.mustPick, 'No pick-required SKUs.', line));
     }
     if (!pickerModeEnabled && Array.isArray(line.deskItems) && line.deskItems.length > 0) {
-      card.appendChild(createSection('Desk Items (List Only)', line.deskItems, 'No desk items.'));
+      card.appendChild(createSection('Desk Items (List Only)', line.deskItems, 'No desk items.', line));
     }
     if (Array.isArray(line.reviewItems) && line.reviewItems.length > 0) {
-      card.appendChild(createSection('Needs Review', line.reviewItems, 'No review items.'));
+      card.appendChild(createSection('Needs Review', line.reviewItems, 'No review items.', line));
     }
 
     container.appendChild(card);
@@ -4910,8 +4941,8 @@ function renderLineCards(lineItems) {
   });
 }
 
-function getRenderedPickerRowKeySet(lineItems = lastRenderedLineItems) {
-  const rowKeys = new Set();
+function getRenderedPickerRowKeys(lineItems = lastRenderedLineItems) {
+  const rowKeys = [];
 
   (lineItems || []).forEach((line) => {
     [
@@ -4920,7 +4951,10 @@ function getRenderedPickerRowKeySet(lineItems = lastRenderedLineItems) {
     ].forEach(([sectionTitle, rows]) => {
       if (!Array.isArray(rows) || rows.length === 0) return;
       [...rows].sort(comparePickLocation).forEach((row, rowIndex) => {
-        rowKeys.add(getPickRowKey(row, sectionTitle, rowIndex));
+        rowKeys.push({
+          key: getPickRowKey(row, sectionTitle, rowIndex, line),
+          legacyKey: getPickRowKey(row, sectionTitle, rowIndex),
+        });
       });
     });
   });
@@ -4931,8 +4965,27 @@ function getRenderedPickerRowKeySet(lineItems = lastRenderedLineItems) {
 function prunePickedRowCountsToRenderedRows() {
   if (!pickerModeEnabled || !hasRenderedPickList || !currentOrderBarcode) return;
 
-  const renderedKeys = getRenderedPickerRowKeySet();
+  const rowKeys = getRenderedPickerRowKeys();
+  const renderedKeys = new Set(rowKeys.map((row) => row.key));
+  const legacyTargets = new Map();
+  rowKeys.forEach(({ key, legacyKey }) => {
+    if (key === legacyKey) return;
+    if (!legacyTargets.has(legacyKey)) legacyTargets.set(legacyKey, new Set());
+    legacyTargets.get(legacyKey).add(key);
+  });
   let changed = false;
+
+  legacyTargets.forEach((targets, legacyKey) => {
+    const count = currentPickedRowCounts.get(legacyKey);
+    if (!(count > 0)) return;
+    if (targets.size === 1) {
+      const [key] = targets;
+      if (!currentPickedRowCounts.has(key)) currentPickedRowCounts.set(key, count);
+    } else {
+      pickerVariantProgressNeedsReview = true;
+    }
+    changed = true;
+  });
 
   Array.from(currentPickedRowCounts.keys()).forEach((rowKey) => {
     if (renderedKeys.has(rowKey)) return;
@@ -5115,7 +5168,10 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
     const isWholesaleBundle = (wholesaleModeEnabled || qcModeEnabled) && Boolean(bundleGroupId);
     // Keep no-SKU rows separate even if UPC matches, so duplicate UPC items
     // are verified one item at a time.
-    const rowBaseKey = normalizedSku ? `SKU:${normalizedSku}` : `LINE:${lineStableId}`;
+    const legacyRowBaseKey = normalizedSku ? `SKU:${normalizedSku}` : `LINE:${lineStableId}`;
+    const variantKey = normalizedSku ? getHypArVariantKey(item) : '';
+    const rowBaseKey = variantKey ? `${legacyRowBaseKey}::VARIANT:${variantKey}` : legacyRowBaseKey;
+    const legacyProgressKey = `${bundleGroupId ? `bundle:${bundleGroupId}` : 'ungrouped'}::${legacyRowBaseKey}`;
     const key = isWholesaleBundle
       ? `bundle:${bundleGroupId}`
       : `${bundleGroupId ? `bundle:${bundleGroupId}` : 'ungrouped'}::${rowBaseKey}`;
@@ -5132,6 +5188,10 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
         productName: isWholesaleBundle
           ? (bundleGroupTitle ? `Bundle: ${bundleGroupTitle}` : 'Bundle adapter')
           : (productName || sku || upc || `Item ${index + 1}`),
+        productTitle: nameBase || sku || upc || `Item ${index + 1}`,
+        variantTitle: isWholesaleBundle ? '' : variantTitle,
+        variantId: isWholesaleBundle ? '' : String(item.variantId || '').trim(),
+        legacyProgressKey: !isWholesaleBundle && variantKey ? legacyProgressKey : '',
         bundleGroupId,
         bundleGroupTitle,
         bundleGroupQuantity,
@@ -5244,16 +5304,33 @@ function buildVerifyState(orderItems, initialProgressByItemKey = null) {
   });
 
   if (initialProgressByItemKey && typeof initialProgressByItemKey === 'object') {
+    const legacyTargets = new Map();
     verifyItems.forEach((row) => {
+      if (!row.legacyProgressKey) return;
+      legacyTargets.set(row.legacyProgressKey, (legacyTargets.get(row.legacyProgressKey) || 0) + 1);
+    });
+    verifyItems.forEach((row) => {
+      let persistedValue = initialProgressByItemKey[row.key];
+      if (persistedValue == null && row.legacyProgressKey) {
+        const legacyValue = initialProgressByItemKey[row.legacyProgressKey];
+        if (legacyTargets.get(row.legacyProgressKey) === 1) {
+          persistedValue = legacyValue;
+        } else {
+          const counts = qcModeEnabled
+            ? normalizeQcProgressCounts(legacyValue, row.requiredQty)
+            : { passedQty: Number(legacyValue) || 0, failedQty: 0 };
+          row.variantProgressNeedsReview = counts.passedQty + counts.failedQty > 0;
+        }
+      }
       if (qcModeEnabled) {
-        const persisted = normalizeQcProgressCounts(initialProgressByItemKey[row.key], row.requiredQty);
+        const persisted = normalizeQcProgressCounts(persistedValue, row.requiredQty);
         row.passedQty = persisted.passedQty;
         row.failedQty = persisted.failedQty;
         row.scannedQty = persisted.passedQty + persisted.failedQty;
         return;
       }
 
-      const persisted = Number(initialProgressByItemKey[row.key]);
+      const persisted = Number(persistedValue);
       if (!Number.isFinite(persisted)) return;
       row.scannedQty = Math.max(0, Math.min(row.requiredQty, Math.floor(persisted)));
     });
@@ -7009,6 +7086,12 @@ function renderVerifyOrderCards() {
     });
   }
   container.appendChild(summaryCard);
+  if (verifyItems.some((row) => row.variantProgressNeedsReview && row.scannedQty < row.requiredQty)) {
+    const note = document.createElement('p');
+    note.className = 'pick-variant-progress-note';
+    note.textContent = 'Recheck each HYP-AR colour separately. Previous checks were saved against the shared SKU.';
+    summaryCard.appendChild(note);
+  }
 
   const hpaTankWarningCard = createHpaTankVerifyWarningCard();
   if (hpaTankWarningCard) {
@@ -7132,7 +7215,7 @@ function renderVerifyOrderCards() {
     info.className = 'pick-verify-item-info';
 
     const title = document.createElement('h3');
-    title.textContent = row.productName;
+    title.textContent = row.isHypArReceiver && row.variantTitle ? row.productTitle : row.productName;
     title.title = row.productName;
 
     const meta = document.createElement('p');
@@ -7193,6 +7276,12 @@ function renderVerifyOrderCards() {
     ].filter(Boolean).join(' | ');
 
     info.appendChild(title);
+    if (row.isHypArReceiver && row.variantTitle) {
+      const variant = document.createElement('p');
+      variant.className = 'pick-verify-variant';
+      variant.textContent = `Variant: ${row.variantTitle}`;
+      info.appendChild(variant);
+    }
     info.appendChild(meta);
     const builderQcFailBlock = createBuilderQcFailReasonsBlock(builderQcFailReasons);
     if (builderQcFailBlock) {
@@ -7541,6 +7630,9 @@ function decrementVerifyRow(row) {
 
 function getVerifyDisplayLabel(row) {
   if (!row) return 'Item';
+  if (row.isHypArReceiver && row.variantTitle) {
+    return `${row.sku && row.sku !== '(No SKU)' ? row.sku : row.productTitle} - ${row.variantTitle}`;
+  }
   if (row.sku && row.sku !== '(No SKU)') return row.sku;
   return row.productName || 'Item';
 }
@@ -8280,8 +8372,7 @@ function openQcFailDialog(orderId, lineItems, defaults = {}) {
         firstAvailableOption = option;
       }
       if (
-        (defaultItemKey && row.key === defaultItemKey)
-        || (defaultSku && normalizeDisplaySku(sku) === defaultSku)
+        defaultItemKey ? row.key === defaultItemKey : (defaultSku && normalizeDisplaySku(sku) === defaultSku)
       ) {
         selectedOption = option;
       }
@@ -8745,6 +8836,7 @@ async function fetchPickList(barcodeInput, { skipActionReminder = false } = {}) 
     builderTimerPaused = false;
     builderTimerPausedItemKey = '';
     setPickedRowCountsFromPayload(data.pickedRowCounts);
+    pickerVariantProgressNeedsReview = false;
     buildVerifyState(
       lastOrderItems,
       wholesaleModeEnabled
